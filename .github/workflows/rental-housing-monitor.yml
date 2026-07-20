@@ -1,0 +1,89 @@
+name: Rental Housing Monitor
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rental-housing-monitor-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rental-housing-monitor
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: rental-housing-monitor/pyproject.toml
+
+      - name: Install project
+        run: python -m pip install .
+
+      - name: Restore SQLite state
+        run: |
+          mkdir -p data
+          git fetch origin data || true
+          if git show-ref --verify --quiet refs/remotes/origin/data; then
+            git show origin/data:rental-housing-monitor/data/announcements.db > data/announcements.db || true
+          fi
+
+      - name: Run monitor
+        env:
+          DATA_GO_KR_SERVICE_KEY: ${{ secrets.DATA_GO_KR_SERVICE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATABASE_PATH: data/announcements.db
+          LOG_PATH: logs/monitor.log
+        run: python -m rental_monitor
+
+      - name: Persist SQLite state on data branch
+        if: always()
+        run: |
+          if [ ! -f data/announcements.db ]; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          data_worktree=$(mktemp -d)
+          if git ls-remote --exit-code --heads origin refs/heads/data >/dev/null 2>&1; then
+            git fetch origin data
+            git worktree add --detach "$data_worktree" origin/data
+          else
+            empty_tree=$(git hash-object -t tree /dev/null)
+            data_commit=$(printf 'Initialize rental monitor data branch\n' | git commit-tree "$empty_tree")
+            git worktree add --detach "$data_worktree" "$data_commit"
+          fi
+          mkdir -p "$data_worktree/rental-housing-monitor/data"
+          cp data/announcements.db "$data_worktree/rental-housing-monitor/data/announcements.db"
+          git -C "$data_worktree" add rental-housing-monitor/data/announcements.db
+          if git -C "$data_worktree" diff --cached --quiet; then
+            exit 0
+          fi
+          git -C "$data_worktree" commit -m "chore(data): update rental notices"
+          cd "$data_worktree"
+          git push origin HEAD:data
+
+      - name: Upload monitor log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rental-housing-monitor-log-${{ github.run_id }}
+          path: rental-housing-monitor/logs/monitor.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -4,7 +4,12 @@ import httpx
 import pytest
 
 from rental_monitor.models import Agency, Announcement, HousingType
-from rental_monitor.telegram import TelegramClient, TelegramError, format_announcement, split_message
+from rental_monitor.telegram import (
+    TelegramClient,
+    TelegramError,
+    format_announcement,
+    split_message,
+)
 
 
 def notice() -> Announcement:
@@ -57,7 +62,9 @@ def test_telegram_returns_last_message_id_after_all_chunks() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         sent.append(request.content.decode())
-        return httpx.Response(200, json={"ok": True, "result": {"message_id": len(sent)}}, request=request)
+        return httpx.Response(
+            200, json={"ok": True, "result": {"message_id": len(sent)}}, request=request
+        )
 
     client = TelegramClient(httpx.Client(transport=httpx.MockTransport(handler)), "token", "42")
 
@@ -67,9 +74,13 @@ def test_telegram_returns_last_message_id_after_all_chunks() -> None:
 
 def test_telegram_ok_false_raises_without_exposing_token() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"ok": False, "description": "chat not found"}, request=request)
+        return httpx.Response(
+            200, json={"ok": False, "description": "chat not found"}, request=request
+        )
 
-    client = TelegramClient(httpx.Client(transport=httpx.MockTransport(handler)), "secret-token", "42")
+    client = TelegramClient(
+        httpx.Client(transport=httpx.MockTransport(handler)), "secret-token", "42"
+    )
 
     with pytest.raises(TelegramError, match="chat not found") as caught:
         client.send("hello")

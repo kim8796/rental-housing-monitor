@@ -100,7 +100,9 @@ def parse_gh_list(html: str, *, source_kind: Literal["rental", "purchase"]) -> l
         if source_kind == "rental" and classify_housing_type(title, raw_type) is None:
             continue
         end_text = cells[index["마감일"]].get_text(" ", strip=True)
-        detail_template = GH_RENTAL_DETAIL_URL if source_kind == "rental" else GH_PURCHASE_DETAIL_URL
+        detail_template = (
+            GH_RENTAL_DETAIL_URL if source_kind == "rental" else GH_PURCHASE_DETAIL_URL
+        )
         candidates.append(
             GHListItem(
                 source_id=source_id,

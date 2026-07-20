@@ -42,7 +42,7 @@ def test_gh_missing_table_is_structure_error() -> None:
 
 def test_gh_collector_merges_duplicate_notice_from_two_lists() -> None:
     rental_with_duplicate = html("gh_rental_list.html").replace(
-        "data-pbancNo=\"801\"", "data-pbancNo=\"792\"", 1
+        'data-pbancNo="801"', 'data-pbancNo="792"', 1
     )
 
     def handler(request: httpx.Request) -> httpx.Response:

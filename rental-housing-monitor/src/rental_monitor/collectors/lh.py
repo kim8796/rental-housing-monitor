@@ -60,7 +60,9 @@ class LHCollector:
                     try:
                         payload = response.json()
                     except ValueError as error:
-                        raise ParserStructureError(Agency.LH, "JSON 파싱", "JSON 응답이 아닙니다") from error
+                        raise ParserStructureError(
+                            Agency.LH, "JSON 파싱", "JSON 응답이 아닙니다"
+                        ) from error
                     notices, total = parse_lh_response(payload)
                     for notice in notices:
                         collected[canonical_key(notice)] = notice
@@ -99,7 +101,9 @@ def parse_lh_response(payload: object) -> tuple[list[Announcement], int]:
             continue
         notices.append(
             Announcement(
-                source_id=str(raw_row.get("PAN_ID") or _pan_id_from_url(_require(raw_row, "DTL_URL"))),
+                source_id=str(
+                    raw_row.get("PAN_ID") or _pan_id_from_url(_require(raw_row, "DTL_URL"))
+                ),
                 title=title,
                 agency=Agency.LH,
                 region=region,
@@ -139,7 +143,9 @@ def _parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value.replace(".", "-"))
     except ValueError as error:
-        raise ParserStructureError(Agency.LH, "날짜 파싱", f"지원하지 않는 날짜: {value}") from error
+        raise ParserStructureError(
+            Agency.LH, "날짜 파싱", f"지원하지 않는 날짜: {value}"
+        ) from error
 
 
 def _pan_id_from_url(url: str) -> str:

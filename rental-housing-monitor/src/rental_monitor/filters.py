@@ -10,9 +10,7 @@ def is_recruitment_title(title: str) -> bool:
     compact = " ".join(title.split())
     if "모집" not in compact:
         return False
-    if any(term in compact for term in _FOLLOW_UP_TERMS) and "정정공고" not in compact:
-        return False
-    return True
+    return not (any(term in compact for term in _FOLLOW_UP_TERMS) and "정정공고" not in compact)
 
 
 def classify_housing_type(title: str, raw_type: str) -> HousingType | None:

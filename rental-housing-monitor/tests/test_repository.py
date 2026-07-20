@@ -60,7 +60,9 @@ def test_run_status_is_recorded(tmp_path) -> None:
     repository = AnnouncementRepository(tmp_path / "announcements.db")
     run_id = repository.start_run(datetime(2026, 7, 20, 3, tzinfo=UTC))
 
-    repository.finish_run(run_id, status="partial_failure", new_count=2, agency_status={"SH": "failed"})
+    repository.finish_run(
+        run_id, status="partial_failure", new_count=2, agency_status={"SH": "failed"}
+    )
 
     row = repository.connection.execute(
         "SELECT status, new_count, agency_status FROM runs WHERE id = ?", (run_id,)

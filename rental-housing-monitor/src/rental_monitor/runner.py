@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Protocol
 
 from rental_monitor.collectors.base import Collector, CollectorError
 from rental_monitor.models import Agency, Announcement, canonical_key
 from rental_monitor.repository import AnnouncementRepository
 from rental_monitor.telegram import format_announcement
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramSender(Protocol):
@@ -47,9 +51,19 @@ class MonitorRunner:
             except CollectorError as error:
                 agency_status[collector.agency.value] = "failed"
                 failures.append((collector.agency, error.stage, error.detail))
+                logger.error(
+                    "기관 수집 실패 agency=%s stage=%s detail=%s",
+                    collector.agency.value,
+                    error.stage,
+                    error.detail,
+                )
             except Exception as error:  # institution isolation requires a final boundary
                 agency_status[collector.agency.value] = "failed"
-                failures.append((collector.agency, "수집", f"{type(error).__name__}: {error}"))
+                error_type = type(error).__name__
+                failures.append((collector.agency, "수집", error_type))
+                logger.error(
+                    "기관 수집 실패 agency=%s error_type=%s", collector.agency.value, error_type
+                )
 
         notices = list(all_notices.values())
         self.repository.upsert_seen(notices)
@@ -86,9 +100,7 @@ class MonitorRunner:
         return RunResult(status=status, new_count=delivered_count, agency_status=agency_status)
 
 
-def _format_failures(
-    failures: list[tuple[Agency, str, str]], agency_status: dict[str, str]
-) -> str:
+def _format_failures(failures: list[tuple[Agency, str, str]], agency_status: dict[str, str]) -> str:
     blocks = ["⚠️ 임대주택 모니터 수집 오류"]
     for agency, stage, detail in failures:
         blocks.extend((f"기관: {agency.value}", f"단계: {stage}", f"원인: {detail}"))

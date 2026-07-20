@@ -37,15 +37,17 @@ class TelegramClient:
                     timeout=20,
                 )
             except httpx.HTTPError as error:
-                raise TelegramError(
-                    f"Telegram HTTP 요청 실패: {type(error).__name__}"
-                ) from error
+                raise TelegramError(f"Telegram HTTP 요청 실패: {type(error).__name__}") from error
             try:
                 payload: Any = response.json()
             except ValueError as error:
                 raise TelegramError("Telegram 응답이 JSON이 아닙니다") from error
             if not isinstance(payload, dict) or payload.get("ok") is not True:
-                description = payload.get("description", "알 수 없는 Telegram API 오류") if isinstance(payload, dict) else "잘못된 응답 구조"
+                description = (
+                    payload.get("description", "알 수 없는 Telegram API 오류")
+                    if isinstance(payload, dict)
+                    else "잘못된 응답 구조"
+                )
                 raise TelegramError(str(description))
             result = payload.get("result")
             if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
@@ -57,6 +59,10 @@ class TelegramClient:
 
 
 def format_announcement(announcement: Announcement) -> str:
+    application_period = _format_period(
+        announcement.application_start_date,
+        announcement.application_end_date,
+    )
     return "\n".join(
         (
             "🏠 신규 임대주택 공고",
@@ -66,7 +72,7 @@ def format_announcement(announcement: Announcement) -> str:
             f"공급유형: {announcement.housing_type.value}",
             f"대상: {announcement.target}",
             f"공고일: {announcement.announcement_date.isoformat()}",
-            f"접수기간: {_format_period(announcement.application_start_date, announcement.application_end_date)}",
+            f"접수기간: {application_period}",
             f"URL: {announcement.url}",
         )
     )

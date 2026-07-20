@@ -12,8 +12,7 @@ from rental_monitor.filters import classify_housing_type, is_recruitment_title
 from rental_monitor.models import Agency, Announcement, HousingType
 
 SH_LIST_URL = (
-    "https://www.i-sh.co.kr/app/lay2/program/"
-    "S1T294C297/www/brd/m_247/list.do?multi_itm_seq=2"
+    "https://www.i-sh.co.kr/app/lay2/program/S1T294C297/www/brd/m_247/list.do?multi_itm_seq=2"
 )
 SH_DETAIL_URL = (
     "https://www.i-sh.co.kr/app/lay2/program/"
@@ -88,12 +87,16 @@ def parse_sh_list(html: str) -> list[SHListItem]:
             SHListItem(
                 source_id=source_id,
                 title=title,
-                announcement_date=_parse_date(cells[header_index["등록일"]].get_text(" ", strip=True)),
+                announcement_date=_parse_date(
+                    cells[header_index["등록일"]].get_text(" ", strip=True)
+                ),
                 url=SH_DETAIL_URL.format(source_id=source_id),
             )
         )
     if parsed_rows == 0:
-        raise ParserStructureError(Agency.SH, "목록 파싱", "공고 행의 getDetailView ID를 찾지 못했습니다")
+        raise ParserStructureError(
+            Agency.SH, "목록 파싱", "공고 행의 getDetailView ID를 찾지 못했습니다"
+        )
     return candidates
 
 
@@ -144,7 +147,9 @@ def _extract_application_period(text: str, agency: Agency) -> tuple[date | None,
     segment = text[label.end() : label.end() + 180]
     matches = re.findall(r"(\d{4})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})", segment)
     if not matches:
-        raise ParserStructureError(agency, "접수기간 파싱", "접수기간 라벨 뒤 날짜를 찾지 못했습니다")
+        raise ParserStructureError(
+            agency, "접수기간 파싱", "접수기간 라벨 뒤 날짜를 찾지 못했습니다"
+        )
     dates = [date(*(int(part) for part in match)) for match in matches[:2]]
     return dates[0], dates[-1]
 
