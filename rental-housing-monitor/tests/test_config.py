@@ -12,9 +12,13 @@ def clear_required(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def test_missing_secret_names_are_reported_without_values(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_secret_names_are_reported_without_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     clear_required(monkeypatch)
     monkeypatch.setenv("DATA_GO_KR_SERVICE_KEY", "private-api-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "")
 
     with pytest.raises(ConfigurationError) as caught:
         Settings.from_env()
