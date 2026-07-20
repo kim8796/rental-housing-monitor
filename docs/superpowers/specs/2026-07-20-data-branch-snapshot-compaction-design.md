@@ -33,9 +33,10 @@
 3. LH·SH·GH를 조회하고 Telegram 전송 결과를 SQLite에 반영한다.
 4. 완료 시각이 90일보다 오래된 `runs` 행을 삭제한다.
 5. SQLite `VACUUM`을 실행해 삭제된 행과 내부 여유 공간을 회수한다.
-6. 정리된 DB 파일을 Git blob으로 기록하고, 필요한 하위 tree와 독립 루트 commit을 생성한다.
-7. 실행 시작 시 확인한 원격 `data` SHA를 lease 값으로 사용해 새 commit을 `refs/heads/data`에 강제 푸시한다.
-8. 원격 SHA가 중간에 바뀌었으면 푸시를 거부하고 워크플로를 실패 처리한다.
+6. 정리와 `VACUUM`이 성공하면 Actions 작업공간에 일회성 `.ready` 표식을 만든다.
+7. 저장 단계는 `.ready` 표식이 있을 때만 DB 파일을 Git blob으로 기록하고, 필요한 하위 tree와 독립 루트 commit을 생성한다.
+8. 실행 시작 시 확인한 원격 `data` SHA를 lease 값으로 사용해 새 commit을 `refs/heads/data`에 강제 푸시한다.
+9. 원격 SHA가 중간에 바뀌었으면 푸시를 거부하고 워크플로를 실패 처리한다.
 
 기존 `concurrency` 그룹과 `cancel-in-progress: false`는 유지한다. 이는 정상적인 예약 실행끼리 겹치지 않게 하며, `force-with-lease`는 수동 변경이나 예상하지 못한 동시 갱신을 추가로 방어한다.
 
@@ -43,16 +44,16 @@
 
 상태 정리와 스냅샷 생성은 두 단위로 분리한다.
 
-- Python 저장소 계층: `AnnouncementRepository.compact()`가 `runs` 보존 기간 정리와 `VACUUM`을 수행한다. CLI는 성공·실패 여부와 관계없이 저장소를 닫기 직전에 이를 호출한다.
+- Python 저장소 계층: `AnnouncementRepository.compact()`가 `runs` 보존 기간 정리와 `VACUUM`을 수행한다. CLI는 성공·실패 여부와 관계없이 저장소를 닫기 직전에 이를 호출하고, 성공한 경우에만 일회성 `.ready` 표식을 만든다.
 - 스냅샷 스크립트: `rental-housing-monitor/scripts/persist_data_snapshot.sh`가 DB 하나로 독립 tree/commit을 생성하고 lease 기반 푸시를 수행한다.
-- GitHub Actions 저장 단계: DB가 있으면 스냅샷 스크립트를 호출하고 결과를 그대로 성공 또는 실패로 반영한다.
+- GitHub Actions 저장 단계: DB와 `.ready` 표식이 모두 있으면 스냅샷 스크립트를 호출하고 결과를 그대로 성공 또는 실패로 반영한다. 표식 자체는 스냅샷에 넣지 않는다.
 
 애플리케이션의 기관 수집, 신규 판정, Telegram 전송 순서는 변경하지 않는다. `main` 브랜치 이력에는 영향을 주지 않으며 `data` 브랜치만 기계 생성 스냅샷으로 교체한다.
 
 ## 오류 처리
 
 - DB 파일이 생성되지 않았으면 기존처럼 저장 단계를 종료한다.
-- SQLite 정리 또는 `VACUUM`이 실패하면 기존 `data` 브랜치를 유지하고 워크플로를 실패 처리한다.
+- SQLite 정리 또는 `VACUUM`이 실패하면 `.ready` 표식이 생성되지 않으므로 기존 `data` 브랜치를 유지하고 워크플로를 실패 처리한다.
 - 원격 `data` 브랜치가 없으면 lease 없이 최초 스냅샷을 생성한다.
 - 원격 `data` SHA가 예상과 다르면 `force-with-lease`가 푸시를 거부하며 기존 상태를 덮어쓰지 않는다.
 - 모니터 실행이 일부 실패해도 생성된 DB가 있으면 실행 상태와 성공한 전송 기록을 보존한다.
