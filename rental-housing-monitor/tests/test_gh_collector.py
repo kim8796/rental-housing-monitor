@@ -35,6 +35,15 @@ def test_gh_detail_identifies_newlywed_purchase_and_period() -> None:
     assert notice.application_end_date == date(2026, 6, 12)
 
 
+def test_gh_global_navigation_does_not_override_official_national_type() -> None:
+    candidate = parse_gh_list(html("gh_rental_list.html"), source_kind="rental")[0]
+
+    notice = parse_gh_detail(html("gh_national_detail.html"), candidate)
+
+    assert notice is not None
+    assert notice.housing_type is HousingType.NATIONAL
+
+
 def test_gh_missing_table_is_structure_error() -> None:
     with pytest.raises(ParserStructureError, match="GH"):
         parse_gh_list("<html>changed</html>", source_kind="rental")

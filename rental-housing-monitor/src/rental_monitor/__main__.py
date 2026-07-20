@@ -9,6 +9,7 @@ from rental_monitor.collectors.gh import GHCollector
 from rental_monitor.collectors.lh import LHCollector
 from rental_monitor.collectors.sh import SHCollector
 from rental_monitor.config import ConfigurationError, Settings
+from rental_monitor.gh_tls import build_gh_ssl_context
 from rental_monitor.logging_config import configure_logging
 from rental_monitor.repository import AnnouncementRepository
 from rental_monitor.runner import MonitorRunner
@@ -26,10 +27,19 @@ def main() -> int:
     logger = logging.getLogger(__name__)
     repository = AnnouncementRepository(settings.database_path)
     try:
-        with httpx.Client(
-            follow_redirects=True,
-            headers={"User-Agent": "rental-housing-monitor/0.1 (+official-notice-checker)"},
-        ) as client:
+        client_options = {
+            "follow_redirects": True,
+            "headers": {"User-Agent": "rental-housing-monitor/0.1 (+official-notice-checker)"},
+        }
+        with (
+            httpx.Client(
+                **client_options,
+            ) as client,
+            httpx.Client(
+                **client_options,
+                verify=build_gh_ssl_context(),
+            ) as gh_client,
+        ):
             telegram = TelegramClient(
                 client,
                 settings.telegram_bot_token,
@@ -39,7 +49,7 @@ def main() -> int:
                 (
                     LHCollector(client, settings.data_go_kr_service_key),
                     SHCollector(client),
-                    GHCollector(client),
+                    GHCollector(gh_client),
                 ),
                 repository,
                 telegram,

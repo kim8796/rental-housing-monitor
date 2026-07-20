@@ -82,7 +82,9 @@ def parse_gh_list(html: str, *, source_kind: Literal["rental", "purchase"]) -> l
     candidates: list[GHListItem] = []
     parsed_rows = 0
     for row in rows:
-        cells = row.find_all("td", recursive=False)
+        # GH's live markup omits several closing </td> tags. Recursive lookup
+        # preserves the browser-repaired semantic column order.
+        cells = row.find_all("td")
         if len(cells) <= max(index.values()):
             continue
         link = cells[index["공고명"]].find("a", attrs={"data-pbancno": True})
@@ -110,7 +112,7 @@ def parse_gh_list(html: str, *, source_kind: Literal["rental", "purchase"]) -> l
                 raw_type=raw_type,
                 raw_region=raw_region,
                 announcement_date=_parse_date(cells[index["게시일"]].get_text(" ", strip=True)),
-                application_end_date=None if end_text == "-" else _parse_date(end_text),
+                application_end_date=_optional_date(end_text),
                 url=detail_template.format(source_id=source_id),
             )
         )
@@ -124,9 +126,13 @@ def parse_gh_detail(html: str, candidate: GHListItem) -> Announcement | None:
     values = _label_values(soup)
     if "공고일" not in values:
         raise ParserStructureError(Agency.GH, "상세 파싱", "공고일 필드를 찾지 못했습니다")
-    text = soup.get_text("\n", strip=True)
+    content = soup.select_one("#sub_content") or soup
+    text = content.get_text("\n", strip=True)
     raw_type = values.get("유형", candidate.raw_type)
-    housing_type = classify_housing_type(f"{candidate.title} {text}", raw_type)
+    classification_text = candidate.title
+    if "매입임대" in raw_type.replace(" ", ""):
+        classification_text = f"{classification_text} {values.get('공고문', '')}"
+    housing_type = classify_housing_type(classification_text, raw_type)
     if housing_type is None:
         return None
     region = _gh_region(candidate.raw_region)
@@ -167,6 +173,12 @@ def _parse_date(value: str) -> date:
     if not match:
         raise ParserStructureError(Agency.GH, "날짜 파싱", f"지원하지 않는 날짜: {value}")
     return date(*(int(part) for part in match.groups()))
+
+
+def _optional_date(value: str) -> date | None:
+    if not re.search(r"\d{4}[.\-/]\s*\d{1,2}[.\-/]\s*\d{1,2}", value):
+        return None
+    return _parse_date(value)
 
 
 def _gh_region(raw_region: str) -> str | None:
