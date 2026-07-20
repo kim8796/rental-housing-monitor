@@ -27,6 +27,16 @@ def test_lh_response_normalizes_official_fields() -> None:
     assert notices[0].source_id == "2016122300001530"
 
 
+def test_lh_response_accepts_current_top_level_list() -> None:
+    payload = [{"dsSch": [{}]}, fixture("lh_notices.json")]
+
+    notices, total = parse_lh_response(payload)
+
+    assert total == 1
+    assert len(notices) == 1
+    assert notices[0].agency is Agency.LH
+
+
 def test_lh_schema_change_names_lh_in_error() -> None:
     with pytest.raises(ParserStructureError, match="LH"):
         parse_lh_response({"unexpected": []})

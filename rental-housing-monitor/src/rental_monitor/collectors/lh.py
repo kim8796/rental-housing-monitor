@@ -73,6 +73,11 @@ class LHCollector:
 
 
 def parse_lh_response(payload: object) -> tuple[list[Announcement], int]:
+    if isinstance(payload, list):
+        payload = next(
+            (item for item in payload if isinstance(item, dict) and "dsList" in item),
+            payload,
+        )
     if not isinstance(payload, dict) or "dsList" not in payload:
         raise ParserStructureError(Agency.LH, "응답 구조", "필수 dsList 경로가 없습니다")
 
