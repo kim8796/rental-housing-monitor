@@ -58,26 +58,13 @@ jobs:
           if [ ! -f data/announcements.db ]; then
             exit 0
           fi
+          if [ ! -f data/announcements.db.ready ]; then
+            echo "SQLite compaction did not complete; preserving the existing data branch" >&2
+            exit 1
+          fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          data_worktree=$(mktemp -d)
-          if git ls-remote --exit-code --heads origin refs/heads/data >/dev/null 2>&1; then
-            git fetch origin data
-            git worktree add --detach "$data_worktree" origin/data
-          else
-            empty_tree=$(git hash-object -t tree /dev/null)
-            data_commit=$(printf 'Initialize rental monitor data branch\n' | git commit-tree "$empty_tree")
-            git worktree add --detach "$data_worktree" "$data_commit"
-          fi
-          mkdir -p "$data_worktree/rental-housing-monitor/data"
-          cp data/announcements.db "$data_worktree/rental-housing-monitor/data/announcements.db"
-          git -C "$data_worktree" add rental-housing-monitor/data/announcements.db
-          if git -C "$data_worktree" diff --cached --quiet; then
-            exit 0
-          fi
-          git -C "$data_worktree" commit -m "chore(data): update rental notices"
-          cd "$data_worktree"
-          git push origin HEAD:refs/heads/data
+          scripts/persist_data_snapshot.sh data/announcements.db origin data
 
       - name: Upload monitor log
         if: always()

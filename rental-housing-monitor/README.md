@@ -94,7 +94,7 @@ SH/GH가 HTML 구조를 변경해 목록 표, 공고 ID, 필수 상세 필드를
 - `contents: write`: 전용 `data` 브랜치에 SQLite 저장
 - `if: always()`: 성공·실패와 무관하게 로그 artifact 업로드
 
-첫 실행 때 `data` 브랜치가 없으면 빈 루트 커밋에서 자동 생성합니다. 이후 `rental-housing-monitor/data/announcements.db`만 갱신합니다. 기본 브랜치에는 DB가 커밋되지 않습니다.
+첫 실행 때 `data` 브랜치가 없으면 자동 생성합니다. 이후 매 실행마다 `rental-housing-monitor/data/announcements.db`만 포함하는 새로운 단일 스냅샷 커밋으로 `data` 브랜치를 교체합니다. 과거 DB 커밋은 보존하지 않으므로 장기간 운영해도 접근 가능한 Git 이력이 누적되지 않습니다. `force-with-lease`가 예상하지 못한 동시 갱신을 감지하면 기존 상태를 덮어쓰지 않고 실행을 실패시킵니다.
 
 Repository 또는 Organization 정책이 Actions의 쓰기 권한을 제한한다면 `Settings → Actions → General → Workflow permissions`에서 Read and write permissions를 허용해야 합니다.
 
@@ -106,6 +106,8 @@ SQLite는 다음 상태를 관리합니다.
 - `deliveries`: 공고·chat별 성공 전송 시각과 Telegram message ID
 - `runs`: 실행 결과, 신규 수, 기관별 상태
 
+`announcements`와 `deliveries`는 중복 전송 방지를 위해 계속 보존합니다. `runs`는 최근 90일만 유지하며 종료 시 SQLite `VACUUM`으로 사용하지 않는 공간을 회수합니다. `deliveries`에는 실제 Telegram chat ID 대신 비식별 키 `telegram-default`가 저장됩니다.
+
 기관 고유번호가 있으면 `기관:고유번호`, 없으면 추적 파라미터를 제거한 공식 URL의 SHA-256을 고유 키로 사용합니다.
 
 ## 운영 시 확인할 점
@@ -113,4 +115,4 @@ SQLite는 다음 상태를 관리합니다.
 - `오늘은 신규 공고가 없습니다.`는 세 기관이 모두 정상 수집됐을 때만 전송됩니다.
 - 일부 기관이 실패하면 `정상 처리`와 실패 기관을 포함한 경고가 전송됩니다.
 - Actions 실패 시 해당 실행의 `rental-housing-monitor-log-*` artifact를 확인합니다.
-- Telegram bot을 교체하면 새로운 chat에 대해 기존 공고가 다시 전송될 수 있습니다. delivery는 chat ID별로 관리됩니다.
+- Telegram bot 또는 chat을 바꿔도 기본 비식별 delivery 키가 같으면 과거 공고를 다시 보내지 않습니다. 전체 공고를 새로 받고 싶을 때만 `TELEGRAM_DELIVERY_TARGET`을 새로운 값으로 변경합니다.
