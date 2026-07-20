@@ -16,6 +16,7 @@ class Settings:
     data_go_kr_service_key: str
     telegram_bot_token: str
     telegram_chat_id: str
+    telegram_delivery_target: str
     database_path: Path
     log_path: Path
 
@@ -34,6 +35,10 @@ class Settings:
             data_go_kr_service_key=required["DATA_GO_KR_SERVICE_KEY"],
             telegram_bot_token=required["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=required["TELEGRAM_CHAT_ID"],
+            telegram_delivery_target=(
+                os.getenv("TELEGRAM_DELIVERY_TARGET", "telegram-default").strip()
+                or "telegram-default"
+            ),
             database_path=Path(os.getenv("DATABASE_PATH", "data/announcements.db")),
             log_path=Path(os.getenv("LOG_PATH", "logs/monitor.log")),
         )

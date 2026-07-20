@@ -41,6 +41,7 @@ def test_settings_read_required_and_default_paths(monkeypatch: pytest.MonkeyPatc
 
     assert settings.database_path == Path("data/announcements.db")
     assert settings.log_path == Path("logs/monitor.log")
+    assert settings.telegram_delivery_target == "telegram-default"
 
 
 def test_blank_value_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:

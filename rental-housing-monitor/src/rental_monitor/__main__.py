@@ -53,7 +53,7 @@ def main() -> int:
                 ),
                 repository,
                 telegram,
-                chat_id=settings.telegram_chat_id,
+                chat_id=settings.telegram_delivery_target,
             )
             result = runner.run()
             logger.info("실행 완료 status=%s new_count=%d", result.status, result.new_count)

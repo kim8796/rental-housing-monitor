@@ -49,6 +49,7 @@ cp .env.example .env
 DATA_GO_KR_SERVICE_KEY=공공데이터포털_Decoding_키
 TELEGRAM_BOT_TOKEN=BotFather_token
 TELEGRAM_CHAT_ID=대상_chat_id
+TELEGRAM_DELIVERY_TARGET=telegram-default
 DATABASE_PATH=data/announcements.db
 LOG_PATH=logs/monitor.log
 ```
