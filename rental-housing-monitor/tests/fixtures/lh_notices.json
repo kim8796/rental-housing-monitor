@@ -1,0 +1,21 @@
+{
+  "resHeader": [{"SS_CODE": "Y", "RS_DTTM": "20260720030000"}],
+  "dsList": [
+    {
+      "PAN_SS": "공고중",
+      "RNUM": "1",
+      "PAN_NT_ST_DT": "2026.07.20",
+      "AIS_TP_CD": "10",
+      "SPL_INF_TP_CD": "100",
+      "CNP_CD_NM": "서울특별시",
+      "PAN_ID": "2016122300001530",
+      "UPP_AIS_TP_NM": "임대주택",
+      "AIS_TP_CD_NM": "행복주택",
+      "CLSG_DT": "2026.07.29",
+      "UPP_AIS_TP_CD": "06",
+      "PAN_NM": "서울 행복주택 입주자 모집공고",
+      "ALL_CNT": "1",
+      "DTL_URL": "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancInfo.do?panId=2016122300001530"
+    }
+  ]
+}
