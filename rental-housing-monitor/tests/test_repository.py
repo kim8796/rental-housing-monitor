@@ -1,4 +1,5 @@
-from datetime import UTC, date, datetime
+import sqlite3
+from datetime import UTC, date, datetime, timedelta
 
 from rental_monitor.models import Agency, Announcement, HousingType
 from rental_monitor.repository import AnnouncementRepository
@@ -69,3 +70,36 @@ def test_run_status_is_recorded(tmp_path) -> None:
     ).fetchone()
     assert row[0:2] == ("partial_failure", 2)
     assert '"SH": "failed"' in row[2]
+
+
+def test_compact_removes_only_runs_older_than_retention(tmp_path) -> None:
+    database_path = tmp_path / "announcements.db"
+    repository = AnnouncementRepository(database_path)
+    now = datetime(2026, 7, 20, 3, tzinfo=UTC)
+    old_run = repository.start_run(now - timedelta(days=91))
+    recent_run = repository.start_run(now - timedelta(days=89))
+    item = notice()
+    repository.upsert_seen([item], observed_at=now - timedelta(days=120))
+    repository.mark_delivered(item, "telegram-default", 123, delivered_at=now)
+
+    repository.compact(now=now)
+
+    run_ids = [row[0] for row in repository.connection.execute("SELECT id FROM runs")]
+    assert run_ids == [recent_run]
+    assert old_run not in run_ids
+    assert repository.connection.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 1
+    assert repository.connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 1
+    assert repository.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_close_can_compact_and_leave_reopenable_database(tmp_path) -> None:
+    database_path = tmp_path / "announcements.db"
+    repository = AnnouncementRepository(database_path)
+    now = datetime(2026, 7, 20, 3, tzinfo=UTC)
+    repository.start_run(now - timedelta(days=120))
+
+    repository.close(compact=True, now=now)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

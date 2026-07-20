@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from rental_monitor.models import Announcement, canonical_key
@@ -182,8 +182,34 @@ class AnnouncementRepository:
         )
         self.connection.commit()
 
-    def close(self) -> None:
-        self.connection.close()
+    def compact(
+        self,
+        *,
+        retention_days: int = 90,
+        now: datetime | None = None,
+    ) -> None:
+        if retention_days < 1:
+            raise ValueError("retention_days must be positive")
+        cutoff = (now or datetime.now(UTC)) - timedelta(days=retention_days)
+        self.connection.execute(
+            "DELETE FROM runs WHERE started_at < ?",
+            (cutoff.isoformat(),),
+        )
+        self.connection.commit()
+        self.connection.execute("VACUUM")
+
+    def close(
+        self,
+        *,
+        compact: bool = False,
+        retention_days: int = 90,
+        now: datetime | None = None,
+    ) -> None:
+        try:
+            if compact:
+                self.compact(retention_days=retention_days, now=now)
+        finally:
+            self.connection.close()
 
 
 def _date_text(value: object) -> str | None:

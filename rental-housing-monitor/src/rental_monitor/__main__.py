@@ -61,7 +61,8 @@ def main() -> int:
         logger.error("실행 실패 error_type=%s", type(error).__name__)
         return 1
     finally:
-        repository.close()
+        repository.close(compact=True)
+        settings.database_path.with_suffix(settings.database_path.suffix + ".ready").touch()
     return 0
 
 
