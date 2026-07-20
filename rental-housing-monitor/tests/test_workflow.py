@@ -31,7 +31,7 @@ def test_workflow_persists_only_database_on_data_branch() -> None:
 
     assert "refs/heads/data" in text
     assert "rental-housing-monitor/data/announcements.db" in text
-    assert "git push origin HEAD:data" in text
+    assert "git push origin HEAD:refs/heads/data" in text
 
 
 def test_required_operator_files_exist() -> None:
