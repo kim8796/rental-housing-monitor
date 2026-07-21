@@ -88,7 +88,7 @@ SH/GH가 HTML 구조를 변경해 목록 표, 공고 ID, 필수 상세 필드를
 
 워크플로는 `.github/workflows/rental-housing-monitor.yml`에 있으며 다음을 수행합니다.
 
-- cron `0 3 * * *`: UTC 03:00, 한국시간 매일 12:00
+- cron `13 3 * * *`: UTC 03:13, 한국시간 매일 12:13
 - `workflow_dispatch`: 수동 실행
 - `concurrency`: DB를 동시에 갱신하는 실행 차단
 - `contents: write`: 전용 `data` 브랜치에 SQLite 저장

@@ -8,10 +8,10 @@ def workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
 
-def test_workflow_runs_at_kst_noon_and_prevents_overlap() -> None:
+def test_workflow_runs_at_kst_1213_and_prevents_overlap() -> None:
     text = workflow_text()
 
-    assert "cron: '0 3 * * *'" in text
+    assert "cron: '13 3 * * *'" in text
     assert "contents: write" in text
     assert "concurrency:" in text
     assert "cancel-in-progress: false" in text
