@@ -115,8 +115,12 @@ def _statements(script: str) -> Iterator[str]:
 
 @contextmanager
 def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> Iterator[None]:
-    """Nest safely without committing or rolling back a caller-owned transaction."""
+    """Run atomically, nesting only non-immediate work inside caller transactions."""
     if connection.in_transaction:
+        if immediate:
+            raise RuntimeError(
+                "immediate transaction cannot start while another transaction is already active"
+            )
         savepoint = f"storage_{uuid4().hex}"
         connection.execute(f"SAVEPOINT {savepoint}")
         try:

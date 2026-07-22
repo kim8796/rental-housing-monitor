@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -19,13 +18,21 @@ from personal_monitor.storage.schema import (
     utc_timestamp,
 )
 
-_ERROR_DETAIL_LIMIT = 500
-_URL_QUERY = re.compile(r"https?://\S+\?\S+", re.IGNORECASE)
-_SENSITIVE_RAW_DETAIL = re.compile(
-    r"\b(?:cookies?|set-cookie)\b|\bresponse\.(?:text|content)\b|\bresponse\s+body\b",
-    re.IGNORECASE,
+SAFE_DIAGNOSTIC_CODES = frozenset(
+    {
+        "authentication_failed",
+        "connection_timeout",
+        "delivery_failed",
+        "internal_error",
+        "network_error",
+        "offline",
+        "policy_rejected",
+        "required_field_missing",
+        "structure_changed",
+        "timeout",
+        "validation_failed",
+    }
 )
-_EXCEPTION_REPR = re.compile(r"\b[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)\(")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +101,7 @@ class RuntimeRepository:
         error_class: str | None = None,
         error_detail: str | None = None,
     ) -> None:
-        _validate_error_detail(error_detail)
+        _validate_diagnostic_code(error_detail)
         if error_class is not None and len(error_class) > 120:
             raise ValueError("error_class must be at most 120 characters")
         with transaction(self.connection):
@@ -234,7 +241,7 @@ class RuntimeRepository:
 
     def reschedule_outbox(self, outbox_id: str, *, available_at: datetime, error: str) -> None:
         available_timestamp = utc_timestamp(available_at, parameter="available_at")
-        _validate_error_detail(error)
+        _validate_diagnostic_code(error)
         with transaction(self.connection):
             cursor = self.connection.execute(
                 "UPDATE outbox SET status = 'pending', attempt_count = attempt_count + 1, "
@@ -245,15 +252,6 @@ class RuntimeRepository:
                 raise ValueError("pending outbox item does not exist")
 
 
-def _validate_error_detail(detail: str | None) -> None:
-    if detail is None:
-        return
-    lowered = detail.casefold()
-    unsafe = (
-        len(detail) > _ERROR_DETAIL_LIMIT
-        or _URL_QUERY.search(detail) is not None
-        or _SENSITIVE_RAW_DETAIL.search(lowered) is not None
-        or _EXCEPTION_REPR.search(detail) is not None
-    )
-    if unsafe:
-        raise ValueError("safe error detail must be bounded and exclude sensitive raw data")
+def _validate_diagnostic_code(detail: str | None) -> None:
+    if detail is not None and detail not in SAFE_DIAGNOSTIC_CODES:
+        raise ValueError("error detail must be a safe diagnostic code")

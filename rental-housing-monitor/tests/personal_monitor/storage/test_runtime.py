@@ -127,7 +127,7 @@ def test_lease_datetimes_must_be_aware(
         runtime.release_lease(monitor_id, worker_id="worker-1", next_run_at=datetime(2026, 1, 1))
 
 
-def test_run_lifecycle_normalizes_start_and_stores_bounded_error(
+def test_run_lifecycle_normalizes_start_and_stores_safe_error_code(
     repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
 ) -> None:
     registry, runtime = repositories
@@ -141,7 +141,7 @@ def test_run_lifecycle_normalizes_start_and_stores_bounded_error(
         status="failed",
         stage="validate",
         error_class="ValidationError",
-        error_detail="required price field was missing",
+        error_detail="required_field_missing",
     )
 
     row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -152,7 +152,7 @@ def test_run_lifecycle_normalizes_start_and_stores_bounded_error(
     assert row["stage"] == "validate"
     assert row["finished_at"] is not None
     assert row["error_class"] == "ValidationError"
-    assert row["error_detail"] == "required price field was missing"
+    assert row["error_detail"] == "required_field_missing"
 
 
 def test_run_start_requires_an_aware_datetime(
@@ -176,9 +176,13 @@ def test_run_start_requires_an_aware_datetime(
         "response body: private document",
         "request failed: response.text='private document'",
         "request failed: HTTPStatusError('500 Server Error')",
+        "FetchFailure('GET /private?token=secret')",
+        "<html><body>private document</body></html>",
+        "sessionid=secret",
+        "ordinary prose is not a stable code",
     ],
 )
-def test_finish_run_rejects_unsafe_error_detail(
+def test_finish_run_rejects_non_code_error_detail(
     repositories: tuple[RegistryRepository, RuntimeRepository], detail: str
 ) -> None:
     registry, runtime = repositories
@@ -186,7 +190,7 @@ def test_finish_run_rejects_unsafe_error_detail(
     version_id = registry.get_active_monitor(monitor_id).version_id
     run_id = runtime.start_run(monitor_id, version_id, started_at=datetime(2026, 1, 1, tzinfo=UTC))
 
-    with pytest.raises(ValueError, match="safe error detail"):
+    with pytest.raises(ValueError, match="diagnostic code"):
         runtime.finish_run(run_id, status="failed", stage="fetch", error_detail=detail)
 
 
@@ -362,7 +366,7 @@ def test_outbox_retry_updates_attempt_and_rejects_unsafe_or_naive_values(
         payload={"text": "retry"},
     )
 
-    with pytest.raises(ValueError, match="safe error detail"):
+    with pytest.raises(ValueError, match="diagnostic code"):
         runtime.reschedule_outbox(
             outbox_id,
             available_at=datetime(2026, 1, 1, tzinfo=UTC),

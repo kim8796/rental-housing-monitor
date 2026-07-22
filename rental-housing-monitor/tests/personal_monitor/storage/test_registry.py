@@ -95,6 +95,30 @@ def test_repository_does_not_commit_a_caller_owned_transaction(
     assert connection.execute("SELECT 1 FROM users WHERE id = 'temporary'").fetchone() is None
 
 
+def test_immediate_operation_rejects_a_caller_owned_transaction_before_work(
+    registry: RegistryRepository, connection: sqlite3.Connection
+) -> None:
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    original_count = connection.execute(
+        "SELECT count(*) FROM monitor_versions WHERE monitor_id = ?", (monitor_id,)
+    ).fetchone()[0]
+    connection.execute("BEGIN")
+
+    with pytest.raises(RuntimeError, match="immediate transaction.*already active"):
+        registry.add_version(
+            monitor_id,
+            make_spec(name="must not be stored"),
+            created_by="codex",
+            approved=False,
+        )
+
+    assert connection.in_transaction
+    assert connection.execute(
+        "SELECT count(*) FROM monitor_versions WHERE monitor_id = ?", (monitor_id,)
+    ).fetchone()[0] == original_count
+    connection.rollback()
+
+
 def test_create_monitor_owns_an_approved_active_version(
     registry: RegistryRepository, connection: sqlite3.Connection
 ) -> None:

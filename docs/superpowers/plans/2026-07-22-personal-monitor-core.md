@@ -705,7 +705,7 @@ def transition_status(self, monitor_id: str, expected: MonitorStatus, target: Mo
 def soft_delete(self, monitor_id: str, *, disabled_at: datetime) -> None: ...
 ```
 
-Use `BEGIN IMMEDIATE` for version numbering and activation. `create_monitor()` creates version 1 already approved by `created_by`, then sets it active in the same transaction. `activate_version()` verifies that version belongs to the monitor and has non-null `approved_at`.
+Use `BEGIN IMMEDIATE` for version numbering and activation. An immediate operation must reject an already-active caller-owned transaction instead of degrading to a savepoint; non-immediate operations may use a savepoint without committing the caller's transaction. `create_monitor()` creates version 1 already approved by `created_by`, then sets it active in the same transaction. `activate_version()` verifies that version belongs to the monitor and has non-null `approved_at`.
 
 - [ ] **Step 5: Implement runtime operations**
 
@@ -732,7 +732,7 @@ def mark_delivered(self, outbox_id: str, *, message_id: str, delivered_at: datet
 def reschedule_outbox(self, outbox_id: str, *, available_at: datetime, error: str) -> None: ...
 ```
 
-All JSON uses `ensure_ascii=False`, `sort_keys=True`, and compact separators. IDs use `uuid.uuid4().hex`; timestamps are timezone-aware UTC ISO-8601 strings. Never place URL queries, cookies, response bodies, or exception reprs in `error_detail`.
+All JSON uses `ensure_ascii=False`, `sort_keys=True`, and compact separators. IDs use `uuid.uuid4().hex`; timestamps are timezone-aware UTC ISO-8601 strings. Stored `error_detail` and `last_error` values are closed safe diagnostic codes, never arbitrary text. `error_detail` may be `None`; otherwise `finish_run(error_detail=...)` and `reschedule_outbox(error=...)` accept only `required_field_missing`, `validation_failed`, `connection_timeout`, `network_error`, `authentication_failed`, `structure_changed`, `policy_rejected`, `delivery_failed`, `internal_error`, `timeout`, or `offline`. Never persist URL queries, cookies, response bodies, exception reprs, HTML, identifiers, or raw exception messages in those columns.
 
 - [ ] **Step 6: Run storage and full tests, then commit**
 
