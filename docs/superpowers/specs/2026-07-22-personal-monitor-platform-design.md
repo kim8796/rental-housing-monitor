@@ -167,7 +167,7 @@ Codex worker는 빈 read-only 작업 디렉터리에서 실행하고 운영 DB, 
 
 `source_adapter`는 `official_api`, `scrapling`, `python_plugin` 중 하나다. `official_api`와 `python_plugin`은 임의 모듈 경로가 아닌 배포 코드에 등록된 allowlist 키를 `adapter_ref`로 요구하고, `scrapling`은 `adapter_ref=null`만 허용한다. Scrapling의 `fetch_strategy`는 `auto`, `http`, `dynamic`, `stealthy` 중 하나이며 `auto`는 HTTP 요청부터 시작해 필요할 때만 브라우저 방식으로 승격한다.
 
-선택자는 실행 가능한 코드가 아니라 CSS/XPath와 제한된 텍스트·정규식 연산만 허용한다. 조건도 등록된 연산자 집합으로 표현하며 Python 표현식이나 셸 문자열을 저장하지 않는다. 모든 변경은 새 `monitor_versions` 행을 만들고 승인된 버전만 활성화한다.
+선택자는 실행 가능한 코드가 아니라 CSS/XPath와 제한된 텍스트·정규식 연산만 허용한다. 조건도 등록된 연산자 집합으로 표현하며 Python 표현식이나 셸 문자열을 저장하지 않는다. 모든 rule의 field는 `extract.fields`에 선언되어야 하고 숫자 임계값은 숫자형, keyword는 text, status literal은 선언형 scalar type과 호환되어야 한다. 어댑터 관측값도 선언되지 않은 field를 하나라도 포함하면 HTML·token 문자열을 포함해 diff와 저장 전에 거부한다. 모든 변경은 새 `monitor_versions` 행을 만들고 승인된 버전만 활성화한다.
 
 ## Scrapling 사용 방식
 
@@ -202,7 +202,9 @@ adaptive 기능은 요소 특징을 저장하고 구조 변경 시 후보를 찾
 - `pending_actions`: Telegram 확인 대기 작업, 만료 시각과 일회성 토큰 해시
 - `credential_refs`: 모니터와 암호화된 자격정보의 논리적 연결
 
-모니터 상태는 `active`, `paused_user`, `paused_auth`, `needs_review`, `disabled` 중 하나다. 사용자 요청은 직접 `active`와 `paused_user` 사이를 전환한다. 인증 만료는 `paused_auth`, 구조 또는 검증 실패는 `needs_review`로 전환한다. 삭제는 즉시 물리 삭제하지 않고 `disabled`와 삭제 시각을 기록하며 30일 뒤 관련 설정과 관측값을 정리한다. 삭제 취소는 이 30일 안에만 허용한다.
+모니터 상태는 `active`, `paused_user`, `paused_auth`, `needs_review`, `disabled` 중 하나다. 사용자 요청은 직접 `active`와 `paused_user` 사이를 전환한다. 사용자 상태 변경과 soft delete는 owner ID를 필수로 받고 SQL mutation predicate에서도 owner를 검사한다. 인증 만료는 `paused_auth`, 구조 또는 검증 실패는 `needs_review`로 전환한다. 삭제는 즉시 물리 삭제하지 않고 `disabled`와 삭제 시각을 기록하며 30일 뒤 관련 설정과 관측값을 정리한다. 삭제 취소는 이 30일 안에만 허용한다.
+
+온라인 observation/outbox 생성은 lease generation과 worker를 검사하는 하나의 atomic unit-of-work로만 수행한다. complete batch는 snapshot을 교체하지만 warning이 있는 partial batch는 실제로 관측된 item만 upsert하고 absent item을 삭제하거나 `last_seen_at`을 갱신하지 않는다. rule 계산을 위한 old-item merge는 runner 메모리 안에서만 수행하며 merged old item을 저장 unit에 다시 넘기지 않는다. Snapshot과 enqueue를 각각 수행하는 unfenced public API는 제공하지 않는다. 향후 offline importer가 필요하면 모든 서비스가 중지된 bootstrap 전용 경로로만 추가한다.
 
 정상 수집의 원시 응답은 추출 후 저장하지 않는다. 구조·검증 실패를 분석할 때만 script, style, hidden 요소와 Secret을 제거한 DOM 조각을 암호화해 최대 7일 보관한다. `runs`는 90일, 성공한 `deliveries`는 180일 보존하고, 활성 모니터의 정규화된 `observations`는 모니터가 삭제될 때까지 유지한다. 이 값은 개인용 1단계의 고정 기본값이며 다중 사용자 단계에서 사용자별 정책으로 바꾼다.
 

@@ -214,10 +214,6 @@ class RuntimeRepository:
             for row in rows
         ]
 
-    def upsert_items(self, batch: ObservationBatch) -> None:
-        with transaction(self.connection):
-            self._upsert_items(batch)
-
     def _upsert_items(self, batch: ObservationBatch) -> None:
         observed_at = utc_timestamp(batch.observed_at, parameter="observed_at")
         item_ids = [item.item_id for item in batch.items]
@@ -242,6 +238,8 @@ class RuntimeRepository:
             "last_seen_at = excluded.last_seen_at",
             values,
         )
+        if batch.warnings:
+            return
         if item_ids:
             placeholders = ", ".join("?" for _ in item_ids)
             self.connection.execute(
@@ -252,20 +250,6 @@ class RuntimeRepository:
         else:
             self.connection.execute(
                 "DELETE FROM observations WHERE monitor_id = ?", (batch.monitor_id,)
-            )
-
-    def enqueue_delivery(
-        self,
-        *,
-        dedupe_key: str,
-        monitor_id: str,
-        target_id: str,
-        payload: dict[str, object],
-    ) -> str:
-        with transaction(self.connection, immediate=True):
-            return self._enqueue_delivery(
-                monitor_id,
-                DeliveryCandidate(dedupe_key=dedupe_key, target_id=target_id, payload=payload),
             )
 
     def apply_snapshot_and_deliveries(

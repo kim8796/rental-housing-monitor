@@ -10,6 +10,7 @@ import pytest
 from personal_monitor.domain.spec import MonitorSpec
 from personal_monitor.engine.outbox import OutboxWorker
 from personal_monitor.storage import RegistryRepository, RuntimeRepository, open_database
+from tests.personal_monitor.sql_seed import seed_outbox
 
 NOW = datetime(2026, 7, 22, 3, 15, tzinfo=UTC)
 
@@ -75,11 +76,13 @@ def configured_worker(
     registry.create_user("owner-1", 1)
     registry.create_delivery_target("opaque-target-id", "owner-1", "chat-address-42")
     monitor_id = registry.create_monitor(make_spec(), created_by="owner-1")
-    outbox_id = runtime.enqueue_delivery(
+    outbox_id = seed_outbox(
+        connection,
         dedupe_key="delivery-1",
         monitor_id=monitor_id,
         target_id="opaque-target-id",
         payload={"text": "hello"},
+        available_at=NOW,
     )
     connection.execute(
         "UPDATE outbox SET available_at = ? WHERE id = ?", (NOW.isoformat(), outbox_id)

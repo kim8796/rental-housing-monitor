@@ -29,8 +29,9 @@ def validate_batch(spec: MonitorSpec, batch: ObservationBatch) -> None:
             if not _is_scalar(value):
                 raise BatchValidationError("field type invalid")
             field = spec.extract.fields.get(field_name)
-            if field is not None:
-                _validate_value(field.type, value, spec.validators.allowed_link_domains)
+            if field is None:
+                raise BatchValidationError("undeclared field")
+            _validate_value(field.type, value, spec.validators.allowed_link_domains)
         for field_name, field in spec.extract.fields.items():
             if field.required and (
                 field_name not in item.fields or item.fields[field_name] is None

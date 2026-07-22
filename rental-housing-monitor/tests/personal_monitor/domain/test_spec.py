@@ -271,3 +271,34 @@ def test_numeric_threshold_rejects_non_finite_values(value: float) -> None:
 
     with pytest.raises(ValidationError, match="finite"):
         MonitorSpec.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("rule", "message"),
+    [
+        ({"kind": "field_changed", "field": "prcie"}, "declared"),
+        (
+            {"kind": "numeric_threshold", "field": "title", "operator": "lte", "value": 1},
+            "numeric field",
+        ),
+        ({"kind": "keyword_match", "field": "price", "keywords": ["sale"]}, "text field"),
+        ({"kind": "status_equals", "field": "price", "value": "sold"}, "compatible"),
+    ],
+)
+def test_monitor_spec_rejects_rule_field_typos_and_type_mismatches(
+    rule: dict[str, object], message: str
+) -> None:
+    payload = valid_spec()
+    payload["rules"] = [rule]
+
+    with pytest.raises(ValidationError, match=message):
+        MonitorSpec.model_validate(payload)
+
+
+def test_status_equals_literal_type_is_compatible_and_round_trips() -> None:
+    payload = valid_spec()
+    payload["rules"] = [{"kind": "status_equals", "field": "title", "value": "sold"}]
+
+    spec = MonitorSpec.model_validate(payload)
+
+    assert spec.model_dump(mode="json", exclude_unset=True) == payload

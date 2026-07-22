@@ -269,9 +269,19 @@ def test_delivery_target_lookup_is_owner_scoped(registry: RegistryRepository) ->
 def test_status_transition_uses_compare_and_swap(registry: RegistryRepository) -> None:
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
 
-    registry.transition_status(monitor_id, MonitorStatus.ACTIVE, MonitorStatus.PAUSED_USER)
+    registry.transition_status(
+        monitor_id,
+        MonitorStatus.ACTIVE,
+        MonitorStatus.PAUSED_USER,
+        owner_id="telegram-user:1",
+    )
     with pytest.raises(ValueError, match="expected status"):
-        registry.transition_status(monitor_id, MonitorStatus.ACTIVE, MonitorStatus.NEEDS_REVIEW)
+        registry.transition_status(
+            monitor_id,
+            MonitorStatus.ACTIVE,
+            MonitorStatus.NEEDS_REVIEW,
+            owner_id="telegram-user:1",
+        )
 
     assert registry.list_monitors("telegram-user:1")[0].status is MonitorStatus.PAUSED_USER
 
@@ -281,10 +291,12 @@ def test_soft_delete_requires_aware_time_and_is_hidden_by_default(
 ) -> None:
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
     with pytest.raises(ValueError, match="timezone-aware"):
-        registry.soft_delete(monitor_id, disabled_at=datetime(2026, 1, 1))
+        registry.soft_delete(
+            monitor_id, owner_id="telegram-user:1", disabled_at=datetime(2026, 1, 1)
+        )
 
     disabled_at = datetime(2026, 1, 1, 9, 0, tzinfo=timezone(timedelta(hours=9)))
-    registry.soft_delete(monitor_id, disabled_at=disabled_at)
+    registry.soft_delete(monitor_id, owner_id="telegram-user:1", disabled_at=disabled_at)
 
     assert registry.list_monitors("telegram-user:1") == []
     assert registry.list_monitors("telegram-user:1", include_disabled=True)[0].status is (
@@ -294,3 +306,30 @@ def test_soft_delete_requires_aware_time_and_is_hidden_by_default(
         "SELECT disabled_at FROM monitors WHERE id = ?", (monitor_id,)
     ).fetchone()[0]
     assert stored == "2026-01-01T00:00:00+00:00"
+
+
+def test_wrong_owner_cannot_pause_monitor(registry: RegistryRepository) -> None:
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+
+    with pytest.raises(ValueError):
+        registry.transition_status(
+            monitor_id,
+            MonitorStatus.ACTIVE,
+            MonitorStatus.PAUSED_USER,
+            owner_id="telegram-user:2",
+        )
+
+    assert registry.list_monitors("telegram-user:1")[0].status is MonitorStatus.ACTIVE
+
+
+def test_wrong_owner_cannot_soft_delete_monitor(registry: RegistryRepository) -> None:
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+
+    with pytest.raises(ValueError):
+        registry.soft_delete(
+            monitor_id,
+            owner_id="telegram-user:2",
+            disabled_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+    assert registry.list_monitors("telegram-user:1")[0].status is MonitorStatus.ACTIVE

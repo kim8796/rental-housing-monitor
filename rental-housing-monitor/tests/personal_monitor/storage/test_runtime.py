@@ -20,6 +20,16 @@ from personal_monitor.storage import (
     RuntimeRepository,
     open_database,
 )
+from tests.personal_monitor.sql_seed import seed_outbox, seed_snapshot
+
+OUTBOX_AT = datetime(2099, 1, 1, tzinfo=UTC)
+
+
+def claim_monitor(runtime: RuntimeRepository, monitor_id: str, now: datetime) -> MonitorLease:
+    runtime.connection.execute(
+        "UPDATE monitors SET next_run_at = ? WHERE id = ?", (now.isoformat(), monitor_id)
+    )
+    return runtime.claim_due(worker_id="worker-1", now=now)[0]
 
 
 def make_spec(name: str = "가격 감시") -> MonitorSpec:
@@ -87,6 +97,11 @@ def test_claim_due_leases_only_active_due_monitors(
     ).fetchone()
     assert lease["lease_owner"] == "worker-1"
     assert lease["lease_expires_at"] == "2026-01-01T00:00:30+00:00"
+
+
+def test_runtime_exposes_no_unfenced_snapshot_or_outbox_mutation() -> None:
+    assert not hasattr(RuntimeRepository, "upsert_items")
+    assert not hasattr(RuntimeRepository, "enqueue_delivery")
 
 
 def test_expired_lease_can_be_reclaimed(
@@ -259,25 +274,25 @@ def observation_batch(
     )
 
 
-def test_upsert_items_replaces_snapshot_and_preserves_first_seen(
+def test_fenced_unit_replaces_snapshot_and_preserves_first_seen(
     repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
 ) -> None:
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
     first_at = datetime(2026, 1, 1, tzinfo=UTC)
-    runtime.upsert_items(
-        observation_batch(
-            monitor_id,
-            (
-                ObservedItem("a", {"title": "가", "price": 100}),
-                ObservedItem("b", {"title": "나", "price": 200}),
-            ),
-            first_at,
-        )
+    first_batch = observation_batch(
+        monitor_id,
+        (
+            ObservedItem("a", {"title": "가", "price": 100}),
+            ObservedItem("b", {"title": "나", "price": 200}),
+        ),
+        first_at,
     )
+    lease = claim_monitor(runtime, monitor_id, first_at)
+    runtime.apply_snapshot_and_deliveries(first_batch, (), lease=lease, worker_id="worker-1")
     second_at = datetime(2026, 1, 2, 9, 0, tzinfo=timezone(timedelta(hours=9)))
 
-    runtime.upsert_items(
+    runtime.apply_snapshot_and_deliveries(
         observation_batch(
             monitor_id,
             (
@@ -285,7 +300,10 @@ def test_upsert_items_replaces_snapshot_and_preserves_first_seen(
                 ObservedItem("c", {"title": "다", "price": 300}),
             ),
             second_at,
-        )
+        ),
+        (),
+        lease=lease,
+        worker_id="worker-1",
     )
 
     assert runtime.load_items(monitor_id) == [
@@ -308,11 +326,20 @@ def test_empty_successful_batch_clears_the_snapshot(
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
     observed_at = datetime(2026, 1, 1, tzinfo=UTC)
-    runtime.upsert_items(
-        observation_batch(monitor_id, (ObservedItem("a", {"price": 100}),), observed_at)
+    lease = claim_monitor(runtime, monitor_id, observed_at)
+    runtime.apply_snapshot_and_deliveries(
+        observation_batch(monitor_id, (ObservedItem("a", {"price": 100}),), observed_at),
+        (),
+        lease=lease,
+        worker_id="worker-1",
     )
 
-    runtime.upsert_items(observation_batch(monitor_id, (), observed_at + timedelta(hours=1)))
+    runtime.apply_snapshot_and_deliveries(
+        observation_batch(monitor_id, (), observed_at + timedelta(hours=1)),
+        (),
+        lease=lease,
+        worker_id="worker-1",
+    )
 
     assert runtime.load_items(monitor_id) == []
 
@@ -327,18 +354,27 @@ def test_invalid_observation_batch_does_not_replace_existing_snapshot(
         (ObservedItem("a", {"price": 100}),),
         datetime(2026, 1, 1, tzinfo=UTC),
     )
-    runtime.upsert_items(valid)
+    lease = claim_monitor(runtime, monitor_id, valid.observed_at)
+    runtime.apply_snapshot_and_deliveries(valid, (), lease=lease, worker_id="worker-1")
 
     with pytest.raises(ValueError, match="unique"):
-        runtime.upsert_items(
+        runtime.apply_snapshot_and_deliveries(
             observation_batch(
                 monitor_id,
                 (ObservedItem("a", {"price": 90}), ObservedItem("a", {"price": 80})),
                 datetime(2026, 1, 2, tzinfo=UTC),
-            )
+            ),
+            (),
+            lease=lease,
+            worker_id="worker-1",
         )
     with pytest.raises(ValueError, match="timezone-aware"):
-        runtime.upsert_items(observation_batch(monitor_id, (), datetime(2026, 1, 2)))
+        runtime.apply_snapshot_and_deliveries(
+            observation_batch(monitor_id, (), datetime(2026, 1, 2)),
+            (),
+            lease=lease,
+            worker_id="worker-1",
+        )
 
     assert runtime.load_items(monitor_id) == [ObservedItem("a", {"price": 100})]
 
@@ -373,7 +409,7 @@ def test_snapshot_and_all_delivery_candidates_commit_or_rollback_as_one_unit(
         (ObservedItem("listing", {"price": 90}),),
         datetime(2026, 1, 2, tzinfo=UTC),
     )
-    runtime.upsert_items(old_batch)
+    seed_snapshot(connection, old_batch)
     candidates = (
         DeliveryCandidate("first", "target-1", {"text": "first"}),
         DeliveryCandidate("fail", "target-1", {"text": "second"}),
@@ -417,18 +453,23 @@ def test_delivery_key_is_idempotent_and_payload_json_is_deterministic(
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
 
-    first = runtime.enqueue_delivery(
-        dedupe_key="m1:p1:numeric_threshold:price:99000",
-        monitor_id=monitor_id,
-        target_id="target-1",
-        payload={"text": "가격이 99,000원입니다", "meta": {"b": 2, "a": 1}},
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    lease = claim_monitor(runtime, monitor_id, observed_at)
+    candidate = DeliveryCandidate(
+        "m1:p1:numeric_threshold:price:99000",
+        "target-1",
+        {"text": "가격이 99,000원입니다", "meta": {"b": 2, "a": 1}},
     )
-    second = runtime.enqueue_delivery(
-        dedupe_key="m1:p1:numeric_threshold:price:99000",
-        monitor_id=monitor_id,
-        target_id="target-1",
-        payload={"text": "ignored duplicate"},
-    )
+    batch = observation_batch(monitor_id, (), observed_at)
+    first = runtime.apply_snapshot_and_deliveries(
+        batch, (candidate,), lease=lease, worker_id="worker-1"
+    )[0]
+    second = runtime.apply_snapshot_and_deliveries(
+        batch,
+        (DeliveryCandidate(candidate.dedupe_key, "target-1", {"text": "ignored duplicate"}),),
+        lease=lease,
+        worker_id="worker-1",
+    )[0]
 
     assert first == second
     row = connection.execute("SELECT payload_json FROM outbox").fetchone()
@@ -441,17 +482,21 @@ def test_claim_due_outbox_orders_retries_and_delivery_removes_item_from_due_work
 ) -> None:
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
-    later = runtime.enqueue_delivery(
+    later = seed_outbox(
+        connection,
         dedupe_key="later",
         monitor_id=monitor_id,
         target_id="target-1",
         payload={"text": "later"},
+        available_at=OUTBOX_AT,
     )
-    first = runtime.enqueue_delivery(
+    first = seed_outbox(
+        connection,
         dedupe_key="first",
         monitor_id=monitor_id,
         target_id="target-1",
         payload={"text": "first"},
+        available_at=OUTBOX_AT,
     )
     base = datetime(2099, 1, 1, tzinfo=UTC)
     connection.execute(
@@ -489,11 +534,13 @@ def test_two_workers_cannot_claim_the_same_unexpired_outbox_lease(
 ) -> None:
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
-    outbox_id = runtime.enqueue_delivery(
+    outbox_id = seed_outbox(
+        connection,
         dedupe_key="exclusive",
         monitor_id=monitor_id,
         target_id="target-1",
         payload={"text": "exclusive"},
+        available_at=OUTBOX_AT,
     )
     now = datetime(2099, 1, 1, tzinfo=UTC)
     connection.execute("UPDATE outbox SET available_at = ?", (now.isoformat(),))
@@ -513,11 +560,13 @@ def test_expired_outbox_lease_is_recoverable_by_another_worker(
 ) -> None:
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
-    outbox_id = runtime.enqueue_delivery(
+    outbox_id = seed_outbox(
+        connection,
         dedupe_key="recoverable",
         monitor_id=monitor_id,
         target_id="target-1",
         payload={"text": "recoverable"},
+        available_at=OUTBOX_AT,
     )
     now = datetime(2099, 1, 1, tzinfo=UTC)
     connection.execute("UPDATE outbox SET available_at = ?", (now.isoformat(),))
@@ -545,11 +594,13 @@ def test_outbox_completion_and_retry_require_claiming_worker(
 ) -> None:
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
-    outbox_id = runtime.enqueue_delivery(
+    outbox_id = seed_outbox(
+        connection,
         dedupe_key="owned",
         monitor_id=monitor_id,
         target_id="target-1",
         payload={"text": "owned"},
+        available_at=OUTBOX_AT,
     )
     now = datetime(2099, 1, 1, tzinfo=UTC)
     connection.execute("UPDATE outbox SET available_at = ?", (now.isoformat(),))
@@ -578,11 +629,13 @@ def test_outbox_retry_updates_attempt_and_rejects_unsafe_or_naive_values(
 ) -> None:
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
-    outbox_id = runtime.enqueue_delivery(
+    outbox_id = seed_outbox(
+        connection,
         dedupe_key="retry",
         monitor_id=monitor_id,
         target_id="target-1",
         payload={"text": "retry"},
+        available_at=OUTBOX_AT,
     )
     claim_at = datetime(2099, 1, 1, tzinfo=UTC)
     connection.execute("UPDATE outbox SET available_at = ?", (claim_at.isoformat(),))

@@ -247,23 +247,29 @@ class RegistryRepository:
         ]
 
     def transition_status(
-        self, monitor_id: str, expected: MonitorStatus, target: MonitorStatus
+        self,
+        monitor_id: str,
+        expected: MonitorStatus,
+        target: MonitorStatus,
+        *,
+        owner_id: str,
     ) -> None:
         with transaction(self.connection):
             cursor = self.connection.execute(
-                "UPDATE monitors SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
-                (target.value, utc_now().isoformat(), monitor_id, expected.value),
+                "UPDATE monitors SET status = ?, updated_at = ? "
+                "WHERE id = ? AND owner_id = ? AND status = ?",
+                (target.value, utc_now().isoformat(), monitor_id, owner_id, expected.value),
             )
             if cursor.rowcount != 1:
                 raise ValueError("monitor is not in the expected status")
 
-    def soft_delete(self, monitor_id: str, *, disabled_at: datetime) -> None:
+    def soft_delete(self, monitor_id: str, *, owner_id: str, disabled_at: datetime) -> None:
         timestamp = utc_timestamp(disabled_at, parameter="disabled_at")
         with transaction(self.connection):
             cursor = self.connection.execute(
                 "UPDATE monitors SET status = ?, disabled_at = ?, lease_owner = NULL, "
-                "lease_expires_at = NULL, updated_at = ? WHERE id = ?",
-                (MonitorStatus.DISABLED.value, timestamp, timestamp, monitor_id),
+                "lease_expires_at = NULL, updated_at = ? WHERE id = ? AND owner_id = ?",
+                (MonitorStatus.DISABLED.value, timestamp, timestamp, monitor_id, owner_id),
             )
             if cursor.rowcount != 1:
-                raise ValueError("monitor does not exist")
+                raise ValueError("monitor does not exist for owner")

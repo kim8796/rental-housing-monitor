@@ -288,3 +288,34 @@ class MonitorSpec(StrictModel):
         if self.source_adapter is not SourceAdapterKind.SCRAPLING and self.adapter_ref is None:
             raise ValueError("official_api and python_plugin require adapter_ref")
         return self
+
+    @model_validator(mode="after")
+    def rules_match_extract_schema(self) -> MonitorSpec:
+        numeric_types = {FieldType.INTEGER, FieldType.DECIMAL, FieldType.KRW}
+        for rule in self.rules:
+            if rule.field is None:
+                continue
+            field = self.extract.fields.get(rule.field)
+            if field is None:
+                raise ValueError("rule field must be declared in extract.fields")
+            if rule.kind is RuleKind.NUMERIC_THRESHOLD and field.type not in numeric_types:
+                raise ValueError("numeric_threshold requires a numeric field")
+            if rule.kind is RuleKind.KEYWORD_MATCH and field.type is not FieldType.TEXT:
+                raise ValueError("keyword_match requires a text field")
+            if rule.kind is RuleKind.STATUS_EQUALS and not _literal_matches_field(
+                rule.value, field.type
+            ):
+                raise ValueError("status_equals literal must be compatible with its field type")
+        return self
+
+
+def _literal_matches_field(value: str | int | float | bool | None, field_type: FieldType) -> bool:
+    if field_type in {FieldType.TEXT, FieldType.DATE, FieldType.DATETIME, FieldType.URL}:
+        return isinstance(value, str)
+    if field_type is FieldType.INTEGER:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if field_type in {FieldType.DECIMAL, FieldType.KRW}:
+        return isinstance(value, int | float) and not isinstance(value, bool) and isfinite(value)
+    if field_type is FieldType.BOOLEAN:
+        return isinstance(value, bool)
+    return False

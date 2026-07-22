@@ -387,6 +387,11 @@ class MonitorSpec(StrictModel):
         return self
 ```
 
+The complete `MonitorSpec` also validates every rule against `extract.fields`: every named rule
+field must exist, `numeric_threshold` accepts only `integer`, `decimal`, or `krw`, `keyword_match`
+accepts only `text`, and `status_equals.value` must have the declared field's deterministic scalar
+type. These invariants are preserved by JSON and schema round trips.
+
 - [ ] **Step 4: Run the schema test and export a schema fixture**
 
 Run: `cd rental-housing-monitor && ../.venv/bin/python -m pytest tests/personal_monitor/domain/test_spec.py -q`
@@ -558,19 +563,16 @@ def test_unapproved_version_cannot_become_active(registry, monitor_spec) -> None
         registry.activate_version(monitor_id, candidate)
 
 
-def test_delivery_key_is_idempotent(runtime) -> None:
-    first = runtime.enqueue_delivery(
-        dedupe_key="m1:p1:numeric_threshold:price:99000",
-        monitor_id="m1",
-        target_id="t1",
-        payload={"text": "가격이 99,000원입니다"},
+def test_delivery_key_is_idempotent(runtime, batch, lease) -> None:
+    candidate = DeliveryCandidate(
+        "m1:p1:numeric_threshold:price:99000", "t1", {"text": "가격이 99,000원입니다"}
     )
-    second = runtime.enqueue_delivery(
-        dedupe_key="m1:p1:numeric_threshold:price:99000",
-        monitor_id="m1",
-        target_id="t1",
-        payload={"text": "가격이 99,000원입니다"},
-    )
+    first = runtime.apply_snapshot_and_deliveries(
+        batch, (candidate,), lease=lease, worker_id="worker-1"
+    )[0]
+    second = runtime.apply_snapshot_and_deliveries(
+        batch, (candidate,), lease=lease, worker_id="worker-1"
+    )[0]
     assert first == second
     assert runtime.connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 1
 
@@ -710,11 +712,11 @@ def get_active_monitor(self, monitor_id: str) -> ActiveMonitor: ...
 def get_primary_target(self, owner_id: str) -> DeliveryTargetRow: ...
 def get_delivery_target(self, target_id: str) -> DeliveryTargetRow: ...
 def list_monitors(self, owner_id: str, *, include_disabled: bool = False) -> list[MonitorRow]: ...
-def transition_status(self, monitor_id: str, expected: MonitorStatus, target: MonitorStatus) -> None: ...
-def soft_delete(self, monitor_id: str, *, disabled_at: datetime) -> None: ...
+def transition_status(self, monitor_id: str, expected: MonitorStatus, target: MonitorStatus, *, owner_id: str) -> None: ...
+def soft_delete(self, monitor_id: str, *, owner_id: str, disabled_at: datetime) -> None: ...
 ```
 
-Use `BEGIN IMMEDIATE` for version numbering and activation. An immediate operation must reject an already-active caller-owned transaction instead of degrading to a savepoint; non-immediate operations may use a savepoint without committing the caller's transaction. `create_monitor()` creates version 1 already approved by `created_by`, then sets it active in the same transaction. `activate_version()` verifies that version belongs to the monitor and has non-null `approved_at`.
+Use `BEGIN IMMEDIATE` for version numbering and activation. An immediate operation must reject an already-active caller-owned transaction instead of degrading to a savepoint; non-immediate operations may use a savepoint without committing the caller's transaction. `create_monitor()` creates version 1 already approved by `created_by`, then sets it active in the same transaction. `activate_version()` verifies that version belongs to the monitor and has non-null `approved_at`. User-facing status transitions and soft deletion require `owner_id` and include it in the mutation SQL predicate, so a wrong owner cannot pause or delete another monitor.
 
 - [ ] **Step 5: Implement runtime operations**
 
@@ -747,8 +749,6 @@ def release_lease(self, lease: MonitorLease, *, worker_id: str, next_run_at: dat
 def start_run(self, lease: MonitorLease, version_id: str, *, worker_id: str, fetch_strategy: str, started_at: datetime) -> str: ...
 def finish_run(self, run_id: str, *, lease: MonitorLease, worker_id: str, status: str, stage: str, error_class: str | None = None, error_detail: str | None = None) -> None: ...
 def load_items(self, monitor_id: str) -> list[ObservedItem]: ...
-def upsert_items(self, batch: ObservationBatch) -> None: ...
-def enqueue_delivery(self, *, dedupe_key: str, monitor_id: str, target_id: str, payload: dict[str, object]) -> str: ...
 def apply_snapshot_and_deliveries(self, batch: ObservationBatch, candidates: Sequence[DeliveryCandidate], *, lease: MonitorLease, worker_id: str) -> list[str]: ...
 def claim_due_outbox(self, *, worker_id: str, now: datetime, lease_seconds: int = 300, limit: int = 50) -> list[OutboxRow]: ...
 def mark_delivered(self, outbox_id: str, *, worker_id: str, message_id: str, delivered_at: datetime) -> None: ...
@@ -757,10 +757,14 @@ def reschedule_outbox(self, outbox_id: str, *, worker_id: str, available_at: dat
 
 All JSON uses `ensure_ascii=False`, `sort_keys=True`, and compact separators. IDs use `uuid.uuid4().hex`; timestamps are timezone-aware UTC ISO-8601 strings. Stored `error_detail` and `last_error` values are closed safe diagnostic codes, never arbitrary text. `error_detail` may be `None`; otherwise `finish_run(error_detail=...)` and `reschedule_outbox(error=...)` accept only `required_field_missing`, `validation_failed`, `connection_timeout`, `network_error`, `authentication_failed`, `structure_changed`, `policy_rejected`, `delivery_failed`, `internal_error`, `timeout`, or `offline`. Never persist URL queries, cookies, response bodies, exception reprs, HTML, identifiers, or raw exception messages in those columns.
 
-`apply_snapshot_and_deliveries()` accepts immutable candidate inputs, then replaces the current
-snapshot and inserts all deduplicated outbox rows in one `BEGIN IMMEDIATE`; any snapshot or enqueue
-failure rolls back the entire unit. Snapshot and enqueue public methods reuse private
-transaction-local helpers rather than nesting immediate transactions.
+`apply_snapshot_and_deliveries()` is the only public observation/outbox creation mutation. It
+accepts immutable candidate inputs, checks the exact monitor lease, then applies supplied
+observations and inserts all deduplicated outbox rows in one `BEGIN IMMEDIATE`; any observation or
+enqueue failure rolls back the entire unit. Complete batches replace the snapshot. Warning-bearing
+partial batches upsert only supplied items and do not delete or refresh absent rows. Private
+transaction-local helpers are not public unfenced methods. A future offline importer may use a
+dedicated private/bootstrap path only while all services are stopped; it must not restore an online
+public bypass.
 
 `claim_due_outbox()` atomically leases only pending, available rows whose lease is absent or
 expired. Delivery completion and retry are compare-and-set operations requiring the claiming
@@ -941,8 +945,10 @@ run_id = runtime.start_run(monitor_id, active.version_id, started_at=clock.now()
 batch = await adapters.resolve(spec.source_adapter, spec.adapter_ref).fetch(monitor_id, spec)
 if batch.monitor_id != monitor_id:
     raise MonitorError(ErrorClass.VALIDATION, "validate", "batch monitor mismatch")
+validate_batch(spec, batch)
 previous = runtime.load_items(monitor_id)
-changes = diff_items(previous, list(batch.items))
+current_items = merge_in_memory_only_when_warning_batch(batch, previous)
+changes = diff_items(previous, current_items)
 candidates: list[DeliveryCandidate] = []
 matched_count = 0
 for change in changes:
@@ -983,9 +989,11 @@ else:
 runtime.apply_snapshot_and_deliveries(batch, candidates)
 ```
 
-The governing execution order is exact: fetch → ownership check → load previous snapshot/diff →
-compute every delivery candidate → atomically apply snapshot plus candidates. Ownership validation
-must remain immediately after fetch because adapter output is untrusted.
+The governing execution order is exact: fetch → ownership check → deterministic batch validation →
+load previous snapshot/diff → compute every delivery candidate → atomically apply the original
+adapter batch plus candidates. Ownership validation must remain immediately after fetch because
+adapter output is untrusted. A warning batch may merge old items only in memory for diff/rule
+evaluation; the runner never passes absent old items back as newly observed.
 
 After `start_run()` succeeds, execution produces one immutable final outcome. Cleanup is a separate
 phase: attempt any failure status transition without allowing it to skip later cleanup; compute the
@@ -1132,12 +1140,16 @@ These amendments supersede earlier interface snippets in Tasks 2, 4, 5, 6, and 7
 - `start_run()` stores the active spec's fetch strategy. Atomic delivery enqueue verifies every
   delivery target owner equals the monitor owner; a mismatch rolls back snapshot and outbox work.
 - `validate_batch()` is the deterministic adapter boundary before diff or persistence. Complete
-  batches enforce configured min/max counts, required fields, declared scalar types, finite numeric
-  values, and exact allowed URL hosts. Warning-bearing partial batches still enforce max/type/
-  required/domain safety but may fall below min; their supplied items merge into the old snapshot,
-  absent old items are preserved, and removals are suppressed. An empty partial batch preserves the
-  full snapshot while fixed warning candidates may be enqueued atomically. Warning and no-change
-  dedupe dates use the monitor timezone.
+  batches enforce configured min/max counts, required fields, an exact declared-field allowlist,
+  declared scalar types, finite numeric values, and exact allowed URL hosts. Undeclared adapter
+  fields—including raw HTML or token-bearing fields—are rejected before diff, observation, outbox,
+  or diagnostic persistence. Warning-bearing partial batches still enforce max/type/required/domain
+  safety but may fall below min; their supplied items merge with old items only in memory for rule
+  evaluation. Storage upserts only supplied items, leaves absent rows and `last_seen_at` unchanged,
+  and suppresses removals. An empty partial batch preserves the full snapshot while fixed warning
+  candidates may be enqueued atomically. Warning and no-change dedupe dates use the monitor timezone.
+- Every rule field exists in `extract.fields`; numeric and keyword rules target compatible numeric
+  and text types, and status literals match their declared scalar types deterministically.
 - Only `database init` may create directories/files or apply migrations. `integrity-check`,
   `vacuum`, and `maintenance run` open an already initialized file read/write without migrating and
   fail safely on missing paths. Run retention uses `finished_at`, falling back to `started_at` for

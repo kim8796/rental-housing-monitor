@@ -106,3 +106,11 @@ def test_required_types_finite_numbers_and_exact_url_hosts_are_enforced(
 
 def test_validator_accepts_a_complete_valid_batch() -> None:
     validate_batch(make_spec(), batch(valid_item()))
+
+
+def test_validator_rejects_every_undeclared_field_including_raw_html() -> None:
+    fields = dict(valid_item().fields)
+    fields["html"] = "<html>token=adapter-secret</html>"
+
+    with pytest.raises(BatchValidationError, match="undeclared field"):
+        validate_batch(make_spec(), batch(ObservedItem("one", fields)))

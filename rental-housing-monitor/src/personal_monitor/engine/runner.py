@@ -135,10 +135,10 @@ class MonitorRunner:
                 ErrorClass.VALIDATION, "validate", "adapter batch validation failed"
             ) from error
         previous = self.runtime.load_items(monitor_id)
-        snapshot_batch = _snapshot_batch(batch, previous)
-        changes = diff_items(previous, list(snapshot_batch.items))
+        current_items = _current_items(batch, previous)
+        changes = diff_items(previous, current_items)
         previous_by_id = {item.item_id: item for item in previous}
-        current_by_id = {item.item_id: item for item in snapshot_batch.items}
+        current_by_id = {item.item_id: item for item in current_items}
         candidates: list[DeliveryCandidate] = []
         matched_count = 0
         for change in changes:
@@ -186,7 +186,7 @@ class MonitorRunner:
         else:
             run_status = "success"
         self.runtime.apply_snapshot_and_deliveries(
-            snapshot_batch, candidates, lease=lease, worker_id=self.worker_id
+            batch, candidates, lease=lease, worker_id=self.worker_id
         )
         return RunResult(
             status=run_status,
@@ -311,19 +311,12 @@ def _aware_fallback(value: datetime) -> datetime:
     return value.astimezone(UTC) + timedelta(minutes=5)
 
 
-def _snapshot_batch(batch: ObservationBatch, previous: list[ObservedItem]) -> ObservationBatch:
+def _current_items(batch: ObservationBatch, previous: list[ObservedItem]) -> list[ObservedItem]:
     if not batch.warnings:
-        return batch
+        return list(batch.items)
     merged = {item.item_id: item for item in previous}
     merged.update((item.item_id, item) for item in batch.items)
-    return ObservationBatch(
-        monitor_id=batch.monitor_id,
-        items=tuple(merged[item_id] for item_id in sorted(merged)),
-        observed_at=batch.observed_at,
-        source_hash=batch.source_hash,
-        source_status=batch.source_status,
-        warnings=batch.warnings,
-    )
+    return [merged[item_id] for item_id in sorted(merged)]
 
 
 def render_payload(spec: MonitorSpec, item: ObservedItem, match: RuleMatch) -> dict[str, object]:

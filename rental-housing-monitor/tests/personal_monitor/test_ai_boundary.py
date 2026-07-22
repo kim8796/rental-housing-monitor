@@ -26,11 +26,7 @@ def test_scheduled_runtime_import_graph_contains_no_ai_module() -> None:
             for node in ast.walk(tree)
             if isinstance(node, ast.Import)
             for alias in node.names
-        } | {
-            node.module or ""
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-        }
+        } | {node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
         assert not any(
             name == "personal_monitor.ai" or name.startswith("personal_monitor.ai.")
             for name in imported_modules

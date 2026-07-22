@@ -36,6 +36,7 @@ from personal_monitor.storage import (
     RuntimeRepository,
     open_database,
 )
+from tests.personal_monitor.sql_seed import seed_snapshot
 
 NOW = datetime(2026, 7, 22, 3, 0, tzinfo=UTC)
 
@@ -199,7 +200,7 @@ def test_successful_run_queues_only_idempotent_outbox_and_releases_lease(
 ) -> None:
     batch = ObservationBatch(
         monitor_id="placeholder",
-        items=(ObservedItem("listing-1", {"price": 900, "html": "<b>secret</b>"}),),
+        items=(ObservedItem("listing-1", {"price": 900}),),
         observed_at=NOW,
         source_hash="hash",
     )
@@ -222,7 +223,6 @@ def test_successful_run_queues_only_idempotent_outbox_and_releases_lease(
     assert "real-chat-address" not in row["payload_json"]
     assert "view=private" not in row["payload_json"]
     assert "#secret" not in row["payload_json"]
-    assert "<b>secret</b>" not in row["payload_json"]
     monitor = connection.execute(
         "SELECT lease_owner, lease_expires_at, next_run_at FROM monitors WHERE id = ?",
         (monitor_id,),
@@ -281,9 +281,6 @@ def test_runner_precomputes_candidates_then_applies_snapshot_and_outbox_once(
     applied: list[tuple[ObservationBatch, tuple[DeliveryCandidate, ...]]] = []
     original_apply = runtime.apply_snapshot_and_deliveries
 
-    def forbid_split_write(*args: object, **kwargs: object) -> None:
-        raise AssertionError("runner used a split snapshot/outbox write")
-
     def record_apply(
         batch: ObservationBatch,
         candidates: Sequence[DeliveryCandidate],
@@ -293,8 +290,6 @@ def test_runner_precomputes_candidates_then_applies_snapshot_and_outbox_once(
         applied.append((batch, frozen_candidates))
         return original_apply(batch, frozen_candidates, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(runtime, "upsert_items", forbid_split_write)
-    monkeypatch.setattr(runtime, "enqueue_delivery", forbid_split_write)
     monkeypatch.setattr(runtime, "apply_snapshot_and_deliveries", record_apply)
 
     result = asyncio.run(runner.run(lease))
@@ -337,7 +332,12 @@ def test_atomic_enqueue_failure_preserves_old_snapshot_so_retry_recreates_notifi
     assert first.status == "failed"
     assert runtime.load_items(monitor_id) == []
     assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
-    registry.transition_status(monitor_id, MonitorStatus.NEEDS_REVIEW, MonitorStatus.ACTIVE)
+    registry.transition_status(
+        monitor_id,
+        MonitorStatus.NEEDS_REVIEW,
+        MonitorStatus.ACTIVE,
+        owner_id="owner-1",
+    )
     connection.execute(
         "UPDATE monitors SET next_run_at = ? WHERE id = ?", (NOW.isoformat(), monitor_id)
     )
@@ -400,13 +400,14 @@ def test_invalid_complete_batch_preserves_snapshot_and_transitions_validation_fa
         monitor_id="placeholder", items=(), observed_at=NOW, source_hash="empty"
     )
     runner, monitor_id, _, runtime, adapter, lease = configured_runner(connection, batch, spec=spec)
-    runtime.upsert_items(
+    seed_snapshot(
+        connection,
         ObservationBatch(
             monitor_id=monitor_id,
             items=(ObservedItem("existing", {"price": 100}),),
             observed_at=NOW - timedelta(hours=1),
             source_hash="old",
-        )
+        ),
     )
     adapter.batch = ObservationBatch(
         monitor_id=monitor_id, items=(), observed_at=NOW, source_hash="empty"
@@ -476,7 +477,10 @@ def test_warning_partial_batch_preserves_absent_items_and_avoids_realert_flood(
         ObservedItem("old-a", {"price": 100}),
         ObservedItem("old-b", {"price": 120}),
     )
-    runtime.upsert_items(ObservationBatch(monitor_id, previous, NOW - timedelta(hours=1), "old"))
+    seed_snapshot(
+        connection,
+        ObservationBatch(monitor_id, previous, NOW - timedelta(hours=1), "old"),
+    )
     adapter.batch = ObservationBatch(
         monitor_id,
         partial.items,
@@ -492,6 +496,18 @@ def test_warning_partial_batch_preserves_absent_items_and_avoids_realert_flood(
         ObservedItem("new", {"price": 80}),
         *previous,
     ]
+    seen_at = {
+        row["item_id"]: row["last_seen_at"]
+        for row in connection.execute(
+            "SELECT item_id, last_seen_at FROM observations WHERE monitor_id = ?",
+            (monitor_id,),
+        )
+    }
+    assert seen_at == {
+        "new": NOW.isoformat(),
+        "old-a": (NOW - timedelta(hours=1)).isoformat(),
+        "old-b": (NOW - timedelta(hours=1)).isoformat(),
+    }
     assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 2
 
     connection.execute(
@@ -527,7 +543,7 @@ def test_empty_warning_batch_preserves_snapshot_and_uses_monitor_local_warning_d
         connection, partial, spec=spec
     )
     previous = (ObservedItem("old", {"price": 100}),)
-    runtime.upsert_items(ObservationBatch(monitor_id, previous, NOW, "old"))
+    seed_snapshot(connection, ObservationBatch(monitor_id, previous, NOW, "old"))
     adapter.batch = ObservationBatch(
         monitor_id,
         (),
@@ -685,7 +701,7 @@ def test_mismatched_adapter_batch_fails_validation_before_snapshot_or_outbox_mut
         observed_at=NOW,
         source_hash="old",
     )
-    runtime.upsert_items(previous)
+    seed_snapshot(connection, previous)
 
     def forbid_previous_load(*args: object, **kwargs: object) -> list[ObservedItem]:
         raise AssertionError("previous snapshot loaded before ownership validation")
@@ -702,6 +718,32 @@ def test_mismatched_adapter_batch_fails_validation_before_snapshot_or_outbox_mut
     assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
     run = connection.execute("SELECT stage, error_detail FROM runs").fetchone()
     assert tuple(run) == ("validate", "validation_failed")
+
+
+def test_undeclared_raw_html_and_token_are_rejected_without_any_persistence(
+    connection: sqlite3.Connection,
+) -> None:
+    secret = "<html>token=adapter-secret</html>"
+    batch = ObservationBatch(
+        monitor_id="placeholder",
+        items=(ObservedItem("listing-1", {"price": 900, "html": secret}),),
+        observed_at=NOW,
+        source_hash="hash",
+    )
+    runner, monitor_id, _, _, adapter, lease = configured_runner(connection, batch)
+    adapter.batch = ObservationBatch(
+        monitor_id=monitor_id,
+        items=batch.items,
+        observed_at=NOW,
+        source_hash="hash",
+    )
+
+    result = asyncio.run(runner.run(lease))
+
+    assert result.status == "failed"
+    assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
+    assert secret not in "\n".join(connection.iterdump())
 
 
 def test_finish_failure_is_attempted_once_and_cannot_skip_release(

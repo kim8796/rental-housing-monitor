@@ -13,6 +13,7 @@ from personal_monitor.storage import (
     RuntimeRepository,
     open_database,
 )
+from tests.personal_monitor.sql_seed import seed_snapshot
 
 NOW = datetime(2026, 7, 22, 3, 0, tzinfo=UTC)
 
@@ -164,7 +165,7 @@ def test_atomic_enqueue_rejects_cross_owner_target_and_rolls_back_snapshot() -> 
         observed_at=NOW,
         source_hash="old",
     )
-    runtime.upsert_items(old)
+    seed_snapshot(connection, old)
     new = ObservationBatch(
         monitor_id=monitor_id,
         items=(ObservedItem("new", {"price": 90}),),
