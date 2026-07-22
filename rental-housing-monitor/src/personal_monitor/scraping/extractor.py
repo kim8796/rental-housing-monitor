@@ -24,7 +24,6 @@ _MAX_INLINE_STYLE_LENGTH = 4096
 _MAX_JSON_DEPTH = 100
 _MAX_JSON_NODES = 100_000
 _XPATH_WORD_OPERATORS = frozenset({"and", "div", "mod", "or"})
-_XPATH_SYMBOL_OPERATORS = frozenset({"(", "[", "|", ",", "=", "!", "<", ">", "+", "-"})
 
 
 class DeclarativeExtractor:
@@ -131,47 +130,83 @@ def _select(node: Selector, selector: str, *, scoped: bool) -> Sequence[Selector
 
 def _scope_xpath(selector: str) -> str:
     result: list[str] = []
-    quote: str | None = None
-    previous_significant: str | None = None
-    for index, character in enumerate(selector):
-        if quote is not None:
+    index = 0
+    expects_operand = True
+    while index < len(selector):
+        character = selector[index]
+        if character.isspace():
             result.append(character)
-            if character == quote:
-                quote = None
+            index += 1
             continue
         if character in {'"', "'"}:
-            quote = character
-            result.append(character)
-            previous_significant = character
+            end = index + 1
+            while end < len(selector) and selector[end] != character:
+                end += 1
+            end = min(end + 1, len(selector))
+            result.append(selector[index:end])
+            expects_operand = False
+            index = end
             continue
-        if character == "/" and _starts_xpath_operand(
-            result,
-            previous_significant,
-            preceded_by_whitespace=index > 0 and selector[index - 1].isspace(),
-        ):
-            result.append(".")
+        if selector.startswith("::", index):
+            result.append("::")
+            expects_operand = True
+            index += 2
+            continue
+        if character == "/":
+            token = "//" if selector.startswith("//", index) else "/"
+            if expects_operand:
+                result.append(".")
+            result.append(token)
+            expects_operand = True
+            index += len(token)
+            continue
+        if character == ".":
+            token = ".." if selector.startswith("..", index) else "."
+            result.append(token)
+            expects_operand = False
+            index += len(token)
+            continue
+        if character.isdigit():
+            end = index + 1
+            while end < len(selector) and (selector[end].isdigit() or selector[end] == "."):
+                end += 1
+            result.append(selector[index:end])
+            expects_operand = False
+            index = end
+            continue
+        if character.isalpha() or character == "_":
+            end = index + 1
+            while end < len(selector):
+                candidate = selector[end]
+                if candidate.isalnum() or candidate in {"_", "-", "."}:
+                    end += 1
+                    continue
+                if candidate == ":" and not selector.startswith("::", end):
+                    end += 1
+                    continue
+                break
+            token = selector[index:end]
+            result.append(token)
+            if not expects_operand and token.casefold() in _XPATH_WORD_OPERATORS:
+                expects_operand = True
+            else:
+                expects_operand = False
+            index = end
+            continue
         result.append(character)
-        if not character.isspace():
-            previous_significant = character
+        if character in {"(", "[", "|", ",", "=", "!", "<", ">", "+", "-"}:
+            expects_operand = True
+        elif character in {
+            ")",
+            "]",
+        }:
+            expects_operand = False
+        elif character == "@":
+            expects_operand = True
+        elif character == "*":
+            expects_operand = not expects_operand
+        index += 1
     return "".join(result)
-
-
-def _starts_xpath_operand(
-    prefix: list[str],
-    previous_significant: str | None,
-    *,
-    preceded_by_whitespace: bool,
-) -> bool:
-    if previous_significant is None or previous_significant in _XPATH_SYMBOL_OPERATORS:
-        return True
-    compact_prefix = "".join(prefix).rstrip()
-    if previous_significant == "*":
-        before_star = compact_prefix[:-1].rstrip()
-        return not before_star.endswith(("/", ":"))
-    if not preceded_by_whitespace:
-        return False
-    word = re.search(r"([a-z]+)$", compact_prefix, re.IGNORECASE)
-    return word is not None and word.group(1).casefold() in _XPATH_WORD_OPERATORS
 
 
 def _visible_text(match: Selector) -> str:

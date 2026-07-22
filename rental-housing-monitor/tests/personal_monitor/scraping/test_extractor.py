@@ -181,6 +181,52 @@ def test_absolute_xpath_operands_after_numeric_word_operators_are_item_scoped(
     assert rows[0].fields["title"] == "A 2"
 
 
+@pytest.mark.parametrize(
+    ("selector", "body"),
+    [
+        ("(/div / h1)[1]", b"<main><div><h1>C</h1></div></main>"),
+        (
+            "(/or / and / mod / h1)[1]",
+            b"<main><or><and><mod><h1>C</h1></mod></and></or></main>",
+        ),
+        ("(/my-div / h1)[1]", b"<main><my-div><h1>C</h1></my-div></main>"),
+    ],
+)
+def test_operator_named_and_hyphenated_path_steps_remain_names(selector: str, body: bytes) -> None:
+    rows = DeclarativeExtractor().extract(
+        document(body),
+        extract_spec(
+            {
+                "item_scope": "main",
+                "fields": {"title": {"selector": selector, "type": "text"}},
+            }
+        ),
+    )
+
+    assert rows[0].fields["title"] == "C"
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "(/section / *[@data-key='x' and @*])[1]",
+        "(/section / child::h1[@data-key='x'])[1]",
+    ],
+)
+def test_wildcard_attribute_axis_and_quoted_xpath_tokens_are_preserved(selector: str) -> None:
+    rows = DeclarativeExtractor().extract(
+        document(b'<main><section><h1 data-key="x">C</h1></section></main>'),
+        extract_spec(
+            {
+                "item_scope": "main",
+                "fields": {"title": {"selector": selector, "type": "text"}},
+            }
+        ),
+    )
+
+    assert rows[0].fields["title"] == "C"
+
+
 def test_xpath_slashes_inside_quoted_literals_are_preserved() -> None:
     rows = DeclarativeExtractor().extract(
         document(b'<main><a href="https://example.com/p">Link</a></main>'),
