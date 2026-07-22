@@ -86,7 +86,13 @@ def configured_worker(
     )
     sink = health or DeduplicatingHealthSink()
     return (
-        OutboxWorker(runtime=runtime, registry=registry, sender=sender, health_sink=sink),
+        OutboxWorker(
+            runtime=runtime,
+            registry=registry,
+            sender=sender,
+            health_sink=sink,
+            worker_id="outbox-worker-1",
+        ),
         outbox_id,
         registry,
         runtime,
@@ -106,9 +112,11 @@ def test_success_resolves_target_address_then_marks_delivery(
     assert sender.calls == [("chat-address-42", {"text": "hello"})]
     assert sender.calls[0][0] != "opaque-target-id"
     row = connection.execute(
-        "SELECT status, attempt_count, last_error FROM outbox WHERE id = ?", (outbox_id,)
+        "SELECT status, attempt_count, last_error, lease_owner, lease_expires_at "
+        "FROM outbox WHERE id = ?",
+        (outbox_id,),
     ).fetchone()
-    assert tuple(row) == ("delivered", 0, None)
+    assert tuple(row) == ("delivered", 0, None, None, None)
     delivery = connection.execute(
         "SELECT external_message_id, delivered_at FROM deliveries WHERE outbox_id = ?",
         (outbox_id,),
@@ -198,3 +206,27 @@ def test_missing_target_is_rescheduled_without_sending(
         "SELECT status, attempt_count, last_error FROM outbox WHERE id = ?", (outbox_id,)
     ).fetchone()
     assert tuple(row) == ("pending", 1, "delivery_failed")
+
+
+@pytest.mark.parametrize("message_id", ["", " ", "\t\n"])
+def test_empty_or_whitespace_message_id_is_retried_without_marking_delivery(
+    connection: sqlite3.Connection, message_id: str
+) -> None:
+    sender = RecordingSender(message_id)
+    worker, outbox_id, _, _, _ = configured_worker(connection, sender)
+
+    assert asyncio.run(worker.drain_once(now=NOW)) == 0
+
+    row = connection.execute(
+        "SELECT status, attempt_count, available_at, last_error, lease_owner "
+        "FROM outbox WHERE id = ?",
+        (outbox_id,),
+    ).fetchone()
+    assert tuple(row) == (
+        "pending",
+        1,
+        (NOW + timedelta(seconds=60)).isoformat(),
+        "delivery_failed",
+        None,
+    )
+    assert connection.execute("SELECT count(*) FROM deliveries").fetchone()[0] == 0

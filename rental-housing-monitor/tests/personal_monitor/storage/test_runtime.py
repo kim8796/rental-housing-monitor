@@ -6,9 +6,19 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from personal_monitor.domain.observation import ObservationBatch, ObservedItem, content_hash
+from personal_monitor.domain.observation import (
+    ObservationBatch,
+    ObservedItem,
+    content_hash,
+    diff_items,
+)
 from personal_monitor.domain.spec import MonitorSpec, MonitorStatus
-from personal_monitor.storage import RegistryRepository, RuntimeRepository, open_database
+from personal_monitor.storage import (
+    DeliveryCandidate,
+    RegistryRepository,
+    RuntimeRepository,
+    open_database,
+)
 
 
 def make_spec(name: str = "가격 감시") -> MonitorSpec:
@@ -289,6 +299,65 @@ def test_invalid_observation_batch_does_not_replace_existing_snapshot(
     assert runtime.load_items(monitor_id) == [ObservedItem("a", {"price": 100})]
 
 
+def test_delivery_candidate_owns_an_immutable_payload_copy() -> None:
+    original = {"text": "before", "meta": {"count": 1}}
+
+    candidate = DeliveryCandidate("key", "target-1", original)
+    original["text"] = "after"
+    original["meta"]["count"] = 2  # type: ignore[index]
+
+    assert candidate.payload["text"] == "before"
+    assert candidate.payload["meta"]["count"] == 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        candidate.payload["text"] = "mutated"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        candidate.payload["meta"]["count"] = 3  # type: ignore[index]
+
+
+def test_snapshot_and_all_delivery_candidates_commit_or_rollback_as_one_unit(
+    repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
+) -> None:
+    registry, runtime = repositories
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    old_batch = observation_batch(
+        monitor_id,
+        (ObservedItem("listing", {"price": 100}),),
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    new_batch = observation_batch(
+        monitor_id,
+        (ObservedItem("listing", {"price": 90}),),
+        datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    runtime.upsert_items(old_batch)
+    candidates = (
+        DeliveryCandidate("first", "target-1", {"text": "first"}),
+        DeliveryCandidate("fail", "target-1", {"text": "second"}),
+    )
+    connection.execute(
+        "CREATE TRIGGER reject_injected_delivery BEFORE INSERT ON outbox "
+        "WHEN NEW.dedupe_key = 'fail' BEGIN SELECT RAISE(ABORT, 'injected enqueue'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected enqueue"):
+        runtime.apply_snapshot_and_deliveries(new_batch, candidates)
+
+    assert runtime.load_items(monitor_id) == list(old_batch.items)
+    assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
+    retry_changes = diff_items(runtime.load_items(monitor_id), list(new_batch.items))
+    assert retry_changes[0].changed_fields["price"] == (100, 90)
+
+    connection.execute("DROP TRIGGER reject_injected_delivery")
+    outbox_ids = runtime.apply_snapshot_and_deliveries(new_batch, candidates)
+
+    assert len(outbox_ids) == 2
+    assert runtime.load_items(monitor_id) == list(new_batch.items)
+    assert [
+        row["dedupe_key"]
+        for row in connection.execute("SELECT dedupe_key FROM outbox ORDER BY rowid")
+    ] == ["first", "fail"]
+
+
 def test_delivery_key_is_idempotent_and_payload_json_is_deterministic(
     repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
 ) -> None:
@@ -314,7 +383,7 @@ def test_delivery_key_is_idempotent_and_payload_json_is_deterministic(
     assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 1
 
 
-def test_due_outbox_orders_retries_and_delivery_removes_item_from_due_work(
+def test_claim_due_outbox_orders_retries_and_delivery_removes_item_from_due_work(
     repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
 ) -> None:
     registry, runtime = repositories
@@ -332,18 +401,30 @@ def test_due_outbox_orders_retries_and_delivery_removes_item_from_due_work(
         payload={"text": "first"},
     )
     base = datetime(2099, 1, 1, tzinfo=UTC)
-    runtime.reschedule_outbox(later, available_at=base + timedelta(minutes=1), error="timeout")
-    runtime.reschedule_outbox(first, available_at=base, error="timeout")
+    connection.execute(
+        "UPDATE outbox SET available_at = ?, attempt_count = 1 WHERE id = ?",
+        ((base + timedelta(minutes=1)).isoformat(), later),
+    )
+    connection.execute(
+        "UPDATE outbox SET available_at = ?, attempt_count = 1 WHERE id = ?",
+        (base.isoformat(), first),
+    )
 
-    rows = runtime.due_outbox(now=base + timedelta(minutes=1), limit=1)
+    rows = runtime.claim_due_outbox(worker_id="worker-1", now=base + timedelta(minutes=1), limit=1)
 
     assert rows[0].id == first
     assert rows[0].target_id == "target-1"
     assert rows[0].payload == {"text": "first"}
     assert rows[0].attempt_count == 1
-    runtime.mark_delivered(first, message_id="telegram-42", delivered_at=base)
-    runtime.mark_delivered(first, message_id="telegram-42", delivered_at=base)
-    assert [row.id for row in runtime.due_outbox(now=base + timedelta(minutes=1))] == [later]
+    runtime.mark_delivered(
+        first, worker_id="worker-1", message_id="telegram-42", delivered_at=base
+    )
+    assert [
+        row.id
+        for row in runtime.claim_due_outbox(
+            worker_id="worker-1", now=base + timedelta(minutes=1)
+        )
+    ] == [later]
     delivery = connection.execute(
         "SELECT * FROM deliveries WHERE outbox_id = ?", (first,)
     ).fetchone()
@@ -352,6 +433,95 @@ def test_due_outbox_orders_retries_and_delivery_removes_item_from_due_work(
         "telegram-42",
         base.isoformat(),
     )
+
+
+def test_two_workers_cannot_claim_the_same_unexpired_outbox_lease(
+    repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
+) -> None:
+    registry, runtime = repositories
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    outbox_id = runtime.enqueue_delivery(
+        dedupe_key="exclusive",
+        monitor_id=monitor_id,
+        target_id="target-1",
+        payload={"text": "exclusive"},
+    )
+    now = datetime(2099, 1, 1, tzinfo=UTC)
+    connection.execute("UPDATE outbox SET available_at = ?", (now.isoformat(),))
+
+    assert [
+        row.id
+        for row in runtime.claim_due_outbox(
+            worker_id="worker-1", now=now, lease_seconds=30
+        )
+    ] == [outbox_id]
+    assert runtime.claim_due_outbox(worker_id="worker-2", now=now, lease_seconds=30) == []
+    row = connection.execute(
+        "SELECT lease_owner, lease_expires_at FROM outbox WHERE id = ?", (outbox_id,)
+    ).fetchone()
+    assert tuple(row) == ("worker-1", "2099-01-01T00:00:30+00:00")
+
+
+def test_expired_outbox_lease_is_recoverable_by_another_worker(
+    repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
+) -> None:
+    registry, runtime = repositories
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    outbox_id = runtime.enqueue_delivery(
+        dedupe_key="recoverable",
+        monitor_id=monitor_id,
+        target_id="target-1",
+        payload={"text": "recoverable"},
+    )
+    now = datetime(2099, 1, 1, tzinfo=UTC)
+    connection.execute("UPDATE outbox SET available_at = ?", (now.isoformat(),))
+    runtime.claim_due_outbox(worker_id="worker-1", now=now, lease_seconds=30)
+
+    assert runtime.claim_due_outbox(
+        worker_id="worker-2", now=now + timedelta(seconds=29), lease_seconds=30
+    ) == []
+    recovered = runtime.claim_due_outbox(
+        worker_id="worker-2", now=now + timedelta(seconds=30), lease_seconds=30
+    )
+
+    assert [row.id for row in recovered] == [outbox_id]
+    lease = connection.execute(
+        "SELECT lease_owner, lease_expires_at FROM outbox WHERE id = ?", (outbox_id,)
+    ).fetchone()
+    assert tuple(lease) == ("worker-2", "2099-01-01T00:01:00+00:00")
+
+
+def test_outbox_completion_and_retry_require_claiming_worker(
+    repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
+) -> None:
+    registry, runtime = repositories
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    outbox_id = runtime.enqueue_delivery(
+        dedupe_key="owned",
+        monitor_id=monitor_id,
+        target_id="target-1",
+        payload={"text": "owned"},
+    )
+    now = datetime(2099, 1, 1, tzinfo=UTC)
+    connection.execute("UPDATE outbox SET available_at = ?", (now.isoformat(),))
+    runtime.claim_due_outbox(worker_id="worker-1", now=now)
+
+    with pytest.raises(ValueError, match="claiming worker"):
+        runtime.mark_delivered(
+            outbox_id, worker_id="worker-2", message_id="message", delivered_at=now
+        )
+    with pytest.raises(ValueError, match="claiming worker"):
+        runtime.reschedule_outbox(
+            outbox_id,
+            worker_id="worker-2",
+            available_at=now + timedelta(minutes=1),
+            error="timeout",
+        )
+
+    row = connection.execute(
+        "SELECT status, attempt_count, lease_owner FROM outbox WHERE id = ?", (outbox_id,)
+    ).fetchone()
+    assert tuple(row) == ("pending", 0, "worker-1")
 
 
 def test_outbox_retry_updates_attempt_and_rejects_unsafe_or_naive_values(
@@ -365,19 +535,33 @@ def test_outbox_retry_updates_attempt_and_rejects_unsafe_or_naive_values(
         target_id="target-1",
         payload={"text": "retry"},
     )
+    claim_at = datetime(2099, 1, 1, tzinfo=UTC)
+    connection.execute("UPDATE outbox SET available_at = ?", (claim_at.isoformat(),))
+    runtime.claim_due_outbox(worker_id="worker-1", now=claim_at)
 
     with pytest.raises(ValueError, match="diagnostic code"):
         runtime.reschedule_outbox(
             outbox_id,
+            worker_id="worker-1",
             available_at=datetime(2026, 1, 1, tzinfo=UTC),
             error="GET https://example.com/path?secret=1",
         )
     with pytest.raises(ValueError, match="timezone-aware"):
-        runtime.reschedule_outbox(outbox_id, available_at=datetime(2026, 1, 1), error="timeout")
+        runtime.reschedule_outbox(
+            outbox_id,
+            worker_id="worker-1",
+            available_at=datetime(2026, 1, 1),
+            error="timeout",
+        )
     with pytest.raises(ValueError, match="timezone-aware"):
-        runtime.due_outbox(now=datetime(2026, 1, 1))
+        runtime.claim_due_outbox(worker_id="worker-1", now=datetime(2026, 1, 1))
     with pytest.raises(ValueError, match="timezone-aware"):
-        runtime.mark_delivered(outbox_id, message_id="message", delivered_at=datetime(2026, 1, 1))
+        runtime.mark_delivered(
+            outbox_id,
+            worker_id="worker-1",
+            message_id="message",
+            delivered_at=datetime(2026, 1, 1),
+        )
 
     row = connection.execute(
         "SELECT attempt_count, last_error FROM outbox WHERE id = ?", (outbox_id,)

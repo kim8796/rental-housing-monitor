@@ -4,12 +4,13 @@ import asyncio
 import inspect
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import personal_monitor.engine.runner as runner_module
 from personal_monitor.domain.observation import (
     ObservationBatch,
     ObservedItem,
@@ -17,7 +18,7 @@ from personal_monitor.domain.observation import (
     content_hash,
 )
 from personal_monitor.domain.rules import RuleMatch
-from personal_monitor.domain.spec import MonitorSpec, RuleKind
+from personal_monitor.domain.spec import MonitorSpec, MonitorStatus, RuleKind
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.engine.runner import MonitorRunner, delivery_key, render_payload
 from personal_monitor.ports import (
@@ -27,7 +28,12 @@ from personal_monitor.ports import (
     OperatorHealthSink,
     SourceAdapter,
 )
-from personal_monitor.storage import RegistryRepository, RuntimeRepository, open_database
+from personal_monitor.storage import (
+    DeliveryCandidate,
+    RegistryRepository,
+    RuntimeRepository,
+    open_database,
+)
 
 NOW = datetime(2026, 7, 22, 3, 0, tzinfo=UTC)
 
@@ -119,6 +125,8 @@ def test_runtime_ports_expose_the_closed_async_boundary() -> None:
     assert inspect.iscoroutinefunction(SourceAdapter.fetch)
     assert inspect.iscoroutinefunction(DeliverySender.send)
     assert inspect.iscoroutinefunction(OperatorHealthSink.emit_once)
+    assert "durable atomic deduplication" in (OperatorHealthSink.emit_once.__doc__ or "")
+    assert "processes and restarts" in (OperatorHealthSink.emit_once.__doc__ or "")
     assert inspect.signature(SourceAdapter.fetch).return_annotation == "ObservationBatch"
     assert inspect.signature(AdapterRegistry.resolve).parameters["kind"].annotation == (
         "SourceAdapterKind"
@@ -212,6 +220,95 @@ def test_second_identical_snapshot_does_not_duplicate_delivery(
 
     assert result.matched_count == 0
     assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 1
+
+
+def test_runner_precomputes_candidates_then_applies_snapshot_and_outbox_once(
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch = ObservationBatch(
+        monitor_id="placeholder",
+        items=(ObservedItem("listing-1", {"price": 900}),),
+        observed_at=NOW,
+        source_hash="hash",
+    )
+    runner, monitor_id, _, runtime, adapter = configured_runner(connection, batch)
+    adapter.batch = ObservationBatch(
+        monitor_id=monitor_id,
+        items=batch.items,
+        observed_at=NOW,
+        source_hash="hash",
+    )
+    applied: list[tuple[ObservationBatch, tuple[DeliveryCandidate, ...]]] = []
+    original_apply = runtime.apply_snapshot_and_deliveries
+
+    def forbid_split_write(*args: object, **kwargs: object) -> None:
+        raise AssertionError("runner used a split snapshot/outbox write")
+
+    def record_apply(
+        batch: ObservationBatch, candidates: Sequence[DeliveryCandidate]
+    ) -> list[str]:
+        frozen_candidates = tuple(candidates)
+        applied.append((batch, frozen_candidates))
+        return original_apply(batch, frozen_candidates)
+
+    monkeypatch.setattr(runtime, "upsert_items", forbid_split_write)
+    monkeypatch.setattr(runtime, "enqueue_delivery", forbid_split_write)
+    monkeypatch.setattr(runtime, "apply_snapshot_and_deliveries", record_apply)
+
+    result = asyncio.run(runner.run(monitor_id))
+
+    assert result.status == "success"
+    assert len(applied) == 1
+    assert applied[0][0] == adapter.batch
+    assert len(applied[0][1]) == 1
+    candidate = applied[0][1][0]
+    assert candidate.dedupe_key == f"{monitor_id}:listing-1:new_item"
+    assert candidate.target_id == "target-1"
+    assert runtime.load_items(monitor_id) == list(batch.items)
+    assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 1
+
+
+def test_atomic_enqueue_failure_preserves_old_snapshot_so_retry_recreates_notification(
+    connection: sqlite3.Connection,
+) -> None:
+    batch = ObservationBatch(
+        monitor_id="placeholder",
+        items=(ObservedItem("listing-1", {"price": 900}),),
+        observed_at=NOW,
+        source_hash="hash",
+    )
+    runner, monitor_id, registry, runtime, adapter = configured_runner(connection, batch)
+    adapter.batch = ObservationBatch(
+        monitor_id=monitor_id,
+        items=batch.items,
+        observed_at=NOW,
+        source_hash="hash",
+    )
+    connection.execute(
+        "CREATE TRIGGER reject_runner_delivery BEFORE INSERT ON outbox "
+        f"WHEN NEW.dedupe_key = '{monitor_id}:listing-1:new_item' "
+        "BEGIN SELECT RAISE(ABORT, 'injected enqueue'); END"
+    )
+
+    first = asyncio.run(runner.run(monitor_id))
+
+    assert first.status == "failed"
+    assert runtime.load_items(monitor_id) == []
+    assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
+    registry.transition_status(monitor_id, MonitorStatus.NEEDS_REVIEW, MonitorStatus.ACTIVE)
+    connection.execute(
+        "UPDATE monitors SET next_run_at = ? WHERE id = ?", (NOW.isoformat(), monitor_id)
+    )
+    assert runtime.claim_due(worker_id="worker-1", now=NOW) == [monitor_id]
+    connection.execute("DROP TRIGGER reject_runner_delivery")
+
+    retry = asyncio.run(runner.run(monitor_id))
+
+    assert retry.status == "success"
+    assert retry.matched_count == 1
+    assert runtime.load_items(monitor_id) == list(batch.items)
+    outbox = connection.execute("SELECT dedupe_key FROM outbox").fetchone()
+    assert outbox["dedupe_key"] == f"{monitor_id}:listing-1:new_item"
 
 
 def test_partial_warning_suppresses_no_change_and_never_renders_raw_detail(
@@ -382,7 +479,7 @@ def test_arbitrary_exception_is_persisted_only_as_internal_error(
 
 
 def test_mismatched_adapter_batch_fails_validation_before_snapshot_or_outbox_mutation(
-    connection: sqlite3.Connection,
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mismatched = ObservationBatch(
         monitor_id="different-monitor",
@@ -399,10 +496,174 @@ def test_mismatched_adapter_batch_fails_validation_before_snapshot_or_outbox_mut
     )
     runtime.upsert_items(previous)
 
+    def forbid_previous_load(*args: object, **kwargs: object) -> list[ObservedItem]:
+        raise AssertionError("previous snapshot loaded before ownership validation")
+
+    monkeypatch.setattr(runtime, "load_items", forbid_previous_load)
+
     result = asyncio.run(runner.run(monitor_id))
 
     assert result.status == "failed"
-    assert runtime.load_items(monitor_id) == list(previous.items)
+    rows = connection.execute(
+        "SELECT item_id, fields_json FROM observations WHERE monitor_id = ?", (monitor_id,)
+    ).fetchall()
+    assert [(row["item_id"], row["fields_json"]) for row in rows] == [
+        ("existing", '{"price":100}')
+    ]
     assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
     run = connection.execute("SELECT stage, error_detail FROM runs").fetchone()
     assert tuple(run) == ("validate", "validation_failed")
+
+
+def test_finish_failure_is_attempted_once_and_cannot_skip_release(
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch = ObservationBatch(
+        monitor_id="placeholder", items=(), observed_at=NOW, source_hash="hash"
+    )
+    runner, monitor_id, _, runtime, adapter = configured_runner(connection, batch)
+    adapter.batch = ObservationBatch(
+        monitor_id=monitor_id, items=(), observed_at=NOW, source_hash="hash"
+    )
+    finish_calls = 0
+    release_calls = 0
+    original_release = runtime.release_lease
+
+    def fail_finish(*args: object, **kwargs: object) -> None:
+        nonlocal finish_calls
+        finish_calls += 1
+        raise RuntimeError("injected finish failure")
+
+    def record_release(*args: object, **kwargs: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "finish_run", fail_finish)
+    monkeypatch.setattr(runtime, "release_lease", record_release)
+
+    with pytest.raises(RuntimeError, match="injected finish failure"):
+        asyncio.run(runner.run(monitor_id))
+
+    assert (finish_calls, release_calls) == (1, 1)
+    run = connection.execute("SELECT status, finished_at FROM runs").fetchone()
+    assert tuple(run) == ("running", None)
+    monitor = connection.execute(
+        "SELECT lease_owner, lease_expires_at FROM monitors WHERE id = ?", (monitor_id,)
+    ).fetchone()
+    assert tuple(monitor) == (None, None)
+
+
+def test_transition_failure_cannot_skip_finish_or_release(
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, monitor_id, registry, runtime, _ = configured_runner(
+        connection,
+        MonitorError(ErrorClass.AUTHENTICATION, "fetch", "expired"),
+    )
+    finish_calls = 0
+    release_calls = 0
+    original_finish = runtime.finish_run
+    original_release = runtime.release_lease
+
+    def fail_transition(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("injected transition failure")
+
+    def record_finish(*args: object, **kwargs: object) -> None:
+        nonlocal finish_calls
+        finish_calls += 1
+        original_finish(*args, **kwargs)
+
+    def record_release(*args: object, **kwargs: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "transition_status", fail_transition)
+    monkeypatch.setattr(runtime, "finish_run", record_finish)
+    monkeypatch.setattr(runtime, "release_lease", record_release)
+
+    with pytest.raises(RuntimeError, match="injected transition failure"):
+        asyncio.run(runner.run(monitor_id))
+
+    assert (finish_calls, release_calls) == (1, 1)
+    run = connection.execute("SELECT status, error_detail FROM runs").fetchone()
+    assert tuple(run) == ("failed", "authentication_failed")
+    monitor = connection.execute(
+        "SELECT status, lease_owner FROM monitors WHERE id = ?", (monitor_id,)
+    ).fetchone()
+    assert tuple(monitor) == ("active", None)
+
+
+def test_scheduling_failure_uses_aware_fallback_and_cannot_skip_release(
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch = ObservationBatch(
+        monitor_id="placeholder", items=(), observed_at=NOW, source_hash="hash"
+    )
+    runner, monitor_id, _, runtime, adapter = configured_runner(connection, batch)
+    adapter.batch = ObservationBatch(
+        monitor_id=monitor_id, items=(), observed_at=NOW, source_hash="hash"
+    )
+    released_at: list[datetime] = []
+    original_release = runtime.release_lease
+
+    def fail_schedule(*args: object, **kwargs: object) -> datetime:
+        raise RuntimeError("injected schedule failure")
+
+    def record_release(*args: object, **kwargs: object) -> None:
+        released_at.append(kwargs["next_run_at"])
+        original_release(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "next_run_at", fail_schedule)
+    monkeypatch.setattr(runtime, "release_lease", record_release)
+
+    result = asyncio.run(runner.run(monitor_id))
+
+    assert result.status == "success"
+    assert released_at == [NOW + timedelta(minutes=5)]
+    assert released_at[0].tzinfo is not None
+    run = connection.execute("SELECT status FROM runs").fetchone()
+    assert run["status"] == "success"
+
+
+def test_release_failure_does_not_overwrite_success_and_lease_expires_for_recovery(
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batch = ObservationBatch(
+        monitor_id="placeholder", items=(), observed_at=NOW, source_hash="hash"
+    )
+    runner, monitor_id, _, runtime, adapter = configured_runner(connection, batch)
+    adapter.batch = ObservationBatch(
+        monitor_id=monitor_id, items=(), observed_at=NOW, source_hash="hash"
+    )
+    finish_calls = 0
+    release_calls = 0
+    original_finish = runtime.finish_run
+
+    def record_finish(*args: object, **kwargs: object) -> None:
+        nonlocal finish_calls
+        finish_calls += 1
+        original_finish(*args, **kwargs)
+
+    def fail_release(*args: object, **kwargs: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        raise sqlite3.OperationalError("injected release failure")
+
+    monkeypatch.setattr(runtime, "finish_run", record_finish)
+    monkeypatch.setattr(runtime, "release_lease", fail_release)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected release failure"):
+        asyncio.run(runner.run(monitor_id))
+
+    assert (finish_calls, release_calls) == (1, 1)
+    run = connection.execute("SELECT status, stage, error_detail FROM runs").fetchone()
+    assert tuple(run) == ("success", "complete", None)
+    lease = connection.execute(
+        "SELECT status, lease_owner, lease_expires_at FROM monitors WHERE id = ?", (monitor_id,)
+    ).fetchone()
+    assert tuple(lease) == ("active", "worker-1", "2026-07-22T03:05:00+00:00")
+    assert runtime.claim_due(worker_id="worker-2", now=NOW + timedelta(minutes=5)) == [
+        monitor_id
+    ]

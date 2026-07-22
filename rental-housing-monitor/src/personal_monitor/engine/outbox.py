@@ -10,6 +10,12 @@ _RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200, 21600)
 
 
 class OutboxWorker:
+    """Deliver leased rows at least once.
+
+    A crash after the sender accepts a message but before SQLite commits may retry the send because
+    the remote sender and SQLite cannot share a transaction.
+    """
+
     def __init__(
         self,
         *,
@@ -17,15 +23,19 @@ class OutboxWorker:
         registry: RegistryRepository,
         sender: DeliverySender,
         health_sink: OperatorHealthSink,
+        worker_id: str,
     ) -> None:
         self.runtime = runtime
         self.registry = registry
         self.sender = sender
         self.health_sink = health_sink
+        self.worker_id = worker_id
 
     async def drain_once(self, *, now: datetime, limit: int = 50) -> int:
         delivered_count = 0
-        for row in self.runtime.due_outbox(now=now, limit=limit):
+        for row in self.runtime.claim_due_outbox(
+            worker_id=self.worker_id, now=now, limit=limit
+        ):
             try:
                 target = self.registry.get_delivery_target(row.target_id)
             except Exception:
@@ -36,7 +46,15 @@ class OutboxWorker:
             except Exception:
                 await self._reschedule(row, now)
                 continue
-            self.runtime.mark_delivered(row.id, message_id=message_id, delivered_at=now)
+            if not isinstance(message_id, str) or not message_id.strip():
+                await self._reschedule(row, now)
+                continue
+            self.runtime.mark_delivered(
+                row.id,
+                worker_id=self.worker_id,
+                message_id=message_id,
+                delivered_at=now,
+            )
             delivered_count += 1
         return delivered_count
 
@@ -45,6 +63,7 @@ class OutboxWorker:
         delay_index = min(row.attempt_count, len(_RETRY_DELAYS_SECONDS) - 1)
         self.runtime.reschedule_outbox(
             row.id,
+            worker_id=self.worker_id,
             available_at=now + timedelta(seconds=_RETRY_DELAYS_SECONDS[delay_index]),
             error="delivery_failed",
         )

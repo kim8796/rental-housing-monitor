@@ -54,3 +54,5 @@ def test_runner_only_queues_and_has_no_delivery_sender_dependency() -> None:
     assert "sender" not in parameters
     assert "DeliverySender" not in inspect.getsource(runner)
     assert ".send(" not in inspect.getsource(runner)
+    assert ".due_outbox(" not in inspect.getsource(outbox)
+    assert ".claim_due_outbox(" in inspect.getsource(outbox)

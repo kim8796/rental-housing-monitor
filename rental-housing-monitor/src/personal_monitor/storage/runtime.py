@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from types import MappingProxyType
 from uuid import uuid4
 
 from personal_monitor.domain.observation import (
@@ -41,6 +43,16 @@ class OutboxRow:
     target_id: str
     payload: dict[str, object]
     attempt_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryCandidate:
+    dedupe_key: str
+    target_id: str
+    payload: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", _freeze_json(self.payload))
 
 
 class RuntimeRepository:
@@ -124,6 +136,10 @@ class RuntimeRepository:
         ]
 
     def upsert_items(self, batch: ObservationBatch) -> None:
+        with transaction(self.connection):
+            self._upsert_items(batch)
+
+    def _upsert_items(self, batch: ObservationBatch) -> None:
         observed_at = utc_timestamp(batch.observed_at, parameter="observed_at")
         item_ids = [item.item_id for item in batch.items]
         if len(item_ids) != len(set(item_ids)):
@@ -139,26 +155,25 @@ class RuntimeRepository:
             )
             for item in batch.items
         ]
-        with transaction(self.connection):
-            self.connection.executemany(
-                "INSERT INTO observations(monitor_id, item_id, fields_json, content_hash, "
-                "first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(monitor_id, item_id) DO UPDATE SET "
-                "fields_json = excluded.fields_json, content_hash = excluded.content_hash, "
-                "last_seen_at = excluded.last_seen_at",
-                values,
+        self.connection.executemany(
+            "INSERT INTO observations(monitor_id, item_id, fields_json, content_hash, "
+            "first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(monitor_id, item_id) DO UPDATE SET "
+            "fields_json = excluded.fields_json, content_hash = excluded.content_hash, "
+            "last_seen_at = excluded.last_seen_at",
+            values,
+        )
+        if item_ids:
+            placeholders = ", ".join("?" for _ in item_ids)
+            self.connection.execute(
+                f"DELETE FROM observations WHERE monitor_id = ? "
+                f"AND item_id NOT IN ({placeholders})",
+                (batch.monitor_id, *item_ids),
             )
-            if item_ids:
-                placeholders = ", ".join("?" for _ in item_ids)
-                self.connection.execute(
-                    f"DELETE FROM observations WHERE monitor_id = ? "
-                    f"AND item_id NOT IN ({placeholders})",
-                    (batch.monitor_id, *item_ids),
-                )
-            else:
-                self.connection.execute(
-                    "DELETE FROM observations WHERE monitor_id = ?", (batch.monitor_id,)
-                )
+        else:
+            self.connection.execute(
+                "DELETE FROM observations WHERE monitor_id = ?", (batch.monitor_id,)
+            )
 
     def enqueue_delivery(
         self,
@@ -168,40 +183,72 @@ class RuntimeRepository:
         target_id: str,
         payload: dict[str, object],
     ) -> str:
-        payload_json = canonical_json(payload)
         with transaction(self.connection, immediate=True):
-            existing = self.connection.execute(
-                "SELECT id FROM outbox WHERE dedupe_key = ?", (dedupe_key,)
-            ).fetchone()
-            if existing is not None:
-                return existing["id"]
-            outbox_id = uuid4().hex
-            created_at = utc_now().isoformat()
-            self.connection.execute(
-                "INSERT INTO outbox(id, dedupe_key, monitor_id, target_id, payload_json, "
-                "status, available_at, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (
-                    outbox_id,
-                    dedupe_key,
-                    monitor_id,
-                    target_id,
-                    payload_json,
-                    created_at,
-                    created_at,
+            return self._enqueue_delivery(
+                monitor_id,
+                DeliveryCandidate(
+                    dedupe_key=dedupe_key, target_id=target_id, payload=payload
                 ),
             )
+
+    def apply_snapshot_and_deliveries(
+        self, batch: ObservationBatch, candidates: Sequence[DeliveryCandidate]
+    ) -> list[str]:
+        with transaction(self.connection, immediate=True):
+            self._upsert_items(batch)
+            return [self._enqueue_delivery(batch.monitor_id, candidate) for candidate in candidates]
+
+    def _enqueue_delivery(self, monitor_id: str, candidate: DeliveryCandidate) -> str:
+        existing = self.connection.execute(
+            "SELECT id FROM outbox WHERE dedupe_key = ?", (candidate.dedupe_key,)
+        ).fetchone()
+        if existing is not None:
+            return existing["id"]
+        outbox_id = uuid4().hex
+        created_at = utc_now().isoformat()
+        self.connection.execute(
+            "INSERT INTO outbox(id, dedupe_key, monitor_id, target_id, payload_json, "
+            "status, available_at, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (
+                outbox_id,
+                candidate.dedupe_key,
+                monitor_id,
+                candidate.target_id,
+                canonical_json(candidate.payload),
+                created_at,
+                created_at,
+            ),
+        )
         return outbox_id
 
-    def due_outbox(self, *, now: datetime, limit: int = 50) -> list[OutboxRow]:
+    def claim_due_outbox(
+        self,
+        *,
+        worker_id: str,
+        now: datetime,
+        lease_seconds: int = 300,
+        limit: int = 50,
+    ) -> list[OutboxRow]:
         now_timestamp = utc_timestamp(now, parameter="now")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         if limit <= 0:
             raise ValueError("limit must be positive")
-        rows = self.connection.execute(
-            "SELECT id, target_id, payload_json, attempt_count FROM outbox "
-            "WHERE status = 'pending' AND available_at <= ? "
-            "ORDER BY available_at, created_at, id LIMIT ?",
-            (now_timestamp, limit),
+        lease_expires_at = utc_timestamp(
+            now + timedelta(seconds=lease_seconds), parameter="lease_expires_at"
         )
+        with transaction(self.connection, immediate=True):
+            rows = self.connection.execute(
+                "SELECT id, target_id, payload_json, attempt_count FROM outbox "
+                "WHERE status = 'pending' AND available_at <= ? "
+                "AND (lease_expires_at IS NULL OR lease_expires_at <= ?) "
+                "ORDER BY available_at, created_at, id LIMIT ?",
+                (now_timestamp, now_timestamp, limit),
+            ).fetchall()
+            self.connection.executemany(
+                "UPDATE outbox SET lease_owner = ?, lease_expires_at = ? WHERE id = ?",
+                ((worker_id, lease_expires_at, row["id"]) for row in rows),
+            )
         return [
             OutboxRow(
                 id=row["id"],
@@ -212,14 +259,18 @@ class RuntimeRepository:
             for row in rows
         ]
 
-    def mark_delivered(self, outbox_id: str, *, message_id: str, delivered_at: datetime) -> None:
+    def mark_delivered(
+        self, outbox_id: str, *, worker_id: str, message_id: str, delivered_at: datetime
+    ) -> None:
         delivered_timestamp = utc_timestamp(delivered_at, parameter="delivered_at")
         with transaction(self.connection, immediate=True):
             outbox = self.connection.execute(
-                "SELECT target_id FROM outbox WHERE id = ?", (outbox_id,)
+                "SELECT target_id FROM outbox "
+                "WHERE id = ? AND status = 'pending' AND lease_owner = ?",
+                (outbox_id, worker_id),
             ).fetchone()
             if outbox is None:
-                raise ValueError("outbox item does not exist")
+                raise ValueError("outbox item is not owned by the claiming worker")
             delivery = self.connection.execute(
                 "SELECT external_message_id, delivered_at FROM deliveries WHERE outbox_id = ?",
                 (outbox_id,),
@@ -236,22 +287,40 @@ class RuntimeRepository:
             ):
                 raise ValueError("outbox item already has a different delivery")
             self.connection.execute(
-                "UPDATE outbox SET status = 'delivered' WHERE id = ?", (outbox_id,)
+                "UPDATE outbox SET status = 'delivered', lease_owner = NULL, "
+                "lease_expires_at = NULL WHERE id = ? AND lease_owner = ?",
+                (outbox_id, worker_id),
             )
 
-    def reschedule_outbox(self, outbox_id: str, *, available_at: datetime, error: str) -> None:
+    def reschedule_outbox(
+        self,
+        outbox_id: str,
+        *,
+        worker_id: str,
+        available_at: datetime,
+        error: str,
+    ) -> None:
         available_timestamp = utc_timestamp(available_at, parameter="available_at")
         _validate_diagnostic_code(error)
         with transaction(self.connection):
             cursor = self.connection.execute(
                 "UPDATE outbox SET status = 'pending', attempt_count = attempt_count + 1, "
-                "available_at = ?, last_error = ? WHERE id = ? AND status = 'pending'",
-                (available_timestamp, error, outbox_id),
+                "available_at = ?, last_error = ?, lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE id = ? AND status = 'pending' AND lease_owner = ?",
+                (available_timestamp, error, outbox_id, worker_id),
             )
             if cursor.rowcount != 1:
-                raise ValueError("pending outbox item does not exist")
+                raise ValueError("outbox item is not owned by the claiming worker")
 
 
 def _validate_diagnostic_code(detail: str | None) -> None:
     if detail is not None and detail not in SAFE_DIAGNOSTIC_CODES:
         raise ValueError("error detail must be a safe diagnostic code")
+
+
+def _freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_json(item) for item in value)
+    return value

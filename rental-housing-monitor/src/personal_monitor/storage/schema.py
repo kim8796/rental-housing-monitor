@@ -47,7 +47,7 @@ CREATE TABLE outbox(
   id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, monitor_id TEXT NOT NULL,
   target_id TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL,
   attempt_count INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL,
-  last_error TEXT, created_at TEXT NOT NULL,
+  last_error TEXT, lease_owner TEXT, lease_expires_at TEXT, created_at TEXT NOT NULL,
   FOREIGN KEY(monitor_id) REFERENCES monitors(id),
   FOREIGN KEY(target_id) REFERENCES delivery_targets(id)
 );

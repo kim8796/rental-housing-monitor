@@ -20,7 +20,9 @@ class DeliverySender(Protocol):
 
 
 class OperatorHealthSink(Protocol):
-    async def emit_once(self, dedupe_key: str, payload: dict[str, object]) -> None: ...
+    async def emit_once(self, dedupe_key: str, payload: dict[str, object]) -> None:
+        """Provide durable atomic deduplication across processes and restarts."""
+        ...
 
 
 class Clock(Protocol):

@@ -634,7 +634,7 @@ CREATE TABLE outbox(
   id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, monitor_id TEXT NOT NULL,
   target_id TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL,
   attempt_count INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL,
-  last_error TEXT, created_at TEXT NOT NULL,
+  last_error TEXT, lease_owner TEXT, lease_expires_at TEXT, created_at TEXT NOT NULL,
   FOREIGN KEY(monitor_id) REFERENCES monitors(id),
   FOREIGN KEY(target_id) REFERENCES delivery_targets(id)
 );
@@ -700,6 +700,7 @@ def activate_version(self, monitor_id: str, version_id: str) -> None: ...
 def get_active_spec(self, monitor_id: str) -> MonitorSpec: ...
 def get_active_monitor(self, monitor_id: str) -> ActiveMonitor: ...
 def get_primary_target(self, owner_id: str) -> DeliveryTargetRow: ...
+def get_delivery_target(self, target_id: str) -> DeliveryTargetRow: ...
 def list_monitors(self, owner_id: str, *, include_disabled: bool = False) -> list[MonitorRow]: ...
 def transition_status(self, monitor_id: str, expected: MonitorStatus, target: MonitorStatus) -> None: ...
 def soft_delete(self, monitor_id: str, *, disabled_at: datetime) -> None: ...
@@ -720,6 +721,13 @@ class OutboxRow:
     attempt_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class DeliveryCandidate:
+    dedupe_key: str
+    target_id: str
+    payload: Mapping[str, object]
+
+
 def claim_due(self, *, worker_id: str, now: datetime, lease_seconds: int = 300) -> list[str]: ...
 def release_lease(self, monitor_id: str, *, worker_id: str, next_run_at: datetime) -> None: ...
 def start_run(self, monitor_id: str, version_id: str, *, started_at: datetime) -> str: ...
@@ -727,12 +735,22 @@ def finish_run(self, run_id: str, *, status: str, stage: str, error_class: str |
 def load_items(self, monitor_id: str) -> list[ObservedItem]: ...
 def upsert_items(self, batch: ObservationBatch) -> None: ...
 def enqueue_delivery(self, *, dedupe_key: str, monitor_id: str, target_id: str, payload: dict[str, object]) -> str: ...
-def due_outbox(self, *, now: datetime, limit: int = 50) -> list[OutboxRow]: ...
-def mark_delivered(self, outbox_id: str, *, message_id: str, delivered_at: datetime) -> None: ...
-def reschedule_outbox(self, outbox_id: str, *, available_at: datetime, error: str) -> None: ...
+def apply_snapshot_and_deliveries(self, batch: ObservationBatch, candidates: Sequence[DeliveryCandidate]) -> list[str]: ...
+def claim_due_outbox(self, *, worker_id: str, now: datetime, lease_seconds: int = 300, limit: int = 50) -> list[OutboxRow]: ...
+def mark_delivered(self, outbox_id: str, *, worker_id: str, message_id: str, delivered_at: datetime) -> None: ...
+def reschedule_outbox(self, outbox_id: str, *, worker_id: str, available_at: datetime, error: str) -> None: ...
 ```
 
 All JSON uses `ensure_ascii=False`, `sort_keys=True`, and compact separators. IDs use `uuid.uuid4().hex`; timestamps are timezone-aware UTC ISO-8601 strings. Stored `error_detail` and `last_error` values are closed safe diagnostic codes, never arbitrary text. `error_detail` may be `None`; otherwise `finish_run(error_detail=...)` and `reschedule_outbox(error=...)` accept only `required_field_missing`, `validation_failed`, `connection_timeout`, `network_error`, `authentication_failed`, `structure_changed`, `policy_rejected`, `delivery_failed`, `internal_error`, `timeout`, or `offline`. Never persist URL queries, cookies, response bodies, exception reprs, HTML, identifiers, or raw exception messages in those columns.
+
+`apply_snapshot_and_deliveries()` accepts immutable candidate inputs, then replaces the current
+snapshot and inserts all deduplicated outbox rows in one `BEGIN IMMEDIATE`; any snapshot or enqueue
+failure rolls back the entire unit. Snapshot and enqueue public methods reuse private
+transaction-local helpers rather than nesting immediate transactions.
+
+`claim_due_outbox()` atomically leases only pending, available rows whose lease is absent or
+expired. Delivery completion and retry are compare-and-set operations requiring the claiming
+`worker_id`; both clear the lease. A worker crash leaves the row reclaimable at lease expiry.
 
 - [ ] **Step 6: Run storage and full tests, then commit**
 
@@ -832,12 +850,12 @@ git commit -m "feat: schedule monitor runs with leases"
 - [ ] **Step 1: Write failing execution-boundary tests**
 
 ```python
-async def test_regular_run_never_imports_ai(runtime_fixture, fake_adapter, fake_sender) -> None:
+async def test_regular_run_never_imports_ai(runtime_fixture, fake_adapter) -> None:
     import inspect
     import personal_monitor.engine.runner as runner_module
 
     assert "personal_monitor.ai" not in inspect.getsource(runner_module)
-    runner = runtime_fixture.runner(adapter=fake_adapter, sender=fake_sender)
+    runner = runtime_fixture.runner(adapter=fake_adapter)
     result = await runner.run(runtime_fixture.monitor_id)
     assert result.status == "success"
 
@@ -871,7 +889,8 @@ class DeliverySender(Protocol):
 
 
 class OperatorHealthSink(Protocol):
-    async def emit_once(self, dedupe_key: str, payload: dict[str, object]) -> None: ...
+    async def emit_once(self, dedupe_key: str, payload: dict[str, object]) -> None:
+        """Persist the key and event atomically, deduplicating across processes and restarts."""
 
 
 class Clock(Protocol):
@@ -906,9 +925,11 @@ spec = active.spec
 target = registry.get_primary_target(active.owner_id)
 run_id = runtime.start_run(monitor_id, active.version_id, started_at=clock.now())
 batch = await adapters.resolve(spec.source_adapter, spec.adapter_ref).fetch(monitor_id, spec)
+if batch.monitor_id != monitor_id:
+    raise MonitorError(ErrorClass.VALIDATION, "validate", "batch monitor mismatch")
 previous = runtime.load_items(monitor_id)
 changes = diff_items(previous, list(batch.items))
-runtime.upsert_items(batch)
+candidates: list[DeliveryCandidate] = []
 matched_count = 0
 for change in changes:
     current = current_by_id.get(change.item_id)
@@ -922,39 +943,43 @@ for change in changes:
     )
     for match in matches:
         matched_count += 1
-        runtime.enqueue_delivery(
+        candidates.append(DeliveryCandidate(
             dedupe_key=delivery_key(monitor_id, current, match),
-            monitor_id=monitor_id,
             target_id=target.id,
             payload=render_payload(spec, current, match),
-        )
+        ))
 if batch.warnings:
     for warning in batch.warnings:
-        runtime.enqueue_delivery(
+        candidates.append(DeliveryCandidate(
             dedupe_key=f"{monitor_id}:warning:{batch.observed_at.date()}:{warning.source}:{warning.stage}",
-            monitor_id=monitor_id,
             target_id=target.id,
             payload=render_warning(spec, warning, batch.source_status),
-        )
+        ))
     run_status = "partial_failure"
 elif matched_count == 0 and spec.notify_on_no_change:
     local_date = batch.observed_at.astimezone(ZoneInfo(spec.timezone)).date()
-    runtime.enqueue_delivery(
+    candidates.append(DeliveryCandidate(
         dedupe_key=f"{monitor_id}:no-change:{local_date}",
-        monitor_id=monitor_id,
         target_id=target.id,
         payload={"text": "오늘은 신규 공고가 없습니다."},
-    )
+    ))
     run_status = "success"
 else:
     run_status = "success"
-runtime.finish_run(run_id, status=run_status, stage="complete")
-runtime.release_lease(
-    monitor_id,
-    worker_id=worker_id,
-    next_run_at=next_run_at(spec, monitor_id, clock.now()),
-)
+runtime.apply_snapshot_and_deliveries(batch, candidates)
 ```
+
+The governing execution order is exact: fetch → ownership check → load previous snapshot/diff →
+compute every delivery candidate → atomically apply snapshot plus candidates. Ownership validation
+must remain immediately after fetch because adapter output is untrusted.
+
+After `start_run()` succeeds, execution produces one immutable final outcome. Cleanup is a separate
+phase: attempt any failure status transition without allowing it to skip later cleanup; compute the
+regular/retry schedule and use an aware five-minute fallback if scheduling raises; attempt
+`finish_run()` exactly once with the final outcome; and attempt `release_lease()` from the outermost
+`finally`. A finish/transition/release exception may propagate after required attempts, but cleanup
+must never reinterpret an already-successful outcome as failed. If SQLite rejects release, the
+existing monitor lease remains recoverable when its expiry passes.
 
 Map `MonitorError` to state transitions: authentication → `paused_auth`; structure/validation → `needs_review`; policy → `needs_review`; transient network → keep active and schedule retry; internal → `needs_review`. Persist only the closed diagnostic code derived from `ErrorClass` (`network_error`, `authentication_failed`, `structure_changed`, `validation_failed`, `policy_rejected`, `delivery_failed`, or `internal_error`); never persist `MonitorError.safe_detail`. Transient-network failures release the lease with `next_run_at=clock.now()+timedelta(minutes=5)`; every other failed run uses the next regular cron time after its status transition. A failed run must finish its run record and release the lease. No AI type appears in the runner constructor or module imports.
 
@@ -962,7 +987,11 @@ Map `MonitorError` to state transitions: authentication → `paused_auth`; struc
 
 - [ ] **Step 5: Implement outbox retry and success ordering**
 
-Add `RegistryRepository.get_delivery_target(target_id) -> DeliveryTargetRow`, which resolves the internal foreign-key ID and raises when absent; `OutboxWorker` uses its address and never treats `target_id` itself as a delivery address. `OutboxWorker` uses delays `(60, 300, 1800, 7200, 21600)` seconds. It selects pending rows whose `available_at <= now`, resolves the target, calls `DeliverySender.send()`, and executes `mark_delivered()` only after a message ID returns. It maps arbitrary sender exceptions to the closed `delivery_failed` storage code. After the fifth failed attempt it retains status `pending`, schedules the next attempt 21,600 seconds later, computes the UTC six-hour window start, and calls `OperatorHealthSink.emit_once()` with dedupe key `outbox-stuck:{outbox_id}:{window_start_iso}` rather than dropping the message. The sink owns persistence of that dedupe key, so restarts cannot duplicate an operator event within the window.
+Add `RegistryRepository.get_delivery_target(target_id) -> DeliveryTargetRow`, which resolves the internal foreign-key ID and raises when absent. `OutboxWorker` receives a stable `worker_id` and uses only `claim_due_outbox(worker_id=..., now=..., limit=...)`; it never treats `target_id` itself as an address. Success and retry mutations require that same worker ID and clear the outbox lease. Empty or whitespace sender message IDs are delivery failures: retain pending status, apply backoff, and do not mark delivery. `OutboxWorker` uses delays `(60, 300, 1800, 7200, 21600)` seconds. It maps arbitrary sender exceptions to the closed `delivery_failed` storage code. After the fifth failed attempt it retains status `pending`, schedules the next attempt 21,600 seconds later, computes the UTC six-hour window start, and calls `OperatorHealthSink.emit_once()` with dedupe key `outbox-stuck:{outbox_id}:{window_start_iso}` rather than dropping the message. The sink owns durable atomic persistence of that dedupe key across processes and restarts.
+
+Delivery remains at-least-once: if a worker crashes after Telegram accepts a send but before SQLite
+commits delivery, the expired lease permits a retry because Telegram and SQLite cannot share a
+transaction.
 
 - [ ] **Step 6: Run the engine and full suites, then commit**
 

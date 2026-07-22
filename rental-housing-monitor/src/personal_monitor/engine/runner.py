@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -17,7 +17,7 @@ from personal_monitor.domain.spec import MonitorSpec, MonitorStatus, RuleKind
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.engine.scheduler import next_run_at
 from personal_monitor.ports import AdapterRegistry, Clock
-from personal_monitor.storage import RegistryRepository, RuntimeRepository
+from personal_monitor.storage import DeliveryCandidate, RegistryRepository, RuntimeRepository
 
 _DIAGNOSTIC_CODES = {
     ErrorClass.TRANSIENT_NETWORK: "network_error",
@@ -35,6 +35,15 @@ class RunResult:
     status: Literal["success", "partial_failure", "failed"]
     matched_count: int
     warning_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RunOutcome:
+    result: RunResult
+    stage: str
+    error_class: ErrorClass | None = None
+    error_detail: str | None = None
+    transition_to: MonitorStatus | None = None
 
 
 class MonitorRunner:
@@ -57,21 +66,22 @@ class MonitorRunner:
         active = self.registry.get_active_monitor(monitor_id)
         spec = active.spec
         target = self.registry.get_primary_target(active.owner_id)
-        run_id = self.runtime.start_run(monitor_id, active.version_id, started_at=self.clock.now())
+        started_at = self.clock.now()
+        run_id = self.runtime.start_run(monitor_id, active.version_id, started_at=started_at)
         try:
-            return await self._run_started(monitor_id, spec, target.id, run_id)
+            result = await self._run_started(monitor_id, spec, target.id)
         except Exception as caught:
             error = (
                 caught
                 if isinstance(caught, MonitorError)
                 else MonitorError(ErrorClass.INTERNAL, "internal", "internal failure")
             )
-            self._finish_failed(monitor_id, spec, run_id, error)
-            return RunResult(status="failed", matched_count=0, warning_count=0)
+            outcome = _failure_outcome(error)
+        else:
+            outcome = _RunOutcome(result=result, stage="complete")
+        return self._complete_started_run(monitor_id, spec, run_id, started_at, outcome)
 
-    async def _run_started(
-        self, monitor_id: str, spec: MonitorSpec, target_id: str, run_id: str
-    ) -> RunResult:
+    async def _run_started(self, monitor_id: str, spec: MonitorSpec, target_id: str) -> RunResult:
         batch = await self.adapters.resolve(spec.source_adapter, spec.adapter_ref).fetch(
             monitor_id, spec
         )
@@ -79,9 +89,9 @@ class MonitorRunner:
             raise MonitorError(ErrorClass.VALIDATION, "validate", "batch monitor mismatch")
         previous = self.runtime.load_items(monitor_id)
         changes = diff_items(previous, list(batch.items))
-        self.runtime.upsert_items(batch)
         previous_by_id = {item.item_id: item for item in previous}
         current_by_id = {item.item_id: item for item in batch.items}
+        candidates: list[DeliveryCandidate] = []
         matched_count = 0
         for change in changes:
             current = current_by_id.get(change.item_id)
@@ -95,73 +105,118 @@ class MonitorRunner:
             )
             for match in matches:
                 matched_count += 1
-                self.runtime.enqueue_delivery(
-                    dedupe_key=delivery_key(monitor_id, current, match),
-                    monitor_id=monitor_id,
-                    target_id=target_id,
-                    payload=render_payload(spec, current, match),
+                candidates.append(
+                    DeliveryCandidate(
+                        dedupe_key=delivery_key(monitor_id, current, match),
+                        target_id=target_id,
+                        payload=render_payload(spec, current, match),
+                    )
                 )
         if batch.warnings:
             for warning in batch.warnings:
-                self.runtime.enqueue_delivery(
-                    dedupe_key=(
-                        f"{monitor_id}:warning:{batch.observed_at.date()}:"
-                        f"{warning.source}:{warning.stage}"
-                    ),
-                    monitor_id=monitor_id,
-                    target_id=target_id,
-                    payload=render_warning(spec, warning, batch.source_status),
+                candidates.append(
+                    DeliveryCandidate(
+                        dedupe_key=(
+                            f"{monitor_id}:warning:{batch.observed_at.date()}:"
+                            f"{warning.source}:{warning.stage}"
+                        ),
+                        target_id=target_id,
+                        payload=render_warning(spec, warning, batch.source_status),
+                    )
                 )
             run_status: Literal["success", "partial_failure"] = "partial_failure"
         elif matched_count == 0 and spec.notify_on_no_change:
             local_date = batch.observed_at.astimezone(ZoneInfo(spec.timezone)).date()
-            self.runtime.enqueue_delivery(
-                dedupe_key=f"{monitor_id}:no-change:{local_date}",
-                monitor_id=monitor_id,
-                target_id=target_id,
-                payload={"text": "오늘은 신규 공고가 없습니다."},
+            candidates.append(
+                DeliveryCandidate(
+                    dedupe_key=f"{monitor_id}:no-change:{local_date}",
+                    target_id=target_id,
+                    payload={"text": "오늘은 신규 공고가 없습니다."},
+                )
             )
             run_status = "success"
         else:
             run_status = "success"
-        self.runtime.finish_run(run_id, status=run_status, stage="complete")
-        self.runtime.release_lease(
-            monitor_id,
-            worker_id=self.worker_id,
-            next_run_at=next_run_at(spec, monitor_id, self.clock.now()),
-        )
+        self.runtime.apply_snapshot_and_deliveries(batch, candidates)
         return RunResult(
             status=run_status,
             matched_count=matched_count,
             warning_count=len(batch.warnings),
         )
 
-    def _finish_failed(
-        self, monitor_id: str, spec: MonitorSpec, run_id: str, error: MonitorError
-    ) -> None:
-        self.runtime.finish_run(
-            run_id,
-            status="failed",
-            stage=error.stage,
-            error_class=error.error_class.value,
-            error_detail=_DIAGNOSTIC_CODES[error.error_class],
-        )
-        now = self.clock.now()
-        if error.error_class is ErrorClass.TRANSIENT_NETWORK:
-            retry_at = now + timedelta(minutes=5)
-        else:
-            target_status = (
-                MonitorStatus.PAUSED_AUTH
-                if error.error_class is ErrorClass.AUTHENTICATION
-                else MonitorStatus.NEEDS_REVIEW
+    def _complete_started_run(
+        self,
+        monitor_id: str,
+        spec: MonitorSpec,
+        run_id: str,
+        started_at: datetime,
+        outcome: _RunOutcome,
+    ) -> RunResult:
+        cleanup_error: Exception | None = None
+        schedule_base = started_at
+        try:
+            if outcome.transition_to is not None:
+                try:
+                    self.registry.transition_status(
+                        monitor_id, MonitorStatus.ACTIVE, outcome.transition_to
+                    )
+                except Exception as caught:
+                    cleanup_error = caught
+
+            try:
+                schedule_base = self.clock.now()
+                if outcome.error_class is ErrorClass.TRANSIENT_NETWORK:
+                    scheduled_at = schedule_base + timedelta(minutes=5)
+                else:
+                    scheduled_at = next_run_at(spec, monitor_id, schedule_base)
+            except Exception:
+                scheduled_at = _aware_fallback(schedule_base)
+
+            try:
+                self.runtime.finish_run(
+                    run_id,
+                    status=outcome.result.status,
+                    stage=outcome.stage,
+                    error_class=(
+                        outcome.error_class.value if outcome.error_class is not None else None
+                    ),
+                    error_detail=outcome.error_detail,
+                )
+            except Exception as caught:
+                if cleanup_error is None:
+                    cleanup_error = caught
+        finally:
+            self.runtime.release_lease(
+                monitor_id,
+                worker_id=self.worker_id,
+                next_run_at=scheduled_at,
             )
-            self.registry.transition_status(monitor_id, MonitorStatus.ACTIVE, target_status)
-            retry_at = next_run_at(spec, monitor_id, now)
-        self.runtime.release_lease(
-            monitor_id,
-            worker_id=self.worker_id,
-            next_run_at=retry_at,
-        )
+
+        if cleanup_error is not None:
+            raise cleanup_error
+        return outcome.result
+
+
+def _failure_outcome(error: MonitorError) -> _RunOutcome:
+    if error.error_class is ErrorClass.TRANSIENT_NETWORK:
+        transition_to = None
+    elif error.error_class is ErrorClass.AUTHENTICATION:
+        transition_to = MonitorStatus.PAUSED_AUTH
+    else:
+        transition_to = MonitorStatus.NEEDS_REVIEW
+    return _RunOutcome(
+        result=RunResult(status="failed", matched_count=0, warning_count=0),
+        stage=error.stage,
+        error_class=error.error_class,
+        error_detail=_DIAGNOSTIC_CODES[error.error_class],
+        transition_to=transition_to,
+    )
+
+
+def _aware_fallback(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = datetime.now(UTC)
+    return value.astimezone(UTC) + timedelta(minutes=5)
 
 
 def render_payload(
