@@ -16,6 +16,9 @@ dependencies = [
   "tenacity>=8.2,<10",
 ]
 
+[project.scripts]
+personal-monitor = "personal_monitor.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0,<9",
