@@ -275,6 +275,51 @@ def test_expired_rows_and_namespace_cleanup_are_bounded_and_scoped(
     assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0
 
 
+def test_expired_reader_does_not_delete_a_concurrent_fresh_upsert(tmp_path: Path) -> None:
+    from personal_monitor.scraping.adaptive_storage import EncryptedAdaptiveStorage
+
+    database = tmp_path / "adaptive-race.db"
+    stale_connection = open_database(database)
+    fresh_connection = open_database(database)
+    current = [datetime(2026, 7, 23, 12, 0, tzinfo=UTC)]
+    race: list[object] = []
+
+    def stale_clock() -> datetime:
+        if race:
+            callback = race.pop()
+            callback()
+        return current[0]
+
+    try:
+        stale = namespace(
+            EncryptedAdaptiveStorage(
+                stale_connection,
+                cipher=AesGcmCipher(b"k" * 32),
+                clock=stale_clock,
+            )
+        )
+        stale.save(fromstring("<article>stale</article>"), "item_scope:0")
+        current[0] += timedelta(days=91)
+        fresh = namespace(
+            EncryptedAdaptiveStorage(
+                fresh_connection,
+                cipher=AesGcmCipher(b"k" * 32),
+                clock=lambda: current[0],
+            )
+        )
+        race.append(lambda: fresh.save(fromstring("<article>fresh</article>"), "item_scope:0"))
+
+        assert stale.retrieve("item_scope:0") is None
+        restored = fresh.retrieve("item_scope:0")
+
+        assert restored is not None
+        assert restored["text"] == "fresh"
+        assert fresh_connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 1
+    finally:
+        fresh_connection.close()
+        stale_connection.close()
+
+
 def test_purge_expired_uses_bound_timestamp_and_rolls_back_on_sql_failure(
     connection: sqlite3.Connection,
 ) -> None:
@@ -439,6 +484,99 @@ def test_coordinated_low_level_store_and_namespace_snapshot_replacement_is_rejec
         "_composition",
         (connection, clean_store._cipher, clean_store._clock, swapped, swapped_hash),
     )
+    with pytest.raises(RuntimeError, match="integrity"):
+        scoped.save(element(), "item_scope:0")
+    assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0
+
+
+def test_save_uses_one_pinned_dependency_snapshot_when_clock_mutates_namespace(
+    connection: sqlite3.Connection,
+) -> None:
+    from personal_monitor.scraping.adaptive_storage import EncryptedAdaptiveStorage
+
+    callback: list[object] = []
+
+    def clock() -> datetime:
+        if callback:
+            callback.pop()()
+        return datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+
+    original_cipher = AesGcmCipher(b"k" * 32)
+    replacement_cipher = AesGcmCipher(b"z" * 32)
+    scoped = namespace(EncryptedAdaptiveStorage(connection, cipher=original_cipher, clock=clock))
+
+    def replace_dependencies() -> None:
+        object.__setattr__(scoped, "_cipher", replacement_cipher)
+        object.__setattr__(
+            scoped,
+            "_composition",
+            (
+                connection,
+                replacement_cipher,
+                clock,
+                scoped._namespace,
+                scoped._namespace_hash,
+            ),
+        )
+
+    callback.append(replace_dependencies)
+    scoped.save(element(), "item_scope:0")
+
+    clean = namespace(
+        EncryptedAdaptiveStorage(
+            connection,
+            cipher=AesGcmCipher(b"k" * 32),
+            clock=lambda: datetime(2026, 7, 23, 12, 0, tzinfo=UTC),
+        )
+    )
+    restored = clean.retrieve("item_scope:0")
+    assert restored is not None
+    assert restored["text"].startswith("private page text")
+
+
+def test_replacing_module_accessors_cannot_replace_private_storage_snapshots(
+    connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import personal_monitor.scraping.adaptive_storage as storage_module
+
+    store = adaptive_store(connection)
+    replacement_cipher = AesGcmCipher(b"z" * 32)
+    clock = store._clock
+    object.__setattr__(store, "_cipher", replacement_cipher)
+    object.__setattr__(store, "_composition", (connection, replacement_cipher, clock))
+    monkeypatch.setattr(
+        storage_module,
+        "_acquire_storage",
+        lambda _owner: (connection, replacement_cipher, clock),
+    )
+
+    with pytest.raises(RuntimeError, match="integrity"):
+        namespace(store)
+
+    monkeypatch.undo()
+    clean_store = adaptive_store(connection)
+    scoped = namespace(clean_store)
+    namespace_bytes = scoped._namespace
+    namespace_hash = scoped._namespace_hash
+    object.__setattr__(scoped, "_cipher", replacement_cipher)
+    object.__setattr__(
+        scoped,
+        "_composition",
+        (connection, replacement_cipher, clean_store._clock, namespace_bytes, namespace_hash),
+    )
+    monkeypatch.setattr(
+        storage_module,
+        "_acquire_namespace",
+        lambda _owner: (
+            connection,
+            replacement_cipher,
+            clean_store._clock,
+            namespace_bytes,
+            namespace_hash,
+        ),
+    )
+
     with pytest.raises(RuntimeError, match="integrity"):
         scoped.save(element(), "item_scope:0")
     assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0

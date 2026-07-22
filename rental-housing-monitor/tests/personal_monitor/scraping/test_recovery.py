@@ -870,6 +870,85 @@ def test_recovery_dependency_replacement_fails_before_any_dispatch(
     assert other_resolver.calls == []
 
 
+@pytest.mark.parametrize(
+    "dependency",
+    ["registry", "repository", "cipher", "extractor", "validator"],
+)
+def test_recovery_rejects_dependency_subclasses_at_the_constructor_boundary(
+    connection: sqlite3.Connection,
+    adaptive_storage: EncryptedAdaptiveStorage,
+    dependency: str,
+) -> None:
+    from personal_monitor.scraping.recovery import AdaptiveRecovery
+
+    class RegistrySubclass(RegistryRepository):
+        pass
+
+    class RecoverySubclass(RecoveryRepository):
+        pass
+
+    class CipherSubclass(AesGcmCipher):
+        pass
+
+    class ExtractorSubclass(DeclarativeExtractor):
+        pass
+
+    class ValidatorSubclass(ObservationValidator):
+        pass
+
+    dependencies: dict[str, object] = {
+        "registry": RegistryRepository(connection),
+        "repository": RecoveryRepository(connection),
+        "cipher": AesGcmCipher(b"k" * 32),
+        "adaptive_storage": adaptive_storage,
+        "url_policy": UrlPolicy(Resolver()),
+        "extractor": DeclarativeExtractor(),
+        "validator": ObservationValidator(),
+    }
+    replacements: dict[str, object] = {
+        "registry": RegistrySubclass(connection),
+        "repository": RecoverySubclass(connection),
+        "cipher": CipherSubclass(b"k" * 32),
+        "extractor": ExtractorSubclass(),
+        "validator": ValidatorSubclass(),
+    }
+    dependencies[dependency] = replacements[dependency]
+
+    with pytest.raises(TypeError):
+        AdaptiveRecovery(**dependencies)  # type: ignore[arg-type]
+
+
+def test_replacing_recovery_accessor_cannot_replace_private_snapshot(
+    connection: sqlite3.Connection,
+    adaptive_storage: EncryptedAdaptiveStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import personal_monitor.scraping.recovery as recovery_module
+
+    recovery, registry, repository, cipher, _monitor_id = build_recovery(
+        connection, adaptive_storage
+    )
+    replacement = DeclarativeExtractor()
+    object.__setattr__(recovery, "_extractor", replacement)
+    monkeypatch.setattr(
+        recovery_module,
+        "_acquire_recovery",
+        lambda _owner: (
+            registry,
+            repository,
+            cipher,
+            adaptive_storage,
+            recovery._url_policy,
+            replacement,
+            recovery._validator,
+            connection,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="integrity"):
+        recovery_module._trusted_recovery(recovery)
+
+
 def test_recovery_candidate_freezes_caps_and_redacts_nested_values() -> None:
     from personal_monitor.scraping.recovery import RecoveryCandidate
 

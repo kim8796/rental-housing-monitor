@@ -120,48 +120,53 @@ class EncryptedAdaptiveStorage:
     def for_namespace(
         self, *, owner_id: str, monitor_id: str, version_id: str
     ) -> EncryptedAdaptiveNamespace:
-        self._assert_integrity()
+        connection, cipher, clock = self._trusted_snapshot()
         parts = tuple(_namespace_part(value) for value in (owner_id, monitor_id, version_id))
         namespace = b"\0".join(part.encode("utf-8") for part in parts)
         return EncryptedAdaptiveNamespace(
-            self._connection,
-            cipher=self._cipher,
-            clock=self._clock,
+            connection,
+            cipher=cipher,
+            clock=clock,
             namespace=namespace,
         )
 
     def purge_expired(self, *, now: datetime) -> int:
-        self._assert_integrity()
+        connection, _cipher, _clock = self._trusted_snapshot()
         timestamp = utc_timestamp(now, parameter="now")
         try:
-            with transaction(self._connection, immediate=True):
-                cursor = self._connection.execute(
+            with transaction(connection, immediate=True):
+                cursor = connection.execute(
                     "DELETE FROM adaptive_features WHERE expires_at <= ?", (timestamp,)
                 )
             return cursor.rowcount
         except sqlite3.Error:
             raise RuntimeError("adaptive feature storage failed") from None
 
-    def _assert_integrity(self) -> None:
+    def _trusted_snapshot(
+        self,
+        _acquire: Callable[[object], tuple[object, ...]] = _acquire_storage,
+    ) -> tuple[sqlite3.Connection, AesGcmCipher, Callable[[], datetime]]:
         try:
-            connection, cipher, clock = _acquire_storage(self)
+            connection, cipher, clock = _acquire(self)
             valid = (
                 self._connection is connection
                 and self._cipher is cipher
                 and self._clock is clock
-                and type(self._cipher) is AesGcmCipher
-                and isinstance(self._connection, sqlite3.Connection)
+                and self._composition == (connection, cipher, clock)
+                and type(cipher) is AesGcmCipher
+                and isinstance(connection, sqlite3.Connection)
             )
         except (AttributeError, TypeError, ValueError):
             valid = False
         if not valid:
             raise RuntimeError("adaptive feature storage integrity check failed")
+        return connection, cipher, clock
+
+    def _assert_integrity(self) -> None:
+        self._trusted_snapshot()
 
     def _trusted_connection(self) -> sqlite3.Connection:
-        self._assert_integrity()
-        connection, _cipher, _clock = _acquire_storage(self)
-        if not isinstance(connection, sqlite3.Connection):
-            raise RuntimeError("adaptive feature storage integrity check failed")
+        connection, _cipher, _clock = self._trusted_snapshot()
         return connection
 
 
@@ -222,20 +227,20 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
         *,
         precondition: Callable[[sqlite3.Connection], None] | None = None,
     ) -> None:
-        self._assert_integrity()
-        now = _clock_value(self._clock)
+        connection, cipher, clock, namespace, namespace_hash = self._trusted_snapshot()
+        now = _clock_value(clock)
         timestamp = now.isoformat()
         expires_at = (now + _RETENTION).isoformat()
         prepared: list[tuple[object, ...]] = []
         for element, identifier in entries:
             checked_identifier = _identifier(identifier)
             payload = _encode_feature(_element_feature(element))
-            base_aad = self._aad(checked_identifier)
-            blob = self._cipher.encrypt(payload, _expiry_aad(base_aad, expires_at))
+            base_aad = _feature_aad(namespace, checked_identifier)
+            blob = cipher.encrypt(payload, _expiry_aad(base_aad, expires_at))
             prepared.append(
                 (
                     hashlib.sha256(base_aad).hexdigest(),
-                    self._namespace_hash,
+                    namespace_hash,
                     blob.nonce,
                     blob.ciphertext,
                     timestamp,
@@ -244,10 +249,10 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
                 )
             )
         try:
-            with transaction(self._connection, immediate=True):
+            with transaction(connection, immediate=True):
                 if precondition is not None:
-                    precondition(self._connection)
-                self._connection.executemany(
+                    precondition(connection)
+                connection.executemany(
                     "INSERT INTO adaptive_features("
                     "key_hash, namespace_hash, nonce, ciphertext, created_at, updated_at, "
                     "expires_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -261,15 +266,15 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
             raise RuntimeError("adaptive feature storage failed") from None
 
     def retrieve(self, identifier: str) -> dict[str, object] | None:
-        self._assert_integrity()
+        connection, cipher, clock, namespace, namespace_hash = self._trusted_snapshot()
         checked_identifier = _identifier(identifier)
-        base_aad = self._aad(checked_identifier)
+        base_aad = _feature_aad(namespace, checked_identifier)
         key_hash = hashlib.sha256(base_aad).hexdigest()
         try:
-            row = self._connection.execute(
+            row = connection.execute(
                 "SELECT nonce, ciphertext, expires_at FROM adaptive_features "
                 "WHERE key_hash = ? AND namespace_hash = ?",
-                (key_hash, self._namespace_hash),
+                (key_hash, namespace_hash),
             ).fetchone()
         except sqlite3.Error:
             raise RuntimeError("adaptive feature storage failed") from None
@@ -279,7 +284,7 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
             expires_at_value = row["expires_at"]
             if not isinstance(expires_at_value, str):
                 raise ValueError
-            plaintext = self._cipher.decrypt(
+            plaintext = cipher.decrypt(
                 EncryptedBlob(nonce=row["nonce"], ciphertext=row["ciphertext"]),
                 _expiry_aad(base_aad, expires_at_value),
             )
@@ -297,59 +302,89 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
                 raise ValueError
         except (TypeError, ValueError):
             raise ValueError("adaptive feature authentication failed") from None
-        if expires_at.astimezone(UTC) <= _clock_value(self._clock):
-            self.delete(checked_identifier)
+        if expires_at.astimezone(UTC) <= _clock_value(clock):
+            try:
+                with transaction(connection, immediate=True):
+                    connection.execute(
+                        "DELETE FROM adaptive_features WHERE key_hash = ? "
+                        "AND namespace_hash = ? AND nonce = ? AND ciphertext = ? "
+                        "AND expires_at = ?",
+                        (
+                            key_hash,
+                            namespace_hash,
+                            row["nonce"],
+                            row["ciphertext"],
+                            expires_at_value,
+                        ),
+                    )
+            except sqlite3.Error:
+                raise RuntimeError("adaptive feature storage failed") from None
             return None
         return feature
 
     def delete(self, identifier: str) -> bool:
-        self._assert_integrity()
+        connection, _cipher, _clock, namespace, namespace_hash = self._trusted_snapshot()
         checked_identifier = _identifier(identifier)
-        aad = self._aad(checked_identifier)
+        aad = _feature_aad(namespace, checked_identifier)
         key_hash = hashlib.sha256(aad).hexdigest()
         try:
-            with transaction(self._connection, immediate=True):
-                cursor = self._connection.execute(
+            with transaction(connection, immediate=True):
+                cursor = connection.execute(
                     "DELETE FROM adaptive_features WHERE key_hash = ? AND namespace_hash = ?",
-                    (key_hash, self._namespace_hash),
+                    (key_hash, namespace_hash),
                 )
             return cursor.rowcount == 1
         except sqlite3.Error:
             raise RuntimeError("adaptive feature storage failed") from None
 
     def delete_all(self) -> int:
-        self._assert_integrity()
+        connection, _cipher, _clock, _namespace, namespace_hash = self._trusted_snapshot()
         try:
-            with transaction(self._connection, immediate=True):
-                cursor = self._connection.execute(
+            with transaction(connection, immediate=True):
+                cursor = connection.execute(
                     "DELETE FROM adaptive_features WHERE namespace_hash = ?",
-                    (self._namespace_hash,),
+                    (namespace_hash,),
                 )
             return cursor.rowcount
         except sqlite3.Error:
             raise RuntimeError("adaptive feature storage failed") from None
 
-    def _aad(self, identifier: str) -> bytes:
-        return _AAD_PREFIX + self._namespace + b"\0" + identifier.encode("ascii")
-
-    def _assert_integrity(self) -> None:
+    def _trusted_snapshot(
+        self,
+        _acquire: Callable[[object], tuple[object, ...]] = _acquire_namespace,
+    ) -> tuple[
+        sqlite3.Connection,
+        AesGcmCipher,
+        Callable[[], datetime],
+        bytes,
+        str,
+    ]:
         try:
-            connection, cipher, clock, namespace, namespace_hash = _acquire_namespace(self)
+            connection, cipher, clock, namespace, namespace_hash = _acquire(self)
             valid = (
                 self._connection is connection
                 and self._cipher is cipher
                 and self._clock is clock
                 and self._namespace == namespace
                 and self._namespace_hash == namespace_hash
-                and hashlib.sha256(self._namespace).hexdigest() == self._namespace_hash
+                and self._composition == (connection, cipher, clock, namespace, namespace_hash)
+                and hashlib.sha256(namespace).hexdigest() == namespace_hash
                 and self.url is None
-                and type(self._cipher) is AesGcmCipher
-                and isinstance(self._connection, sqlite3.Connection)
+                and type(cipher) is AesGcmCipher
+                and isinstance(connection, sqlite3.Connection)
             )
         except (AttributeError, TypeError, ValueError):
             valid = False
         if not valid:
             raise RuntimeError("adaptive feature storage integrity check failed")
+        return connection, cipher, clock, namespace, namespace_hash
+
+    def _assert_integrity(self) -> None:
+        self._trusted_snapshot()
+
+
+def _feature_aad(namespace: bytes, identifier: str) -> bytes:
+    return _AAD_PREFIX + namespace + b"\0" + identifier.encode("ascii")
 
 
 def _expiry_aad(base_aad: bytes, expires_at: str) -> bytes:

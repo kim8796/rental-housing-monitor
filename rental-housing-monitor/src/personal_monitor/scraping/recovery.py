@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import threading
 import weakref
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -133,19 +133,19 @@ class AdaptiveRecovery:
         extractor: DeclarativeExtractor,
         validator: ObservationValidator,
     ) -> None:
-        if not isinstance(registry, RegistryRepository):
+        if type(registry) is not RegistryRepository:
             raise TypeError("registry is invalid")
-        if not isinstance(repository, RecoveryRepository):
+        if type(repository) is not RecoveryRepository:
             raise TypeError("recovery repository is invalid")
-        if not isinstance(cipher, AesGcmCipher):
+        if type(cipher) is not AesGcmCipher:
             raise TypeError("cipher is invalid")
         if type(adaptive_storage) is not EncryptedAdaptiveStorage:
             raise TypeError("adaptive storage must be the sealed encrypted store")
         if type(url_policy) is not UrlPolicy:
             raise TypeError("URL policy is invalid")
-        if not isinstance(extractor, DeclarativeExtractor):
+        if type(extractor) is not DeclarativeExtractor:
             raise TypeError("extractor is invalid")
-        if not isinstance(validator, ObservationValidator):
+        if type(validator) is not ObservationValidator:
             raise TypeError("validator is invalid")
         try:
             storage_connection = adaptive_storage._trusted_connection()
@@ -457,9 +457,12 @@ class AdaptiveRecovery:
         )
 
 
-def _trusted_recovery(owner: AdaptiveRecovery) -> tuple[object, ...]:
+def _trusted_recovery(
+    owner: AdaptiveRecovery,
+    _acquire: Callable[[object], tuple[object, ...]] = _acquire_recovery,
+) -> tuple[object, ...]:
     try:
-        dependencies = _acquire_recovery(owner)
+        dependencies = _acquire(owner)
         registry, repository, cipher, storage, policy, extractor, validator, connection = (
             dependencies
         )
