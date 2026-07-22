@@ -1,54 +1,120 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
+import re
+import threading
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from threading import Lock
-from urllib.parse import urlsplit
-from weakref import WeakKeyDictionary
+from typing import cast
+from urllib.parse import urljoin, urlsplit
 
+from scrapling.core.utils import reset_logger, set_logger
 from scrapling.fetchers import DynamicFetcher, Fetcher, StealthyFetcher
 
 from personal_monitor.domain.spec import FetchStrategy
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.scraping.document import SourceDocument
-from personal_monitor.security.url_policy import MAX_REDIRECTS, ResolvedTarget
+from personal_monitor.security.url_policy import (
+    MAX_REDIRECTS,
+    ResolvedTarget,
+    has_unsafe_url_characters,
+)
 
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+MAX_DETECTOR_BYTES = 256 * 1024
 HTTP_CONCURRENCY = 4
 BROWSER_CONCURRENCY = 1
 HTTP_TIMEOUT_SECONDS = 30.0
 BROWSER_TIMEOUT_SECONDS = 90.0
+GATE_POLL_SECONDS = 0.01
 NAVIGATION_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
+_RETAINED_HEADERS = frozenset({"content-type", "location", "retry-after"})
+_MEDIA_TOKEN = r"[!#$%&'*+\-.^_`|~0-9a-z]+"
+_MEDIA_TYPE = re.compile(rf"^({_MEDIA_TOKEN})/({_MEDIA_TOKEN})$")
 _SELECTOR_CONFIG = {
     "adaptive": True,
     "keep_comments": False,
     "keep_cdata": False,
 }
+_DYNAMIC_WEBRTC_FLAGS = [
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--force-webrtc-ip-handling-policy",
+]
+_UNSET = object()
 
 BlockingFetcher = Callable[..., object]
+BlockPageDetector = Callable[[int, str, bytes], bool]
+Clock = Callable[[], datetime]
 
-_shared_semaphore_lock = Lock()
-_shared_semaphores: WeakKeyDictionary[
-    asyncio.AbstractEventLoop, tuple[asyncio.Semaphore, asyncio.Semaphore]
-] = WeakKeyDictionary()
+_HTTP_GATE = threading.BoundedSemaphore(HTTP_CONCURRENCY)
+_BROWSER_GATE = threading.BoundedSemaphore(BROWSER_CONCURRENCY)
+
+_QUIET_LOGGER = logging.getLogger("personal_monitor.scrapling.quiet")
+_QUIET_LOGGER.handlers.clear()
+_QUIET_LOGGER.addHandler(logging.NullHandler())
+_QUIET_LOGGER.propagate = False
+_QUIET_LOGGER.setLevel(logging.CRITICAL + 1)
 
 
-def normalize_response(response: object, *, strategy: FetchStrategy) -> SourceDocument:
+class FetchError(MonitorError):
+    """A safe structured fetch failure without response or credential material."""
+
+    def __init__(
+        self,
+        error_class: ErrorClass,
+        safe_detail: str,
+        *,
+        status: int,
+        retry_after_seconds: float | None = None,
+        detected_interstitial: bool = False,
+    ) -> None:
+        super().__init__(error_class, "fetch", safe_detail)
+        self.status = status
+        self.retry_after_seconds = retry_after_seconds
+        self.detected_interstitial = detected_interstitial
+
+
+def normalize_response(
+    response: object,
+    *,
+    strategy: FetchStrategy,
+    block_page_detector: BlockPageDetector | None = None,
+    clock: Clock = lambda: datetime.now(UTC),
+) -> SourceDocument:
     status = _read_status(response)
-    _raise_for_status(status)
     final_url = _read_final_url(response)
     redirect_urls = _read_redirect_urls(response)
-    headers = _copy_headers(response)
+    headers, header_values = _copy_safe_headers(response)
     body = _read_body(response)
-    content_type = _read_content_type(
-        response,
-        headers,
-        allow_missing=status in NAVIGATION_REDIRECT_STATUSES and not body,
+    content_type = _normalize_content_type(header_values.get("content-type", ()))
+    detected_interstitial = _detect_interstitial(
+        block_page_detector,
+        status=status,
+        content_type=content_type,
+        body=body,
     )
+    retry_after_seconds = _parse_retry_after(header_values.get("retry-after", ()), clock=clock)
+    _raise_for_status(
+        status,
+        retry_after_seconds=retry_after_seconds,
+        detected_interstitial=detected_interstitial,
+    )
+
+    redirect_location = None
+    if status in NAVIGATION_REDIRECT_STATUSES:
+        redirect_location = _read_redirect_location(
+            header_values.get("location", ()),
+            base_url=final_url,
+        )
+    allow_missing_content_type = status in NAVIGATION_REDIRECT_STATUSES and not body
+    _validate_content_type(content_type, allow_missing=allow_missing_content_type)
+
     return SourceDocument(
         final_url=final_url,
         status=status,
@@ -57,15 +123,18 @@ def normalize_response(response: object, *, strategy: FetchStrategy) -> SourceDo
         body=body,
         strategy=strategy,
         redirect_urls=redirect_urls,
+        redirect_location=redirect_location,
     )
 
 
 class ScraplingBackend:
     """A bounded async boundary around Scrapling's synchronous fetchers.
 
-    Python cannot forcibly stop a thread already running inside ``asyncio.to_thread``.
-    After outer cancellation or timeout, an already-started worker therefore retains
-    its semaphore slot until Scrapling's own timeout bounds and finishes the work.
+    The default execution gates are process-wide threading semaphores, so separate
+    event loops and worker threads still share the HTTP-4/browser-1 policy. Gate
+    acquisition polls without occupying the loop's default executor. Once egress
+    work starts, timeout or cancellation leaves the gate held until its underlying
+    executor call actually finishes.
     """
 
     def __init__(
@@ -73,23 +142,46 @@ class ScraplingBackend:
         *,
         egress_proxy_url: str | None,
         test_mode: bool = False,
-        http_fetcher: BlockingFetcher = Fetcher.get,
-        dynamic_fetcher: BlockingFetcher = DynamicFetcher.fetch,
-        stealthy_fetcher: BlockingFetcher = StealthyFetcher.fetch,
-        http_semaphore: asyncio.Semaphore | None = None,
-        browser_semaphore: asyncio.Semaphore | None = None,
+        http_fetcher: BlockingFetcher | object = _UNSET,
+        dynamic_fetcher: BlockingFetcher | object = _UNSET,
+        stealthy_fetcher: BlockingFetcher | object = _UNSET,
+        http_gate: threading.BoundedSemaphore | None = None,
+        browser_gate: threading.BoundedSemaphore | None = None,
         http_timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
         browser_timeout_seconds: float = BROWSER_TIMEOUT_SECONDS,
+        block_page_detector: BlockPageDetector | None = None,
+        clock: Clock = lambda: datetime.now(UTC),
     ) -> None:
-        proxy = egress_proxy_url.strip() if isinstance(egress_proxy_url, str) else None
-        if not test_mode and not proxy:
-            raise ValueError("an egress proxy is required outside test mode")
+        proxy = _validate_proxy_url(egress_proxy_url)
+        injected_fetchers = (
+            http_fetcher is not _UNSET and not _is_scrapling_default(http_fetcher, Fetcher.get),
+            dynamic_fetcher is not _UNSET
+            and not _is_scrapling_default(dynamic_fetcher, DynamicFetcher.fetch),
+            stealthy_fetcher is not _UNSET
+            and not _is_scrapling_default(stealthy_fetcher, StealthyFetcher.fetch),
+        )
+        if not proxy:
+            if not test_mode:
+                raise ValueError("an egress proxy is required outside test mode")
+            if not all(injected_fetchers):
+                raise ValueError(
+                    "unproxied test mode requires three explicitly injected test fetchers"
+                )
+
         self._egress_proxy_url = proxy
-        self._http_fetcher = http_fetcher
-        self._dynamic_fetcher = dynamic_fetcher
-        self._stealthy_fetcher = stealthy_fetcher
-        self._http_semaphore = http_semaphore
-        self._browser_semaphore = browser_semaphore
+        self._http_fetcher = cast(
+            BlockingFetcher, Fetcher.get if http_fetcher is _UNSET else http_fetcher
+        )
+        self._dynamic_fetcher = cast(
+            BlockingFetcher,
+            DynamicFetcher.fetch if dynamic_fetcher is _UNSET else dynamic_fetcher,
+        )
+        self._stealthy_fetcher = cast(
+            BlockingFetcher,
+            StealthyFetcher.fetch if stealthy_fetcher is _UNSET else stealthy_fetcher,
+        )
+        self._http_gate = http_gate or _HTTP_GATE
+        self._browser_gate = browser_gate or _BROWSER_GATE
         self._http_timeout_seconds = _bounded_timeout(
             http_timeout_seconds,
             maximum=HTTP_TIMEOUT_SECONDS,
@@ -100,6 +192,8 @@ class ScraplingBackend:
             maximum=BROWSER_TIMEOUT_SECONDS,
             label="browser",
         )
+        self._block_page_detector = block_page_detector
+        self._clock = clock
         self._background_calls: set[asyncio.Task[object]] = set()
 
     async def fetch_http(self, target: ResolvedTarget) -> SourceDocument:
@@ -107,18 +201,17 @@ class ScraplingBackend:
             target,
             strategy=FetchStrategy.HTTP,
             fetcher=self._http_fetcher,
-            semaphore=self._http_capacity(),
+            gate=self._http_gate,
             outer_timeout_seconds=self._http_timeout_seconds,
             kwargs={
-                "timeout": 30,
+                # curl_cffi accepts (connect timeout, read timeout); Scrapling
+                # 0.4.11 forwards this value unchanged to the curl session.
+                "timeout": (10, 30),
                 "follow_redirects": False,
                 "max_redirects": 0,
-                # Scrapling 0.4.11 defines this as total attempts, despite the
-                # option name. One means exactly one attempt; zero skips I/O.
+                # Scrapling 0.4.11 counts total attempts, so one means no retry.
                 "retries": 1,
                 "proxy": self._egress_proxy_url,
-                # Scrapling 0.4.11's Fetcher.get accepts ``headers`` rather than
-                # the browser-only ``extra_headers`` option.
                 "headers": {"Accept-Encoding": "identity"},
                 "selector_config": dict(_SELECTOR_CONFIG),
             },
@@ -152,41 +245,32 @@ class ScraplingBackend:
         strategy: FetchStrategy,
         fetcher: BlockingFetcher,
     ) -> SourceDocument:
+        kwargs: dict[str, object] = {
+            "timeout": 90_000,
+            "headless": True,
+            "network_idle": True,
+            "disable_resources": True,
+            "block_ads": True,
+            "google_search": False,
+            "dns_over_https": False,
+            "retries": 1,
+            "proxy": self._egress_proxy_url,
+            "selector_config": dict(_SELECTOR_CONFIG),
+        }
+        if profile is not None:
+            kwargs["user_data_dir"] = str(profile)
+        if strategy is FetchStrategy.STEALTHY:
+            kwargs.update(solve_cloudflare=False, block_webrtc=True)
+        else:
+            kwargs["extra_flags"] = list(_DYNAMIC_WEBRTC_FLAGS)
         return await self._fetch(
             target,
             strategy=strategy,
             fetcher=fetcher,
-            semaphore=self._browser_capacity(),
+            gate=self._browser_gate,
             outer_timeout_seconds=self._browser_timeout_seconds,
-            kwargs={
-                "timeout": 90_000,
-                "network_idle": True,
-                "disable_resources": True,
-                "block_ads": True,
-                "google_search": False,
-                "dns_over_https": False,
-                # Browser fetchers also count total attempts, not retries.
-                "retries": 1,
-                "proxy": self._egress_proxy_url,
-                "user_data_dir": str(profile) if profile else None,
-                "selector_config": dict(_SELECTOR_CONFIG),
-                **(
-                    {"solve_cloudflare": False, "block_webrtc": True}
-                    if strategy is FetchStrategy.STEALTHY
-                    else {}
-                ),
-            },
+            kwargs=kwargs,
         )
-
-    def _http_capacity(self) -> asyncio.Semaphore:
-        if self._http_semaphore is not None:
-            return self._http_semaphore
-        return _shared_fetch_semaphores()[0]
-
-    def _browser_capacity(self) -> asyncio.Semaphore:
-        if self._browser_semaphore is not None:
-            return self._browser_semaphore
-        return _shared_fetch_semaphores()[1]
 
     async def _fetch(
         self,
@@ -194,7 +278,7 @@ class ScraplingBackend:
         *,
         strategy: FetchStrategy,
         fetcher: BlockingFetcher,
-        semaphore: asyncio.Semaphore,
+        gate: threading.BoundedSemaphore,
         outer_timeout_seconds: float,
         kwargs: dict[str, object],
     ) -> SourceDocument:
@@ -206,7 +290,7 @@ class ScraplingBackend:
                 fetcher,
                 target.normalized_url,
                 kwargs=kwargs,
-                semaphore=semaphore,
+                gate=gate,
                 started=started,
             )
         )
@@ -222,20 +306,17 @@ class ScraplingBackend:
         except TimeoutError:
             if not started.is_set():
                 worker.cancel()
-            raise MonitorError(
-                ErrorClass.TRANSIENT_NETWORK,
-                "fetch",
-                "fetch timed out",
-            ) from None
+            raise MonitorError(ErrorClass.TRANSIENT_NETWORK, "fetch", "fetch timed out") from None
         except MonitorError:
             raise
         except Exception:
-            raise MonitorError(
-                ErrorClass.TRANSIENT_NETWORK,
-                "fetch",
-                "fetch failed",
-            ) from None
-        return normalize_response(response, strategy=strategy)
+            raise MonitorError(ErrorClass.TRANSIENT_NETWORK, "fetch", "fetch failed") from None
+        return normalize_response(
+            response,
+            strategy=strategy,
+            block_page_detector=self._block_page_detector,
+            clock=self._clock,
+        )
 
     @staticmethod
     async def _run_blocking(
@@ -243,26 +324,83 @@ class ScraplingBackend:
         url: str,
         *,
         kwargs: dict[str, object],
-        semaphore: asyncio.Semaphore,
+        gate: threading.BoundedSemaphore,
         started: asyncio.Event,
     ) -> object:
-        async with semaphore:
+        await _acquire_gate(gate)
+        try:
             started.set()
-            thread = asyncio.create_task(asyncio.to_thread(fetcher, url, **kwargs))
+            thread = asyncio.get_running_loop().run_in_executor(
+                None,
+                _invoke_quietly,
+                fetcher,
+                url,
+                kwargs,
+            )
             try:
                 return await asyncio.shield(thread)
             except asyncio.CancelledError:
-                # Loop shutdown can cancel this bookkeeping task. Do not release
-                # capacity while its blocking thread is still doing egress work.
                 with suppress(BaseException):
                     await thread
                 raise
+        finally:
+            gate.release()
 
     def _discard_background_call(self, task: asyncio.Task[object]) -> None:
         self._background_calls.discard(task)
-        if task.cancelled():
-            return
-        task.exception()
+        if not task.cancelled():
+            task.exception()
+
+
+async def _acquire_gate(gate: threading.BoundedSemaphore) -> None:
+    while not gate.acquire(blocking=False):
+        await asyncio.sleep(GATE_POLL_SECONDS)
+
+
+def _invoke_quietly(
+    fetcher: BlockingFetcher,
+    url: str,
+    kwargs: dict[str, object],
+) -> object:
+    token = set_logger(_QUIET_LOGGER)
+    try:
+        return fetcher(url, **kwargs)
+    finally:
+        reset_logger(token)
+
+
+def _is_scrapling_default(candidate: object, default: BlockingFetcher) -> bool:
+    return getattr(candidate, "__self__", None) is getattr(default, "__self__", None) and getattr(
+        candidate, "__func__", None
+    ) is getattr(default, "__func__", None)
+
+
+def _validate_proxy_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("egress proxy URL is invalid")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized != value or has_unsafe_url_characters(value):
+        raise ValueError("egress proxy URL is invalid")
+    try:
+        parts = urlsplit(normalized)
+        port = parts.port
+    except ValueError:
+        raise ValueError("egress proxy URL is invalid") from None
+    if (
+        parts.scheme.casefold() not in {"http", "https"}
+        or not parts.hostname
+        or (parts.path not in {"", "/"})
+        or parts.query
+        or parts.fragment
+        or port is not None
+        and not 1 <= port <= 65535
+    ):
+        raise ValueError("egress proxy URL is invalid")
+    return normalized
 
 
 def _bounded_timeout(value: float, *, maximum: float, label: str) -> float:
@@ -287,17 +425,59 @@ def _read_status(response: object) -> int:
     return status
 
 
-def _raise_for_status(status: int) -> None:
+def _raise_for_status(
+    status: int,
+    *,
+    retry_after_seconds: float | None,
+    detected_interstitial: bool,
+) -> None:
+    if detected_interstitial:
+        raise FetchError(
+            ErrorClass.POLICY,
+            "block page detected",
+            status=status,
+            retry_after_seconds=retry_after_seconds,
+            detected_interstitial=True,
+        )
     if status in {401, 403}:
-        raise MonitorError(ErrorClass.AUTHENTICATION, "fetch", "authentication was rejected")
+        raise FetchError(
+            ErrorClass.AUTHENTICATION,
+            "authentication was rejected",
+            status=status,
+            retry_after_seconds=retry_after_seconds,
+        )
     if status == 429 or 500 <= status <= 599:
-        raise MonitorError(
+        raise FetchError(
             ErrorClass.TRANSIENT_NETWORK,
-            "fetch",
             "remote service is temporarily unavailable",
+            status=status,
+            retry_after_seconds=retry_after_seconds,
         )
     if 400 <= status <= 499:
-        raise _policy_error("remote service rejected the request")
+        raise FetchError(
+            ErrorClass.POLICY,
+            "remote service rejected the request",
+            status=status,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+
+def _detect_interstitial(
+    detector: BlockPageDetector | None,
+    *,
+    status: int,
+    content_type: str,
+    body: bytes,
+) -> bool:
+    if detector is None:
+        return False
+    try:
+        result = detector(status, content_type, body[:MAX_DETECTOR_BYTES])
+    except Exception:
+        raise MonitorError(ErrorClass.INTERNAL, "fetch", "block detector failed") from None
+    if not isinstance(result, bool):
+        raise MonitorError(ErrorClass.INTERNAL, "fetch", "block detector returned invalid result")
+    return result
 
 
 def _read_final_url(response: object) -> str:
@@ -330,68 +510,122 @@ def _read_redirect_urls(response: object) -> tuple[str, ...]:
 
 
 def _validate_absolute_http_url(value: object, *, detail: str) -> str:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value or has_unsafe_url_characters(value):
         raise _policy_error(detail)
     try:
         parts = urlsplit(value)
+        _ = parts.port
     except ValueError:
         raise _policy_error(detail) from None
-    if parts.scheme.casefold() not in {"http", "https"} or not parts.hostname:
+    if (
+        parts.scheme.casefold() not in {"http", "https"}
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+    ):
         raise _policy_error(detail)
     return value
 
 
-def _copy_headers(response: object) -> dict[str, str]:
+def _copy_safe_headers(
+    response: object,
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
     try:
         raw_headers = response.headers
     except Exception:
         raise _policy_error("response headers are missing or invalid") from None
     if not isinstance(raw_headers, Mapping):
         raise _policy_error("response headers are missing or invalid")
-    copied: dict[str, str] = {}
+
+    mapped: dict[str, list[str]] = {}
     try:
         for key, value in raw_headers.items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise TypeError
-            copied[key] = value
+            normalized = key.casefold()
+            if normalized in _RETAINED_HEADERS:
+                mapped.setdefault(normalized, []).append(value)
     except Exception:
         raise _policy_error("response headers are missing or invalid") from None
-    return copied
 
-
-def _read_content_type(
-    response: object,
-    headers: Mapping[str, str],
-    *,
-    allow_missing: bool = False,
-) -> str:
-    raw_headers = response.headers
-    mapped_values = [value for key, value in headers.items() if key.casefold() == "content-type"]
-    listed_values: list[str] | None = None
+    values_by_name: dict[str, tuple[str, ...]] = {}
     get_list = getattr(raw_headers, "get_list", None)
-    if callable(get_list):
-        try:
-            values = get_list("content-type")
-            listed_values = list(values)
-        except Exception:
-            raise _policy_error("response Content-Type is missing or invalid") from None
-        if any(not isinstance(value, str) for value in listed_values):
-            raise _policy_error("response Content-Type is missing or invalid")
-    values = listed_values if listed_values is not None else mapped_values
+    for name in _RETAINED_HEADERS:
+        values = mapped.get(name, [])
+        if callable(get_list):
+            try:
+                listed = list(get_list(name))
+            except Exception:
+                raise _policy_error("response headers are missing or invalid") from None
+            if any(not isinstance(value, str) for value in listed):
+                raise _policy_error("response headers are missing or invalid")
+            if listed:
+                values = listed if len(listed) >= len(values) else values
+        values_by_name[name] = tuple(values)
+
+    retained = {name: values[0] for name, values in values_by_name.items() if len(values) == 1}
+    return retained, values_by_name
+
+
+def _normalize_content_type(values: tuple[str, ...]) -> str:
     if not values:
-        if allow_missing:
-            return ""
-        raise _policy_error("response Content-Type is missing or invalid")
-    if len(values) != 1 or len(mapped_values) != 1 or "," in values[0]:
+        return ""
+    if len(values) != 1 or "," in values[0]:
         raise _policy_error("response has multiple Content-Type values")
-    content_type = values[0].split(";", 1)[0].strip().casefold()
+    return values[0].split(";", 1)[0].strip().casefold()
+
+
+def _validate_content_type(content_type: str, *, allow_missing: bool) -> None:
     if not content_type:
+        if allow_missing:
+            return
         raise _policy_error("response Content-Type is missing or invalid")
-    if content_type not in {"text/html", "application/xhtml+xml", "application/json"} and not (
-        "/" in content_type and content_type.endswith("+json")
-    ):
+    match = _MEDIA_TYPE.fullmatch(content_type)
+    if match is None or "*" in content_type:
         raise _policy_error("response content type is not allowed")
-    return content_type
+    media_type, subtype = match.groups()
+    allowed = content_type in {"text/html", "application/xhtml+xml", "application/json"}
+    structured_json = (
+        subtype.endswith("+json") and len(subtype) > len("+json") and media_type != "*"
+    )
+    if not allowed and not structured_json:
+        raise _policy_error("response content type is not allowed")
+
+
+def _read_redirect_location(values: tuple[str, ...], *, base_url: str) -> str:
+    if len(values) != 1:
+        raise _policy_error("navigation redirect requires exactly one Location header")
+    raw = values[0]
+    if not raw or has_unsafe_url_characters(raw):
+        raise _policy_error("navigation redirect Location is invalid")
+    try:
+        resolved = urljoin(base_url, raw)
+    except ValueError:
+        raise _policy_error("navigation redirect Location is invalid") from None
+    return _validate_absolute_http_url(
+        resolved,
+        detail="navigation redirect Location is invalid",
+    )
+
+
+def _parse_retry_after(values: tuple[str, ...], *, clock: Clock) -> float | None:
+    if len(values) != 1:
+        return None
+    raw = values[0].strip()
+    if raw.isascii() and raw.isdigit() and len(raw) <= 10:
+        return float(int(raw))
+    try:
+        retry_at = parsedate_to_datetime(raw)
+        now = clock()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    if not isinstance(now, datetime):
+        return None
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return max(0.0, (retry_at.astimezone(UTC) - now.astimezone(UTC)).total_seconds())
 
 
 def _read_body(response: object) -> bytes:
@@ -409,16 +643,3 @@ def _read_body(response: object) -> bytes:
 
 def _policy_error(detail: str) -> MonitorError:
     return MonitorError(ErrorClass.POLICY, "fetch", detail)
-
-
-def _shared_fetch_semaphores() -> tuple[asyncio.Semaphore, asyncio.Semaphore]:
-    loop = asyncio.get_running_loop()
-    with _shared_semaphore_lock:
-        capacities = _shared_semaphores.get(loop)
-        if capacities is None:
-            capacities = (
-                asyncio.Semaphore(HTTP_CONCURRENCY),
-                asyncio.Semaphore(BROWSER_CONCURRENCY),
-            )
-            _shared_semaphores[loop] = capacities
-        return capacities
