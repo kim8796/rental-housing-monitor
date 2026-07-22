@@ -10,6 +10,8 @@ from pathlib import Path
 from time import sleep
 
 import pytest
+from curl_cffi.const import CurlOpt
+from curl_cffi.requests.utils import set_curl_options
 from scrapling.engines._browsers._controllers import DynamicSession
 from scrapling.engines._browsers._stealth import StealthySession
 from scrapling.engines.static import FetcherSession
@@ -88,8 +90,7 @@ def noop_fetcher(_url: str, **_kwargs: object) -> FakeResponse:
 
 def make_test_backend(**overrides: object) -> ScraplingBackend:
     arguments: dict[str, object] = {
-        "egress_proxy_url": None,
-        "test_mode": True,
+        "egress_proxy_url": "http://proxy.test:8080",
         "http_fetcher": noop_fetcher,
         "dynamic_fetcher": noop_fetcher,
         "stealthy_fetcher": noop_fetcher,
@@ -201,6 +202,7 @@ def test_navigation_redirect_resolves_one_relative_location() -> None:
         ),
         FakeHeaders({"Location": "https://user:password@example.com/next"}),
         FakeHeaders({"Location": "/next\r\nX-Injected: yes"}),
+        FakeHeaders({"Location": "/one, /two"}),
     ],
 )
 def test_navigation_redirect_requires_one_syntactically_safe_location(
@@ -455,16 +457,13 @@ def test_production_backend_requires_an_egress_proxy() -> None:
         ScraplingBackend(egress_proxy_url=None)
     with pytest.raises(ValueError, match="egress proxy"):
         ScraplingBackend(egress_proxy_url="   ")
-    with pytest.raises(ValueError, match="test fetchers"):
-        ScraplingBackend(egress_proxy_url=None, test_mode=True)
-    with pytest.raises(ValueError, match="test fetchers"):
-        ScraplingBackend(
-            egress_proxy_url=None,
+    with pytest.raises(TypeError, match="test_mode"):
+        ScraplingBackend(  # type: ignore[call-arg]
+            egress_proxy_url="http://proxy.test:8080",
             test_mode=True,
-            http_fetcher=noop_fetcher,
         )
 
-    make_test_backend()
+    ScraplingBackend(egress_proxy_url="http://proxy.test:8080")
 
 
 @pytest.mark.parametrize(
@@ -506,7 +505,7 @@ def test_http_fetch_uses_approved_url_and_bounded_fetcher_kwargs() -> None:
         (
             "https://example.com/source",
             {
-                "timeout": (10, 30),
+                "timeout": (10, 20),
                 "follow_redirects": False,
                 "max_redirects": 0,
                 "retries": 1,
@@ -529,8 +528,36 @@ def test_http_fetch_uses_approved_url_and_bounded_fetcher_kwargs() -> None:
             max_redirects=0,
             proxy="http://proxy.internal:8080",
         )
-    assert merged["timeout"] == (10, 30)
+    assert merged["timeout"] == (10, 20)
     assert merged["allow_redirects"] is False
+
+    class RecordingCurl:
+        _skip_cacert = False
+
+        def __init__(self) -> None:
+            self.options: dict[object, object] = {}
+
+        def setopt(self, option: object, value: object) -> None:
+            self.options[option] = value
+
+        def impersonate(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    curl = RecordingCurl()
+    set_curl_options(
+        curl,  # type: ignore[arg-type]
+        "GET",
+        "https://example.com/source",
+        params_list=[None, None],
+        headers_list=[None, None],
+        cookies_list=[None, None],
+        proxies_list=[None, None],
+        verify_list=[None, None],
+        timeout=merged["timeout"],
+        allow_redirects=False,
+    )
+    assert curl.options[CurlOpt.CONNECTTIMEOUT_MS] == 10_000
+    assert curl.options[CurlOpt.TIMEOUT_MS] == 30_000
 
 
 @pytest.mark.parametrize(

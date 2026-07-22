@@ -10,7 +10,6 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import cast
 from urllib.parse import urljoin, urlsplit
 
 from scrapling.core.utils import reset_logger, set_logger
@@ -46,8 +45,6 @@ _DYNAMIC_WEBRTC_FLAGS = [
     "--webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--force-webrtc-ip-handling-policy",
 ]
-_UNSET = object()
-
 BlockingFetcher = Callable[..., object]
 BlockPageDetector = Callable[[int, str, bytes], bool]
 Clock = Callable[[], datetime]
@@ -141,10 +138,9 @@ class ScraplingBackend:
         self,
         *,
         egress_proxy_url: str | None,
-        test_mode: bool = False,
-        http_fetcher: BlockingFetcher | object = _UNSET,
-        dynamic_fetcher: BlockingFetcher | object = _UNSET,
-        stealthy_fetcher: BlockingFetcher | object = _UNSET,
+        http_fetcher: BlockingFetcher = Fetcher.get,
+        dynamic_fetcher: BlockingFetcher = DynamicFetcher.fetch,
+        stealthy_fetcher: BlockingFetcher = StealthyFetcher.fetch,
         http_gate: threading.BoundedSemaphore | None = None,
         browser_gate: threading.BoundedSemaphore | None = None,
         http_timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
@@ -153,33 +149,13 @@ class ScraplingBackend:
         clock: Clock = lambda: datetime.now(UTC),
     ) -> None:
         proxy = _validate_proxy_url(egress_proxy_url)
-        injected_fetchers = (
-            http_fetcher is not _UNSET and not _is_scrapling_default(http_fetcher, Fetcher.get),
-            dynamic_fetcher is not _UNSET
-            and not _is_scrapling_default(dynamic_fetcher, DynamicFetcher.fetch),
-            stealthy_fetcher is not _UNSET
-            and not _is_scrapling_default(stealthy_fetcher, StealthyFetcher.fetch),
-        )
         if not proxy:
-            if not test_mode:
-                raise ValueError("an egress proxy is required outside test mode")
-            if not all(injected_fetchers):
-                raise ValueError(
-                    "unproxied test mode requires three explicitly injected test fetchers"
-                )
+            raise ValueError("an egress proxy is required for every backend")
 
         self._egress_proxy_url = proxy
-        self._http_fetcher = cast(
-            BlockingFetcher, Fetcher.get if http_fetcher is _UNSET else http_fetcher
-        )
-        self._dynamic_fetcher = cast(
-            BlockingFetcher,
-            DynamicFetcher.fetch if dynamic_fetcher is _UNSET else dynamic_fetcher,
-        )
-        self._stealthy_fetcher = cast(
-            BlockingFetcher,
-            StealthyFetcher.fetch if stealthy_fetcher is _UNSET else stealthy_fetcher,
-        )
+        self._http_fetcher = http_fetcher
+        self._dynamic_fetcher = dynamic_fetcher
+        self._stealthy_fetcher = stealthy_fetcher
         self._http_gate = http_gate or _HTTP_GATE
         self._browser_gate = browser_gate or _BROWSER_GATE
         self._http_timeout_seconds = _bounded_timeout(
@@ -206,7 +182,7 @@ class ScraplingBackend:
             kwargs={
                 # curl_cffi accepts (connect timeout, read timeout); Scrapling
                 # 0.4.11 forwards this value unchanged to the curl session.
-                "timeout": (10, 30),
+                "timeout": (10, 20),
                 "follow_redirects": False,
                 "max_redirects": 0,
                 # Scrapling 0.4.11 counts total attempts, so one means no retry.
@@ -367,12 +343,6 @@ def _invoke_quietly(
         return fetcher(url, **kwargs)
     finally:
         reset_logger(token)
-
-
-def _is_scrapling_default(candidate: object, default: BlockingFetcher) -> bool:
-    return getattr(candidate, "__self__", None) is getattr(default, "__self__", None) and getattr(
-        candidate, "__func__", None
-    ) is getattr(default, "__func__", None)
 
 
 def _validate_proxy_url(value: str | None) -> str | None:
@@ -596,7 +566,7 @@ def _read_redirect_location(values: tuple[str, ...], *, base_url: str) -> str:
     if len(values) != 1:
         raise _policy_error("navigation redirect requires exactly one Location header")
     raw = values[0]
-    if not raw or has_unsafe_url_characters(raw):
+    if not raw or "," in raw or has_unsafe_url_characters(raw):
         raise _policy_error("navigation redirect Location is invalid")
     try:
         resolved = urljoin(base_url, raw)
