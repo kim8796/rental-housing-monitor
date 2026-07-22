@@ -749,3 +749,76 @@ def test_cleanup_failure_never_replaces_original_cancellation(
 
     assert caught.value is cancellation
     assert (finish_calls, release_calls) == (1, 1)
+
+
+@pytest.mark.parametrize("cleanup_failure", ["finish", "release"])
+def test_task_cancellation_delivered_while_shield_waits_wins_over_cleanup_failure(
+    connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: str,
+) -> None:
+    batch = ObservationBatch(
+        monitor_id="placeholder", items=(), observed_at=NOW, source_hash="hash"
+    )
+    runner, monitor_id, _, runtime, adapter = configured_runner(connection, batch)
+    adapter.batch = ObservationBatch(
+        monitor_id=monitor_id, items=(), observed_at=NOW, source_hash="hash"
+    )
+    finish_calls = 0
+    release_calls = 0
+    original_finish = runtime.finish_run
+    original_release = runtime.release_lease
+    original_complete = runner._complete_started_run
+    unhandled_contexts: list[dict[str, object]] = []
+
+    def finish(*args: object, **kwargs: object) -> None:
+        nonlocal finish_calls
+        finish_calls += 1
+        if cleanup_failure == "finish":
+            raise RuntimeError("injected timed finish failure")
+        original_finish(*args, **kwargs)
+
+    def release(*args: object, **kwargs: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        if cleanup_failure == "release":
+            raise RuntimeError("injected timed release failure")
+        original_release(*args, **kwargs)
+
+    async def scenario() -> None:
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        async def paused_cleanup(*args: object, **kwargs: object) -> object:
+            cleanup_started.set()
+            await allow_cleanup.wait()
+            return await original_complete(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(runner, "_complete_started_run", paused_cleanup)
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(
+            lambda _loop, context: unhandled_contexts.append(dict(context))
+        )
+        task = asyncio.create_task(runner.run(monitor_id))
+        try:
+            await cleanup_started.wait()
+            assert not task.done()
+            task.cancel("cancelled while cleanup was shielded")
+            await asyncio.sleep(0)
+            assert not task.done()
+            allow_cleanup.set()
+            await task
+        finally:
+            await asyncio.sleep(0)
+            loop.set_exception_handler(previous_handler)
+
+    monkeypatch.setattr(runtime, "finish_run", finish)
+    monkeypatch.setattr(runtime, "release_lease", release)
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(scenario())
+
+    assert caught.value.args == ("cancelled while cleanup was shielded",)
+    assert (finish_calls, release_calls) == (1, 1)
+    assert unhandled_contexts == []

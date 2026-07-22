@@ -256,22 +256,23 @@ async def _shield_cleanup(
 ) -> RunResult:
     cleanup_task = asyncio.create_task(cleanup)
     interrupted: asyncio.CancelledError | None = None
+    cleanup_error: BaseException | None = None
     while not cleanup_task.done():
         try:
-            await asyncio.shield(cleanup_task)
+            # Waiting does not forward caller cancellation into the retained task.
+            await asyncio.wait({cleanup_task})
         except asyncio.CancelledError as caught:
             if interrupted is None:
                 interrupted = caught
-    if cleanup_task.cancelled():
-        if interrupted is not None:
-            raise interrupted
-        raise asyncio.CancelledError
-    exception = cleanup_task.exception()
-    if exception is not None:
-        raise exception
+    try:
+        result = cleanup_task.result()
+    except BaseException as caught:
+        cleanup_error = caught
     if interrupted is not None:
         raise interrupted
-    return cleanup_task.result()
+    if cleanup_error is not None:
+        raise cleanup_error
+    return result
 
 
 def _aware_fallback(value: datetime) -> datetime:
