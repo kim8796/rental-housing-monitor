@@ -667,3 +667,85 @@ def test_release_failure_does_not_overwrite_success_and_lease_expires_for_recove
     assert runtime.claim_due(worker_id="worker-2", now=NOW + timedelta(minutes=5)) == [
         monitor_id
     ]
+
+
+def test_cancellation_propagates_after_one_failed_finish_and_one_release(
+    connection: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cancellation = asyncio.CancelledError("shutdown")
+    runner, monitor_id, _, runtime, _ = configured_runner(connection, cancellation)
+    finish_calls = 0
+    release_calls = 0
+    original_finish = runtime.finish_run
+    original_release = runtime.release_lease
+
+    def record_finish(*args: object, **kwargs: object) -> None:
+        nonlocal finish_calls
+        finish_calls += 1
+        original_finish(*args, **kwargs)
+
+    def record_release(*args: object, **kwargs: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        original_release(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "finish_run", record_finish)
+    monkeypatch.setattr(runtime, "release_lease", record_release)
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(runner.run(monitor_id))
+
+    assert caught.value is cancellation
+    assert (finish_calls, release_calls) == (1, 1)
+    run = connection.execute(
+        "SELECT status, stage, error_class, error_detail, finished_at FROM runs"
+    ).fetchone()
+    assert tuple(run)[:4] == ("failed", "cancelled", "internal", "internal_error")
+    assert run["finished_at"] is not None
+    monitor = connection.execute(
+        "SELECT status, lease_owner, lease_expires_at, next_run_at FROM monitors WHERE id = ?",
+        (monitor_id,),
+    ).fetchone()
+    assert tuple(monitor) == (
+        "active",
+        None,
+        None,
+        "2026-07-22T03:05:00+00:00",
+    )
+
+
+@pytest.mark.parametrize("cleanup_failure", ["finish", "release"])
+def test_cleanup_failure_never_replaces_original_cancellation(
+    connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: str,
+) -> None:
+    cancellation = asyncio.CancelledError("original shutdown")
+    runner, monitor_id, _, runtime, _ = configured_runner(connection, cancellation)
+    finish_calls = 0
+    release_calls = 0
+    original_finish = runtime.finish_run
+    original_release = runtime.release_lease
+
+    def finish(*args: object, **kwargs: object) -> None:
+        nonlocal finish_calls
+        finish_calls += 1
+        if cleanup_failure == "finish":
+            raise RuntimeError("injected finish cleanup failure")
+        original_finish(*args, **kwargs)
+
+    def release(*args: object, **kwargs: object) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        if cleanup_failure == "release":
+            raise RuntimeError("injected release cleanup failure")
+        original_release(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "finish_run", finish)
+    monkeypatch.setattr(runtime, "release_lease", release)
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(runner.run(monitor_id))
+
+    assert caught.value is cancellation
+    assert (finish_calls, release_calls) == (1, 1)

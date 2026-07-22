@@ -659,6 +659,12 @@ CREATE INDEX runs_monitor_started_idx ON runs(monitor_id, started_at);
 
 Insert migration version 1 only after the transaction succeeds.
 
+Migration lifecycle guarantee: migration v1 remains intentionally mutable only until the first
+shadow deployment. This branch has never been deployed, the approved workflow/GCP plans do not yet
+provision a persistent personal-monitor database, and current pytest databases are disposable.
+The first shadow deployment freezes v1 permanently; every later schema change must be an ordered
+migration 2 or higher. Do not invent an upgrade from an unreleased intermediate commit.
+
 - [ ] **Step 4: Implement registry operations**
 
 `RegistryRepository` exposes these exact methods:
@@ -980,6 +986,12 @@ regular/retry schedule and use an aware five-minute fallback if scheduling raise
 `finally`. A finish/transition/release exception may propagate after required attempts, but cleanup
 must never reinterpret an already-successful outcome as failed. If SQLite rejects release, the
 existing monitor lease remains recoverable when its expiry passes.
+
+Seed a cancellation-safe failed outcome before awaiting adapter execution and enter cleanup from a
+true outer `finally` for every `BaseException` after `start_run()`. `asyncio.CancelledError` is
+operational shutdown: keep the monitor active, finish once with closed `internal_error`, use the
+aware five-minute fallback, shield cleanup so the first cancellation cannot skip it, then re-raise
+the original cancellation even when finish or release also raises.
 
 Map `MonitorError` to state transitions: authentication → `paused_auth`; structure/validation → `needs_review`; policy → `needs_review`; transient network → keep active and schedule retry; internal → `needs_review`. Persist only the closed diagnostic code derived from `ErrorClass` (`network_error`, `authentication_failed`, `structure_changed`, `validation_failed`, `policy_rejected`, `delivery_failed`, or `internal_error`); never persist `MonitorError.safe_detail`. Transient-network failures release the lease with `next_run_at=clock.now()+timedelta(minutes=5)`; every other failed run uses the next regular cron time after its status transition. A failed run must finish its run record and release the lease. No AI type appears in the runner constructor or module imports.
 

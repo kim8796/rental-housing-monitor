@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -44,6 +46,7 @@ class _RunOutcome:
     error_class: ErrorClass | None = None
     error_detail: str | None = None
     transition_to: MonitorStatus | None = None
+    use_fallback_schedule: bool = False
 
 
 class MonitorRunner:
@@ -68,18 +71,41 @@ class MonitorRunner:
         target = self.registry.get_primary_target(active.owner_id)
         started_at = self.clock.now()
         run_id = self.runtime.start_run(monitor_id, active.version_id, started_at=started_at)
+        outcome = _cancellation_outcome()
+        pending_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        completed_result = outcome.result
         try:
-            result = await self._run_started(monitor_id, spec, target.id)
-        except Exception as caught:
-            error = (
-                caught
-                if isinstance(caught, MonitorError)
-                else MonitorError(ErrorClass.INTERNAL, "internal", "internal failure")
-            )
-            outcome = _failure_outcome(error)
-        else:
-            outcome = _RunOutcome(result=result, stage="complete")
-        return self._complete_started_run(monitor_id, spec, run_id, started_at, outcome)
+            try:
+                result = await self._run_started(monitor_id, spec, target.id)
+            except asyncio.CancelledError as caught:
+                pending_error = caught
+            except Exception as caught:
+                error = (
+                    caught
+                    if isinstance(caught, MonitorError)
+                    else MonitorError(ErrorClass.INTERNAL, "internal", "internal failure")
+                )
+                outcome = _failure_outcome(error)
+            except BaseException as caught:
+                pending_error = caught
+            else:
+                outcome = _RunOutcome(result=result, stage="complete")
+        finally:
+            try:
+                completed_result = await _shield_cleanup(
+                    self._complete_started_run(
+                        monitor_id, spec, run_id, started_at, outcome
+                    )
+                )
+            except BaseException as caught:
+                cleanup_error = caught
+
+        if pending_error is not None:
+            raise pending_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        return completed_result
 
     async def _run_started(self, monitor_id: str, spec: MonitorSpec, target_id: str) -> RunResult:
         batch = await self.adapters.resolve(spec.source_adapter, spec.adapter_ref).fetch(
@@ -144,7 +170,7 @@ class MonitorRunner:
             warning_count=len(batch.warnings),
         )
 
-    def _complete_started_run(
+    async def _complete_started_run(
         self,
         monitor_id: str,
         spec: MonitorSpec,
@@ -165,7 +191,9 @@ class MonitorRunner:
 
             try:
                 schedule_base = self.clock.now()
-                if outcome.error_class is ErrorClass.TRANSIENT_NETWORK:
+                if outcome.use_fallback_schedule:
+                    scheduled_at = _aware_fallback(schedule_base)
+                elif outcome.error_class is ErrorClass.TRANSIENT_NETWORK:
                     scheduled_at = schedule_base + timedelta(minutes=5)
                 else:
                     scheduled_at = next_run_at(spec, monitor_id, schedule_base)
@@ -211,6 +239,39 @@ def _failure_outcome(error: MonitorError) -> _RunOutcome:
         error_detail=_DIAGNOSTIC_CODES[error.error_class],
         transition_to=transition_to,
     )
+
+
+def _cancellation_outcome() -> _RunOutcome:
+    return _RunOutcome(
+        result=RunResult(status="failed", matched_count=0, warning_count=0),
+        stage="cancelled",
+        error_class=ErrorClass.INTERNAL,
+        error_detail=_DIAGNOSTIC_CODES[ErrorClass.INTERNAL],
+        use_fallback_schedule=True,
+    )
+
+
+async def _shield_cleanup(
+    cleanup: Coroutine[Any, Any, RunResult],
+) -> RunResult:
+    cleanup_task = asyncio.create_task(cleanup)
+    interrupted: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as caught:
+            if interrupted is None:
+                interrupted = caught
+    if cleanup_task.cancelled():
+        if interrupted is not None:
+            raise interrupted
+        raise asyncio.CancelledError
+    exception = cleanup_task.exception()
+    if exception is not None:
+        raise exception
+    if interrupted is not None:
+        raise interrupted
+    return cleanup_task.result()
 
 
 def _aware_fallback(value: datetime) -> datetime:
