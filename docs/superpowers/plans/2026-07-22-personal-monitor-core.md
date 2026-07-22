@@ -794,7 +794,9 @@ def next_run_at(spec: MonitorSpec, monitor_id: str, after: datetime) -> datetime
     zone = ZoneInfo(spec.timezone)
     local_after = after.astimezone(zone)
     scheduled = croniter(spec.schedule, local_after).get_next(datetime)
-    is_rental_exact = spec.name == "서울·경기 임대주택" and spec.schedule == "13 12 * * *"
+    is_rental_exact = (
+        monitor_id == "rental-housing-seoul-gyeonggi" and spec.schedule == "13 12 * * *"
+    )
     jitter = 0 if is_rental_exact else stable_jitter_seconds(monitor_id)
     return (scheduled + timedelta(seconds=jitter)).astimezone(UTC)
 ```
