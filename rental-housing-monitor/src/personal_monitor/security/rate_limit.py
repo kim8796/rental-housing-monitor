@@ -21,20 +21,36 @@ class HostRateLimiter:
         self._minimum_interval = float(minimum_interval_seconds)
         self._locks: dict[str, asyncio.Lock] = {}
         self._last_started_at: dict[str, float] = {}
+        self._not_before: dict[str, float] = {}
 
     async def acquire(self, host: str, retry_after_seconds: float | None = None) -> None:
         normalized_host = _normalize_host(host)
         retry_after = _normalize_retry_after(retry_after_seconds)
-        interval = max(self._minimum_interval, retry_after)
+        if retry_after > 0:
+            retry_deadline = self._clock() + retry_after
+            self._not_before[normalized_host] = max(
+                self._not_before.get(normalized_host, retry_deadline),
+                retry_deadline,
+            )
         lock = self._locks.setdefault(normalized_host, asyncio.Lock())
         async with lock:
-            now = self._clock()
-            previous = self._last_started_at.get(normalized_host)
-            if previous is not None:
-                wait_seconds = previous + interval - now
+            while True:
+                now = self._clock()
+                previous = self._last_started_at.get(normalized_host)
+                minimum_start = previous + self._minimum_interval if previous is not None else now
+                allowed_start = max(
+                    minimum_start,
+                    self._not_before.get(normalized_host, now),
+                )
+                wait_seconds = allowed_start - now
                 if wait_seconds > 0:
                     await self._sleeper(wait_seconds)
-            self._last_started_at[normalized_host] = self._clock()
+                    continue
+                break
+            started_at = self._clock()
+            self._last_started_at[normalized_host] = started_at
+            if self._not_before.get(normalized_host, started_at) <= started_at:
+                self._not_before.pop(normalized_host, None)
 
 
 def _normalize_host(host: str) -> str:

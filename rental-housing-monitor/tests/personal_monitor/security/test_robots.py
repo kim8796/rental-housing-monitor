@@ -76,6 +76,23 @@ def test_robots_policy_cannot_be_applied_to_a_different_origin() -> None:
         policy.check("personal-monitor", "https://other.example/path")
 
 
+@pytest.mark.parametrize(
+    "robots_url",
+    [
+        "https://example.com:0/robots.txt",
+        "https://example.com:/robots.txt",
+        "https://example.com:not-a-port/robots.txt",
+    ],
+)
+def test_robots_origin_rejects_zero_empty_or_malformed_port(robots_url: str) -> None:
+    with pytest.raises(PolicyError, match="robots"):
+        RobotsPolicy.from_text(
+            "User-agent: *\nAllow: /\n",
+            robots_url,
+            checked_at=CHECKED_AT,
+        )
+
+
 def test_robots_requires_timezone_aware_checked_at() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         RobotsPolicy.from_text(

@@ -93,11 +93,15 @@ def _origin(url: str) -> tuple[str, str, int]:
         parts = urlsplit(url)
         scheme = parts.scheme.casefold()
         hostname = (parts.hostname or "").rstrip(".").casefold()
-        port = parts.port or (443 if scheme == "https" else 80)
+        if parts.netloc.rsplit("@", 1)[-1].endswith(":"):
+            raise ValueError("empty port")
+        port = parts.port if parts.port is not None else (443 if scheme == "https" else 80)
     except ValueError:
         raise PolicyError("robots URL is malformed", stage="robots") from None
     if scheme not in {"http", "https"} or not hostname:
         raise PolicyError("robots URL must be absolute http(s)", stage="robots")
+    if port <= 0:
+        raise PolicyError("robots URL port is invalid", stage="robots")
     return scheme, hostname, port
 
 

@@ -111,3 +111,50 @@ def test_concurrent_same_host_acquisitions_are_serialized() -> None:
         return time.sleeps
 
     assert asyncio.run(scenario()) == [10.0, 10.0]
+
+
+def test_retry_after_extends_an_already_sleeping_host_waiter() -> None:
+    class BlockingTime:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.sleeps: list[float] = []
+            self.releases: asyncio.Queue[None] = asyncio.Queue()
+
+        def monotonic(self) -> float:
+            return self.now
+
+        async def sleep(self, seconds: float) -> None:
+            self.sleeps.append(seconds)
+            await self.releases.get()
+            self.now += seconds
+
+    async def scenario() -> tuple[list[float], float]:
+        time = BlockingTime()
+        limiter = HostRateLimiter(clock=time.monotonic, sleeper=time.sleep)
+        await limiter.acquire("example.com")
+
+        sleeping_waiter = asyncio.create_task(limiter.acquire("example.com"))
+        await asyncio.sleep(0)
+        assert time.sleeps == [10.0]
+
+        retry_after_waiter = asyncio.create_task(
+            limiter.acquire("example.com", retry_after_seconds=30)
+        )
+        await asyncio.sleep(0)
+
+        time.releases.put_nowait(None)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert time.sleeps == [10.0, 20.0]
+
+        time.releases.put_nowait(None)
+        await sleeping_waiter
+        await asyncio.sleep(0)
+        assert time.now == 30.0
+        assert time.sleeps == [10.0, 20.0, 10.0]
+
+        time.releases.put_nowait(None)
+        await retry_after_waiter
+        return time.sleeps, time.now
+
+    assert asyncio.run(scenario()) == ([10.0, 20.0, 10.0], 40.0)

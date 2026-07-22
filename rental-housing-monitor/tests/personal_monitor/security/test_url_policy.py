@@ -6,7 +6,7 @@ from collections.abc import Sequence
 import pytest
 
 from personal_monitor.engine.errors import ErrorClass
-from personal_monitor.security.url_policy import PolicyError, UrlPolicy
+from personal_monitor.security.url_policy import PolicyError, UrlPolicy, is_public_address
 
 
 class FakeResolver:
@@ -44,8 +44,22 @@ class FakeResolver:
         "https://user@example.com/",
         "https://:pass@example.com/",
         "https://example.com:8443/",
+        "https://example.com:0/",
+        "https://example.com:/",
         "https://example.com:not-a-port/",
         "https://example.com:99999/",
+        "https://example.com\x00.evil/",
+        "https://example.com\n.evil/",
+        "https://example.com\\@127.0.0.1/",
+        "https://under_score.example/",
+        "https://-leading.example/",
+        "https://trailing-.example/",
+        "https://double..dot.example/",
+        "https://example.com../",
+        "https://2130706433/",
+        "https://0177.0.0.1/",
+        "https://0x7f000001/",
+        "https://127.1/",
     ],
 )
 def test_url_policy_rejects_unsafe_targets(url: str) -> None:
@@ -65,6 +79,16 @@ def test_url_policy_normalizes_target_and_pins_all_dns_answers() -> None:
     assert target.port == 443
     assert target.addresses == frozenset({"93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"})
     assert resolver.calls == [("example.com", 443)]
+
+
+def test_url_policy_canonicalizes_an_idna_hostname() -> None:
+    resolver = FakeResolver()
+
+    target = asyncio.run(UrlPolicy(resolver).validate("https://서울.kr/공고"))
+
+    assert target.hostname == "xn--2i4bq6h.kr"
+    assert target.normalized_url == "https://xn--2i4bq6h.kr/공고"
+    assert resolver.calls == [("xn--2i4bq6h.kr", 443)]
 
 
 @pytest.mark.parametrize(
@@ -107,6 +131,21 @@ def test_url_policy_validates_public_ip_literal_without_trusting_dns() -> None:
     assert resolver.calls == []
 
 
+@pytest.mark.parametrize(
+    "address",
+    [
+        "100.64.0.1",  # shared carrier-grade NAT space
+        "::ffff:100.64.0.1",  # mapped non-global IPv4
+        "fec0::1",  # deprecated IPv6 site-local space
+        "192.0.2.1",  # documentation-only IPv4
+        "2001:db8::1",  # documentation-only IPv6
+        "198.18.0.1",  # benchmark network
+    ],
+)
+def test_non_global_addresses_are_never_public_targets(address: str) -> None:
+    assert is_public_address(address) is False
+
+
 def test_redirect_number_five_is_allowed_and_number_six_is_rejected() -> None:
     policy = UrlPolicy(FakeResolver())
 
@@ -145,6 +184,14 @@ def test_peer_address_is_normalized_before_matching_pinned_dns_answer() -> None:
     )
 
     UrlPolicy.validate_peer(target, "[2606:2800:0220:0001:0248:1893:25c8:1946]")
+
+
+def test_public_ipv4_mapped_peer_matches_its_pinned_ipv4_answer() -> None:
+    target = asyncio.run(
+        UrlPolicy(FakeResolver(("93.184.216.34",))).validate("https://example.com")
+    )
+
+    UrlPolicy.validate_peer(target, "::ffff:93.184.216.34")
 
 
 @pytest.mark.parametrize("peer", ["", "not-an-ip", "[::1]", "[broken"])
