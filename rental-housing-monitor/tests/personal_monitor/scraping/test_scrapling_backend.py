@@ -123,6 +123,16 @@ def test_response_is_bounded_normalized_and_immutable() -> None:
     assert "headers" not in representation
 
 
+def test_trustworthy_peer_metadata_is_preserved_for_policy_revalidation() -> None:
+    response = FakeResponse()
+    response.primary_ip = "93.184.216.34"
+
+    document = normalize_response(response, strategy=FetchStrategy.HTTP)
+
+    assert document.peer_ip == "93.184.216.34"
+    assert "93.184.216.34" not in repr(document)
+
+
 @pytest.mark.parametrize(
     ("raw_content_type", "normalized"),
     [

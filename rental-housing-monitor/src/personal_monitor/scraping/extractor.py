@@ -4,14 +4,14 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import regex
 from bs4 import BeautifulSoup, Tag
-from scrapling import Selector
 
 from personal_monitor.domain.observation import ObservedItem, Scalar, stable_item_id
 from personal_monitor.domain.spec import ExtractSpec, FieldSpec
-from personal_monitor.engine.errors import ErrorClass, MonitorError
+from personal_monitor.engine.errors import ErrorClass, FailureCode, MonitorError
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.normalizers import normalize_value
 
@@ -24,6 +24,9 @@ _MAX_INLINE_STYLE_LENGTH = 4096
 _MAX_JSON_DEPTH = 100
 _MAX_JSON_NODES = 100_000
 _XPATH_WORD_OPERATORS = frozenset({"and", "div", "mod", "or"})
+
+if TYPE_CHECKING:
+    from scrapling import Selector
 
 
 class DeclarativeExtractor:
@@ -43,6 +46,8 @@ class DeclarativeExtractor:
         return tuple(_make_item(fields) for fields in rows)
 
     def _extract_html(self, document: SourceDocument, spec: ExtractSpec) -> list[dict[str, Scalar]]:
+        from scrapling import Selector
+
         try:
             page = Selector(document.body, url=document.final_url, adaptive=True)
             roots = _select(page, spec.item_scope, scoped=False)
@@ -102,7 +107,7 @@ class DeclarativeExtractor:
                 value = _traverse_json(root, field.selector, required=field.required)
                 if value is _MISSING or value is None:
                     if field.required:
-                        raise _structure_error("required field is missing")
+                        raise _required_content_absent()
                     continue
                 if isinstance(value, bool):
                     raw_value = "true" if value else "false"
@@ -116,6 +121,8 @@ class DeclarativeExtractor:
 
 
 def _select(node: Selector, selector: str, *, scoped: bool) -> Sequence[Selector]:
+    from scrapling import Selector
+
     if selector.startswith(("/", "(", "./")):
         if scoped:
             detached = Selector(str(node.html_content), adaptive=False)
@@ -323,7 +330,7 @@ def _traverse_json(value: object, path: str, *, required: bool) -> object:
         if isinstance(current, Mapping):
             if segment not in current:
                 if required:
-                    raise _structure_error("required field is missing")
+                    raise _required_content_absent()
                 return _MISSING
             current = current[segment]
         elif isinstance(current, list):
@@ -332,12 +339,12 @@ def _traverse_json(value: object, path: str, *, required: bool) -> object:
             index = int(segment)
             if index >= len(current):
                 if required:
-                    raise _structure_error("required field is missing")
+                    raise _required_content_absent()
                 return _MISSING
             current = current[index]
         else:
             if required:
-                raise _structure_error("required field is missing")
+                raise _required_content_absent()
             return _MISSING
     return current
 
@@ -353,8 +360,15 @@ def _json_segments(path: str) -> list[str]:
 
 def _missing(field: FieldSpec) -> None:
     if field.required:
-        raise _structure_error("required field is missing")
+        raise _required_content_absent()
     return None
+
+
+def _required_content_absent() -> MonitorError:
+    return _structure_error(
+        "required field is missing",
+        code=FailureCode.REQUIRED_CONTENT_ABSENT,
+    )
 
 
 def _make_item(fields: Mapping[str, Scalar]) -> ObservedItem:
@@ -364,8 +378,12 @@ def _make_item(fields: Mapping[str, Scalar]) -> ObservedItem:
         raise _validation_error("item identity could not be generated") from None
 
 
-def _structure_error(detail: str) -> MonitorError:
-    return MonitorError(ErrorClass.STRUCTURE, "extract", detail)
+def _structure_error(
+    detail: str,
+    *,
+    code: FailureCode | None = None,
+) -> MonitorError:
+    return MonitorError(ErrorClass.STRUCTURE, "extract", detail, code=code)
 
 
 def _validation_error(detail: str) -> MonitorError:

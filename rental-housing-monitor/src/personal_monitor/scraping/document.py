@@ -17,6 +17,7 @@ class SourceDocument:
     strategy: FetchStrategy
     redirect_urls: tuple[str, ...] = field(default=(), repr=False)
     redirect_location: str | None = field(default=None, repr=False)
+    peer_ip: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))

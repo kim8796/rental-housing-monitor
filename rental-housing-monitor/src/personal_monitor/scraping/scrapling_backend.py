@@ -16,7 +16,7 @@ from scrapling.core.utils import reset_logger, set_logger
 from scrapling.fetchers import DynamicFetcher, Fetcher, StealthyFetcher
 
 from personal_monitor.domain.spec import FetchStrategy
-from personal_monitor.engine.errors import ErrorClass, MonitorError
+from personal_monitor.engine.errors import ErrorClass, FetchError, MonitorError
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.security.url_policy import (
     MAX_REDIRECTS,
@@ -49,6 +49,10 @@ BlockingFetcher = Callable[..., object]
 BlockPageDetector = Callable[[int, str, bytes], bool]
 Clock = Callable[[], datetime]
 
+_DEFAULT_HTTP_FETCHER = Fetcher.get
+_DEFAULT_DYNAMIC_FETCHER = DynamicFetcher.fetch
+_DEFAULT_STEALTHY_FETCHER = StealthyFetcher.fetch
+
 _HTTP_GATE = threading.BoundedSemaphore(HTTP_CONCURRENCY)
 _BROWSER_GATE = threading.BoundedSemaphore(BROWSER_CONCURRENCY)
 
@@ -57,24 +61,6 @@ _QUIET_LOGGER.handlers.clear()
 _QUIET_LOGGER.addHandler(logging.NullHandler())
 _QUIET_LOGGER.propagate = False
 _QUIET_LOGGER.setLevel(logging.CRITICAL + 1)
-
-
-class FetchError(MonitorError):
-    """A safe structured fetch failure without response or credential material."""
-
-    def __init__(
-        self,
-        error_class: ErrorClass,
-        safe_detail: str,
-        *,
-        status: int,
-        retry_after_seconds: float | None = None,
-        detected_interstitial: bool = False,
-    ) -> None:
-        super().__init__(error_class, "fetch", safe_detail)
-        self.status = status
-        self.retry_after_seconds = retry_after_seconds
-        self.detected_interstitial = detected_interstitial
 
 
 def normalize_response(
@@ -87,6 +73,7 @@ def normalize_response(
     status = _read_status(response)
     final_url = _read_final_url(response)
     redirect_urls = _read_redirect_urls(response)
+    peer_ip = _read_peer_ip(response)
     headers, header_values = _copy_safe_headers(response)
     body = _read_body(response)
     content_type = _normalize_content_type(header_values.get("content-type", ()))
@@ -121,6 +108,7 @@ def normalize_response(
         strategy=strategy,
         redirect_urls=redirect_urls,
         redirect_location=redirect_location,
+        peer_ip=peer_ip,
     )
 
 
@@ -138,9 +126,9 @@ class ScraplingBackend:
         self,
         *,
         egress_proxy_url: str | None,
-        http_fetcher: BlockingFetcher = Fetcher.get,
-        dynamic_fetcher: BlockingFetcher = DynamicFetcher.fetch,
-        stealthy_fetcher: BlockingFetcher = StealthyFetcher.fetch,
+        http_fetcher: BlockingFetcher = _DEFAULT_HTTP_FETCHER,
+        dynamic_fetcher: BlockingFetcher = _DEFAULT_DYNAMIC_FETCHER,
+        stealthy_fetcher: BlockingFetcher = _DEFAULT_STEALTHY_FETCHER,
         http_gate: threading.BoundedSemaphore | None = None,
         browser_gate: threading.BoundedSemaphore | None = None,
         http_timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
@@ -171,6 +159,18 @@ class ScraplingBackend:
         self._block_page_detector = block_page_detector
         self._clock = clock
         self._background_calls: set[asyncio.Task[object]] = set()
+        self._policy_sealed = (
+            http_fetcher is _DEFAULT_HTTP_FETCHER
+            and dynamic_fetcher is _DEFAULT_DYNAMIC_FETCHER
+            and stealthy_fetcher is _DEFAULT_STEALTHY_FETCHER
+            and http_gate is None
+            and browser_gate is None
+        )
+
+    @property
+    def is_policy_sealed(self) -> bool:
+        """Whether production fetchers and process-wide concurrency gates are intact."""
+        return self._policy_sealed
 
     async def fetch_http(self, target: ResolvedTarget) -> SourceDocument:
         return await self._fetch(
@@ -477,6 +477,18 @@ def _read_redirect_urls(response: object) -> tuple[str, ...]:
             _validate_absolute_http_url(value, detail="response redirect history is invalid")
         )
     return tuple(urls)
+
+
+def _read_peer_ip(response: object) -> str | None:
+    try:
+        value = getattr(response, "primary_ip", None)
+    except Exception:
+        raise _policy_error("response peer metadata is invalid") from None
+    if value in {None, ""}:
+        return None
+    if not isinstance(value, str):
+        raise _policy_error("response peer metadata is invalid")
+    return value
 
 
 def _validate_absolute_http_url(value: object, *, detail: str) -> str:

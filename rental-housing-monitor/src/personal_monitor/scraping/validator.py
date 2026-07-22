@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from personal_monitor.domain.observation import ObservedItem, Scalar, stable_item_id
 from personal_monitor.domain.spec import ExtractSpec, FieldType, ValidatorSpec
-from personal_monitor.engine.errors import ErrorClass, MonitorError
+from personal_monitor.engine.errors import ErrorClass, FailureCode, MonitorError
 from personal_monitor.scraping.normalizers import normalize_url
 
 
@@ -26,6 +26,7 @@ class ObservationValidator:
                 ErrorClass.STRUCTURE,
                 "validate",
                 "item count is below the required minimum",
+                code=FailureCode.REQUIRED_CONTENT_ABSENT,
             )
         if len(values) > validators.max_items:
             raise _validation_error("item count exceeds the allowed maximum")
@@ -63,6 +64,7 @@ class ObservationValidator:
                         ErrorClass.STRUCTURE,
                         "validate",
                         "required field is missing",
+                        code=FailureCode.REQUIRED_CONTENT_ABSENT,
                     )
                 continue
             _validate_scalar(field.type, item.fields[name], validators.allowed_link_domains)
