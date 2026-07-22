@@ -325,6 +325,128 @@ def test_provenance_registry_does_not_retain_or_reuse_adapter_instances() -> Non
         asyncio.run(second.fetch("m", spec(fetch_strategy="http")))
 
 
+@pytest.mark.parametrize("component", ["client", "backend"])
+@pytest.mark.parametrize("replacement_kind", ["exact", "duck"])
+def test_adapter_rejects_replaced_composition_before_any_dispatch(
+    component: str,
+    replacement_kind: str,
+) -> None:
+    transport_calls = 0
+    replacement_calls = 0
+    fake = FakeBackend(http=document())
+    make_scrapling_backend(fake)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal transport_calls
+        transport_calls += 1
+        return httpx.Response(500)
+
+    make_policy_client(handler)
+    source = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+    policy = source._http_client._egress_policy
+
+    if component == "client" and replacement_kind == "exact":
+        replacement: object = BoundedPolicyHttpClient._from_egress_policy(policy, clock=lambda: NOW)
+    elif component == "backend" and replacement_kind == "exact":
+        replacement = ScraplingBackend._from_egress_policy(policy, clock=lambda: NOW)
+    elif component == "client":
+
+        class DuckClient:
+            _egress_policy = policy
+
+            def _uses_egress_policy(self, candidate) -> bool:
+                return candidate is policy
+
+            async def get_robots(self, _target):
+                nonlocal replacement_calls
+                replacement_calls += 1
+                raise AssertionError("replacement client dispatched")
+
+        replacement = DuckClient()
+    else:
+
+        class DuckBackend:
+            is_policy_sealed = True
+
+            def _uses_egress_policy(self, candidate) -> bool:
+                return candidate is policy
+
+            async def fetch_http(self, _target):
+                nonlocal replacement_calls
+                replacement_calls += 1
+                raise AssertionError("replacement backend dispatched")
+
+        replacement = DuckBackend()
+    attribute = "_http_client" if component == "client" else "_backend"
+    object.__setattr__(source, attribute, replacement)
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(source.fetch("m", spec(fetch_strategy="http")))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert transport_calls == 0
+    assert replacement_calls == 0
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(("component", "replace_on_acquire"), [("client", 1), ("backend", 2)])
+def test_adapter_rechecks_pinned_composition_at_each_dispatch(
+    component: str,
+    replace_on_acquire: int,
+) -> None:
+    paths: list[str] = []
+    replacement_calls = 0
+    fake = FakeBackend(http=document())
+    make_scrapling_backend(fake)
+    source: ScraplingSourceAdapter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+
+    make_policy_client(handler)
+
+    class DuckClient:
+        async def get_robots(self, _target):
+            nonlocal replacement_calls
+            replacement_calls += 1
+            raise AssertionError("replacement client dispatched")
+
+    class DuckBackend:
+        async def fetch_http(self, _target):
+            nonlocal replacement_calls
+            replacement_calls += 1
+            raise AssertionError("replacement backend dispatched")
+
+    class MutatingRateLimiter(RecordingRateLimiter):
+        async def acquire(self, host: str, retry_after_seconds: float | None = None) -> None:
+            await super().acquire(host, retry_after_seconds)
+            if len(self.calls) == replace_on_acquire:
+                attribute = "_http_client" if component == "client" else "_backend"
+                replacement = DuckClient() if component == "client" else DuckBackend()
+                object.__setattr__(source, attribute, replacement)
+
+    source = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=MutatingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(source.fetch("m", spec(fetch_strategy="http")))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert replacement_calls == 0
+    assert fake.calls == []
+    assert paths == ([] if component == "client" else ["/robots.txt"])
+
+
 def test_production_adapter_has_no_independent_proxy_components() -> None:
     with pytest.raises(TypeError, match="http_client"):
         ScraplingSourceAdapter(  # type: ignore[call-arg]

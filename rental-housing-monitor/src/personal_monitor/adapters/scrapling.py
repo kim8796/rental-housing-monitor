@@ -8,6 +8,10 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
 
+from personal_monitor.adapters._composition import (
+    _acquire_adapter_composition,
+    _bind_adapter_composition,
+)
 from personal_monitor.adapters._policy import (
     MONITOR_USER_AGENT,
     BoundedPolicyHttpClient,
@@ -111,11 +115,12 @@ class ScraplingSourceAdapter:
         self._sleeper = sleeper
         self._shell_detector = js_shell_detector
         self._profile_provider = profile_provider
+        _bind_adapter_composition(self, (http_client, backend))
 
     async def fetch(self, monitor_id: str, spec: MonitorSpec) -> ObservationBatch:
+        self._require_pinned_components()
         if spec.source_adapter is not SourceAdapterKind.SCRAPLING or spec.adapter_ref is not None:
             raise MonitorError(ErrorClass.POLICY, "adapter", "monitor adapter is incompatible")
-        self._require_sealed_egress()
 
         if spec.fetch_strategy is not FetchStrategy.AUTO:
             return await self._run_strategy(monitor_id, spec, spec.fetch_strategy)
@@ -215,21 +220,30 @@ class ScraplingSourceAdapter:
         target: ResolvedTarget,
         profile_reference: str | None,
     ) -> SourceDocument:
-        self._require_sealed_egress()
+        self._require_pinned_components()
         if strategy is FetchStrategy.HTTP:
-            return await self._backend.fetch_http(target)
-        method = (
-            self._backend.fetch_dynamic
-            if strategy is FetchStrategy.DYNAMIC
-            else self._backend.fetch_stealthy
-        )
+            return await self._dispatch_backend(strategy, target, profile=None)
         if profile_reference is None:
-            return await method(target, profile=None)
-        return await self._fetch_with_profile(method, target, profile_reference)
+            return await self._dispatch_backend(strategy, target, profile=None)
+        return await self._fetch_with_profile(strategy, target, profile_reference)
+
+    async def _dispatch_backend(
+        self,
+        strategy: FetchStrategy,
+        target: ResolvedTarget,
+        *,
+        profile: Path | None,
+    ) -> SourceDocument:
+        _, backend = self._require_pinned_components()
+        if strategy is FetchStrategy.HTTP:
+            return await backend.fetch_http(target)
+        if strategy is FetchStrategy.DYNAMIC:
+            return await backend.fetch_dynamic(target, profile=profile)
+        return await backend.fetch_stealthy(target, profile=profile)
 
     async def _fetch_with_profile(
         self,
-        method: Callable[..., Awaitable[SourceDocument]],
+        strategy: FetchStrategy,
         target: ResolvedTarget,
         profile_reference: str,
     ) -> SourceDocument:
@@ -252,7 +266,11 @@ class ScraplingSourceAdapter:
             except Exception:
                 raise _profile_error() from None
             try:
-                result = await method(target, profile=_profile_path(profile))
+                result = await self._dispatch_backend(
+                    strategy,
+                    target,
+                    profile=_profile_path(profile),
+                )
             except BaseException as original:
                 exception = sys.exc_info()
                 try:
@@ -283,7 +301,11 @@ class ScraplingSourceAdapter:
         except Exception:
             raise _profile_error() from None
         try:
-            result = await method(target, profile=_profile_path(profile))
+            result = await self._dispatch_backend(
+                strategy,
+                target,
+                profile=_profile_path(profile),
+            )
         except BaseException as original:
             exception = sys.exc_info()
             try:
@@ -366,9 +388,9 @@ class ScraplingSourceAdapter:
         seen = {robots_target.normalized_url}
         redirect_count = 0
         while True:
-            self._require_sealed_egress()
+            http_client, _ = self._require_pinned_components()
             try:
-                response = await self._http_client.get_robots(robots_target)
+                response = await http_client.get_robots(robots_target)
             except FetchError as error:
                 if error.error_class is not ErrorClass.TRANSIENT_NETWORK:
                     raise
@@ -421,20 +443,30 @@ class ScraplingSourceAdapter:
                 )
             return policy.check(MONITOR_USER_AGENT, target.normalized_url), retry_after
 
-    def _require_sealed_egress(self) -> None:
-        egress_policy = self._http_client._egress_policy
-        if (
-            not _matches_egress_snapshot(self, egress_policy)
-            or not egress_policy.is_valid
-            or not self._http_client._uses_egress_policy(egress_policy)
-            or not self._backend._uses_egress_policy(egress_policy)
-            or not self._backend.is_policy_sealed
-        ):
-            raise MonitorError(
-                ErrorClass.POLICY,
-                "adapter",
-                "adapter backend policy integrity check failed",
-            )
+    def _require_pinned_components(
+        self,
+    ) -> tuple[BoundedPolicyHttpClient, ScraplingBackend]:
+        current = (
+            getattr(self, "_http_client", None),
+            getattr(self, "_backend", None),
+        )
+        pinned = _acquire_adapter_composition(self, current)
+        if pinned is not None:
+            http_client, backend = pinned
+            if type(http_client) is BoundedPolicyHttpClient and type(backend) is ScraplingBackend:
+                egress_policy = http_client._egress_policy
+                if (
+                    _matches_egress_snapshot(self, egress_policy)
+                    and http_client._uses_egress_policy(egress_policy)
+                    and backend._uses_egress_policy(egress_policy)
+                    and backend.is_policy_sealed
+                ):
+                    return http_client, backend
+        raise MonitorError(
+            ErrorClass.POLICY,
+            "adapter",
+            "adapter backend policy integrity check failed",
+        )
 
     async def _validate_policy_response(
         self,

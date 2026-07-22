@@ -7,6 +7,10 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from urllib.parse import urlsplit, urlunsplit
 
+from personal_monitor.adapters._composition import (
+    _acquire_adapter_composition,
+    _bind_adapter_composition,
+)
 from personal_monitor.adapters._policy import (
     MONITOR_USER_AGENT,
     BoundedPolicyHttpClient,
@@ -44,6 +48,7 @@ class OfficialJsonAdapter:
     ) -> None:
         if type(http_client) is not BoundedPolicyHttpClient:
             raise TypeError("http_client must preserve the bounded proxy policy")
+        _bind_adapter_composition(self, (http_client,))
         self._url_policy = url_policy
         self._rate_limiter = rate_limiter
         self._http_client = http_client
@@ -53,6 +58,7 @@ class OfficialJsonAdapter:
         self._sleeper = sleeper
 
     async def fetch(self, monitor_id: str, spec: MonitorSpec) -> ObservationBatch:
+        self._require_pinned_http_client()
         if (
             spec.source_adapter is not SourceAdapterKind.OFFICIAL_API
             or spec.adapter_ref != "json_get"
@@ -88,7 +94,8 @@ class OfficialJsonAdapter:
         redirect_count = 0
         while True:
             await self._rate_limiter.acquire(target.hostname, crawl_delay)
-            response = await self._http_client.get_json(target)
+            http_client = self._require_pinned_http_client()
+            response = await http_client.get_json(target)
             await self._validate_response_destination(response, requested=target)
             if response.status in _REDIRECT_STATUSES:
                 redirect_count += 1
@@ -160,8 +167,9 @@ class OfficialJsonAdapter:
         seen = {robots_target.normalized_url}
         redirect_count = 0
         while True:
+            http_client = self._require_pinned_http_client()
             try:
-                response = await self._http_client.get_robots(robots_target)
+                response = await http_client.get_robots(robots_target)
             except FetchError as error:
                 if error.error_class is not ErrorClass.TRANSIENT_NETWORK:
                     raise
@@ -217,6 +225,21 @@ class OfficialJsonAdapter:
                     "robots response returned an invalid status",
                 )
             return policy.check(MONITOR_USER_AGENT, target.normalized_url), retry_after
+
+    def _require_pinned_http_client(self) -> BoundedPolicyHttpClient:
+        current = getattr(self, "_http_client", None)
+        pinned = _acquire_adapter_composition(self, (current,))
+        if pinned is not None:
+            http_client = pinned[0]
+            if type(http_client) is BoundedPolicyHttpClient and http_client._uses_egress_policy(
+                http_client._egress_policy
+            ):
+                return http_client
+        raise MonitorError(
+            ErrorClass.POLICY,
+            "adapter",
+            "adapter client policy integrity check failed",
+        )
 
     async def _validate_response_destination(
         self,

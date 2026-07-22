@@ -239,6 +239,163 @@ def test_policy_client_snapshot_owners_use_identity_and_are_weakly_held() -> Non
     assert second._uses_egress_policy(second._egress_policy)
 
 
+@pytest.mark.parametrize("replacement_kind", ["exact", "duck"])
+def test_official_adapter_rejects_replaced_client_before_dispatch(
+    replacement_kind: str,
+) -> None:
+    transport_calls = 0
+    fake_calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal transport_calls
+        transport_calls += 1
+        return httpx.Response(500)
+
+    original = make_policy_client(handler)
+    adapter = OfficialJsonAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),
+        http_client=original,
+        clock=lambda: NOW,
+    )
+
+    if replacement_kind == "exact":
+        replacement: object = BoundedPolicyHttpClient(
+            egress_proxy_url="http://other-proxy.internal:8080"
+        )
+    else:
+
+        class DuckClient:
+            async def get_robots(self, _target):
+                nonlocal fake_calls
+                fake_calls += 1
+                raise AssertionError("replacement client dispatched")
+
+            async def get_json(self, _target):
+                nonlocal fake_calls
+                fake_calls += 1
+                raise AssertionError("replacement client dispatched")
+
+        replacement = DuckClient()
+    object.__setattr__(adapter, "_http_client", replacement)
+
+    with pytest.raises(MonitorError, match="client policy") as caught:
+        asyncio.run(adapter.fetch("monitor-1", official_spec()))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert transport_calls == 0
+    assert fake_calls == 0
+    assert "other-proxy" not in str(caught.value)
+    assert "other-proxy" not in repr(caught.value)
+
+
+@pytest.mark.parametrize("replace_on_acquire", [1, 2])
+def test_official_adapter_rechecks_pinned_client_at_each_dispatch(
+    replace_on_acquire: int,
+) -> None:
+    paths: list[str] = []
+    adapter: OfficialJsonAdapter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=b'{"products":[{"id":"sku-1","price":99}]}',
+        )
+
+    class MutatingRateLimiter(RecordingRateLimiter):
+        async def acquire(self, host: str, retry_after_seconds: float | None = None) -> None:
+            await super().acquire(host, retry_after_seconds)
+            if len(self.calls) == replace_on_acquire:
+                object.__setattr__(
+                    adapter,
+                    "_http_client",
+                    BoundedPolicyHttpClient(egress_proxy_url="http://other-proxy.internal:8080"),
+                )
+
+    adapter = OfficialJsonAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=MutatingRateLimiter(),
+        http_client=make_policy_client(handler),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(MonitorError, match="client policy") as caught:
+        asyncio.run(adapter.fetch("monitor-1", official_spec()))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert paths == ([] if replace_on_acquire == 1 else ["/robots.txt"])
+
+
+def test_official_composition_pin_is_owner_isolated_and_weakly_held() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=b'{"products":[{"id":"sku-1","price":99}]}',
+        )
+
+    shared = make_policy_client(handler)
+
+    def make_adapter() -> OfficialJsonAdapter:
+        return OfficialJsonAdapter(
+            url_policy=UrlPolicy(Resolver()),
+            rate_limiter=RecordingRateLimiter(),
+            http_client=shared,
+            clock=lambda: NOW,
+        )
+
+    first = make_adapter()
+    second = make_adapter()
+    object.__setattr__(
+        first,
+        "_http_client",
+        BoundedPolicyHttpClient(egress_proxy_url="http://other-proxy.internal:8080"),
+    )
+
+    with pytest.raises(MonitorError, match="client policy"):
+        asyncio.run(first.fetch("first", official_spec()))
+    assert asyncio.run(second.fetch("second", official_spec())).monitor_id == "second"
+
+    reference = weakref.ref(first)
+    del first
+    gc.collect()
+    assert reference() is None
+
+    third = make_adapter()
+    assert asyncio.run(third.fetch("third", official_spec())).monitor_id == "third"
+
+
+def test_official_composition_pin_cannot_be_rebound_or_leak_replacement() -> None:
+    original = make_policy_client()
+    adapter = OfficialJsonAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),
+        http_client=original,
+        clock=lambda: NOW,
+    )
+    secret = "replacement-proxy-secret"
+
+    with pytest.raises(RuntimeError, match="already bound") as caught:
+        adapter.__init__(
+            url_policy=UrlPolicy(Resolver()),
+            rate_limiter=RecordingRateLimiter(),
+            http_client=BoundedPolicyHttpClient(
+                egress_proxy_url=f"http://user:{secret}@other-proxy.internal:8080"
+            ),
+            clock=lambda: NOW,
+        )
+
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+    assert adapter._http_client is original
+
+
 def test_official_constructor_rejects_policy_client_subclasses() -> None:
     class SubclassedClient(BoundedPolicyHttpClient):
         pass
