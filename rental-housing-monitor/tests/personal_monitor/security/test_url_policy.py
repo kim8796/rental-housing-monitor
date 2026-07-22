@@ -37,6 +37,7 @@ class FakeResolver:
         "http://LOCALHOST./admin",
         "http://127.0.0.1/",
         "http://[::1]/",
+        "http://[::ffff:10.0.0.1]/",
         "http://0.0.0.0/",
         "http://169.254.169.254/computeMetadata/v1/",
         "http://metadata.google.internal/computeMetadata/v1/",
@@ -91,6 +92,16 @@ def test_url_policy_canonicalizes_an_idna_hostname() -> None:
     assert resolver.calls == [("xn--2i4bq6h.kr", 443)]
 
 
+def test_url_policy_uses_non_transitional_idna_for_sharp_s() -> None:
+    resolver = FakeResolver()
+
+    target = asyncio.run(UrlPolicy(resolver).validate("https://faß.de/notices"))
+
+    assert target.hostname == "xn--fa-hia.de"
+    assert target.normalized_url == "https://xn--fa-hia.de/notices"
+    assert resolver.calls == [("xn--fa-hia.de", 443)]
+
+
 @pytest.mark.parametrize(
     "answers",
     [
@@ -134,16 +145,36 @@ def test_url_policy_validates_public_ip_literal_without_trusting_dns() -> None:
 @pytest.mark.parametrize(
     "address",
     [
+        "192.0.0.8",  # version-dependent IETF special-purpose classification
         "100.64.0.1",  # shared carrier-grade NAT space
         "::ffff:100.64.0.1",  # mapped non-global IPv4
         "fec0::1",  # deprecated IPv6 site-local space
         "192.0.2.1",  # documentation-only IPv4
         "2001:db8::1",  # documentation-only IPv6
         "198.18.0.1",  # benchmark network
+        "64:ff9b::7f00:1",  # NAT64 well-known translation prefix
+        "64:ff9b:1::7f00:1",  # local-use translation prefix
+        "2002:7f00:1::",  # 6to4 carrying loopback IPv4
+        "2001:0000:4136:e378:8000:63bf:3fff:fdd2",  # Teredo transition space
+        "3fff::1",  # documentation-only IPv6
     ],
 )
 def test_non_global_addresses_are_never_public_targets(address: str) -> None:
     assert is_public_address(address) is False
+
+
+@pytest.mark.parametrize("address", ["93.184.216.34", "2606:4700:4700::1111"])
+def test_representative_global_addresses_are_public_targets(address: str) -> None:
+    assert is_public_address(address) is True
+
+
+def test_public_ipv4_mapped_literal_is_canonicalized_before_classification() -> None:
+    resolver = FakeResolver(("10.0.0.7",))
+
+    target = asyncio.run(UrlPolicy(resolver).validate("https://[::ffff:93.184.216.34]/notices"))
+
+    assert target.addresses == frozenset({"93.184.216.34"})
+    assert resolver.calls == []
 
 
 def test_redirect_number_five_is_allowed_and_number_six_is_rejected() -> None:

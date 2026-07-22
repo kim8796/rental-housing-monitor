@@ -76,6 +76,36 @@ def test_robots_policy_cannot_be_applied_to_a_different_origin() -> None:
         policy.check("personal-monitor", "https://other.example/path")
 
 
+def test_robots_origin_treats_unicode_and_punycode_hosts_as_equivalent() -> None:
+    policy = RobotsPolicy.from_text(
+        "User-agent: *\nAllow: /\n",
+        "https://faß.de/robots.txt",
+        checked_at=CHECKED_AT,
+    )
+
+    decision = policy.check("personal-monitor", "https://xn--fa-hia.de/path")
+
+    assert decision.allowed is True
+
+
+@pytest.mark.parametrize(
+    "robots_url",
+    [
+        "https://\ud800.example/robots.txt",
+        "https://under_score.example/robots.txt",
+        "https://example.com\x00.evil/robots.txt",
+        "https://example.com\\evil/robots.txt",
+    ],
+)
+def test_robots_origin_rejects_malformed_or_ambiguous_hostname(robots_url: str) -> None:
+    with pytest.raises(PolicyError, match="robots"):
+        RobotsPolicy.from_text(
+            "User-agent: *\nAllow: /\n",
+            robots_url,
+            checked_at=CHECKED_AT,
+        )
+
+
 @pytest.mark.parametrize(
     "robots_url",
     [

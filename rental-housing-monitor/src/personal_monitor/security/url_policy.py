@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
+import idna
+
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 
 ALLOWED_PORTS = frozenset({80, 443})
@@ -15,6 +17,54 @@ BLOCKED_HOSTS = frozenset({"localhost", "metadata.google.internal"})
 MAX_REDIRECTS = 5
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _LEGACY_NUMERIC_COMPONENT = re.compile(r"(?:[0-9]+|0x[0-9a-f]+)\Z")
+# Conservative snapshot of the IANA special-purpose registries (2025-10-09).
+# Whole special prefixes stay denied even when IANA lists a narrower globally reachable exception.
+_IPV4_DENY_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.31.196.0/24",
+        "192.52.193.0/24",
+        "192.88.99.0/24",
+        "192.168.0.0/16",
+        "192.175.48.0/24",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    )
+)
+_IPV6_DENY_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "::/96",
+        "::ffff:0:0:0/96",
+        "64:ff9b::/96",
+        "64:ff9b:1::/48",
+        "100::/64",
+        "100:0:0:1::/64",
+        "2001::/23",
+        "2001:db8::/32",
+        "2002::/16",
+        "2620:4f:8000::/48",
+        "3fff::/20",
+        "5f00::/16",
+        "fc00::/7",
+        "fe00::/9",
+        "fe80::/10",
+        "fec0::/10",
+        "ff00::/8",
+    )
+)
+_IPV6_GLOBAL_UNICAST = ipaddress.ip_network("2000::/3")
 
 
 class Resolver(Protocol):
@@ -37,23 +87,12 @@ class ResolvedTarget:
 
 
 def is_public_address(value: str) -> bool:
-    address = _parse_address(value)
-    if (
-        not address.is_global
-        or address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_reserved
-        or address.is_unspecified
-    ):
-        return False
-    if isinstance(address, ipaddress.IPv6Address):
-        if address.is_site_local:
-            return False
-        if address.ipv4_mapped is not None and not address.ipv4_mapped.is_global:
-            return False
-    return True
+    address = _canonical_ip_address(_parse_address(value))
+    if isinstance(address, ipaddress.IPv4Address):
+        return not any(address in network for network in _IPV4_DENY_NETWORKS)
+    return address in _IPV6_GLOBAL_UNICAST and not any(
+        address in network for network in _IPV6_DENY_NETWORKS
+    )
 
 
 class UrlPolicy:
@@ -111,7 +150,7 @@ class UrlPolicy:
 def _parse_target(url: str) -> tuple[SplitResult, str, int]:
     if not isinstance(url, str):
         raise PolicyError("target URL must be a string")
-    if _has_unsafe_raw_character(url):
+    if has_unsafe_url_characters(url):
         raise PolicyError("target URL contains an unsafe character")
     try:
         parts = urlsplit(url)
@@ -128,7 +167,7 @@ def _parse_target(url: str) -> tuple[SplitResult, str, int]:
     if username is not None or password is not None:
         raise PolicyError("URL userinfo is not allowed")
 
-    hostname = _normalize_hostname(hostname_value)
+    hostname = canonicalize_hostname(hostname_value)
     if hostname in BLOCKED_HOSTS:
         raise PolicyError("target host is blocked")
 
@@ -145,21 +184,28 @@ def _parse_target(url: str) -> tuple[SplitResult, str, int]:
     return parts._replace(scheme=scheme), hostname, resolved_port
 
 
-def _normalize_hostname(value: str) -> str:
-    folded = value.casefold()
-    if folded.endswith(".."):
+def canonicalize_hostname(value: str) -> str:
+    if not isinstance(value, str) or not value or has_unsafe_url_characters(value):
         raise PolicyError("target hostname is malformed")
-    hostname = folded[:-1] if folded.endswith(".") else folded
-    if not hostname or _has_unsafe_raw_character(hostname):
-        raise PolicyError("target hostname is malformed")
-    if "%" in hostname:
+    if "%" in value:
         raise PolicyError("scoped IP addresses are not allowed")
-    if _try_parse_address(hostname) is not None:
-        return hostname
+
+    literal_candidate = value[:-1] if value.endswith(".") else value
+    literal = _try_parse_address(literal_candidate)
+    if literal is not None:
+        return literal.compressed
+
     try:
-        ascii_hostname = hostname.encode("idna").decode("ascii")
-    except UnicodeError:
+        ascii_hostname = idna.encode(
+            value,
+            uts46=True,
+            transitional=False,
+            std3_rules=True,
+        ).decode("ascii")
+    except (idna.IDNAError, UnicodeError):
         raise PolicyError("target hostname is malformed") from None
+    if ascii_hostname.endswith("."):
+        ascii_hostname = ascii_hostname[:-1]
     if len(ascii_hostname) > 253 or any(
         _DNS_LABEL.fullmatch(label) is None for label in ascii_hostname.split(".")
     ):
@@ -205,12 +251,18 @@ def _parse_peer(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
 def _canonical_address(
     address: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> str:
+    return _canonical_ip_address(address).compressed
+
+
+def _canonical_ip_address(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        return address.ipv4_mapped.compressed
-    return address.compressed
+        return address.ipv4_mapped
+    return address
 
 
-def _has_unsafe_raw_character(value: str) -> bool:
+def has_unsafe_url_characters(value: str) -> bool:
     return "\\" in value or any(
         unicodedata.category(character).startswith("C") for character in value
     )

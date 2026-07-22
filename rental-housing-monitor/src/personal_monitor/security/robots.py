@@ -6,7 +6,11 @@ from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
 from personal_monitor.engine.errors import ErrorClass, MonitorError
-from personal_monitor.security.url_policy import PolicyError
+from personal_monitor.security.url_policy import (
+    PolicyError,
+    canonicalize_hostname,
+    has_unsafe_url_characters,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,19 +93,29 @@ class RobotsPolicy:
 
 
 def _origin(url: str) -> tuple[str, str, int]:
+    if not isinstance(url, str) or has_unsafe_url_characters(url):
+        raise PolicyError("robots URL contains an unsafe character", stage="robots")
     try:
         parts = urlsplit(url)
         scheme = parts.scheme.casefold()
-        hostname = (parts.hostname or "").rstrip(".").casefold()
+        hostname_value = parts.hostname
+        username = parts.username
+        password = parts.password
         if parts.netloc.rsplit("@", 1)[-1].endswith(":"):
             raise ValueError("empty port")
         port = parts.port if parts.port is not None else (443 if scheme == "https" else 80)
     except ValueError:
         raise PolicyError("robots URL is malformed", stage="robots") from None
-    if scheme not in {"http", "https"} or not hostname:
+    if scheme not in {"http", "https"} or not hostname_value:
         raise PolicyError("robots URL must be absolute http(s)", stage="robots")
+    if username is not None or password is not None:
+        raise PolicyError("robots URL userinfo is not allowed", stage="robots")
     if port <= 0:
         raise PolicyError("robots URL port is invalid", stage="robots")
+    try:
+        hostname = canonicalize_hostname(hostname_value)
+    except PolicyError:
+        raise PolicyError("robots URL hostname is malformed", stage="robots") from None
     return scheme, hostname, port
 
 

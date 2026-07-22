@@ -2,7 +2,12 @@
 
 from personal_monitor.security.rate_limit import HostRateLimiter
 from personal_monitor.security.robots import RobotsDecision, RobotsPolicy
-from personal_monitor.security.url_policy import PolicyError, ResolvedTarget, UrlPolicy
+from personal_monitor.security.url_policy import (
+    PolicyError,
+    ResolvedTarget,
+    UrlPolicy,
+    canonicalize_hostname,
+)
 
 __all__ = [
     "HostRateLimiter",
@@ -11,4 +16,5 @@ __all__ = [
     "RobotsDecision",
     "RobotsPolicy",
     "UrlPolicy",
+    "canonicalize_hostname",
 ]
