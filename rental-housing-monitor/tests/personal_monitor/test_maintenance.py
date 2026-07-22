@@ -158,23 +158,34 @@ def test_removes_only_pending_actions_strictly_older_than_one_day(
     assert _exists(connection, "pending_actions", "expired-boundary", "token_hash")
 
 
-def test_removes_old_diagnostic_snapshots_only_when_the_optional_table_exists(
+def test_removes_diagnostic_snapshots_at_exact_expiry_without_changing_other_boundaries(
     connection: sqlite3.Connection, now: datetime
 ) -> None:
-    Maintenance(connection).run(now=now)
-    connection.execute(
-        "CREATE TABLE diagnostic_snapshots(id TEXT PRIMARY KEY, created_at TEXT NOT NULL)"
-    )
-    cutoff = now - timedelta(days=7)
+    _add_monitor(connection, "monitor")
     connection.executemany(
-        "INSERT INTO diagnostic_snapshots(id, created_at) VALUES (?, ?)",
-        [("old", _timestamp(cutoff - timedelta(microseconds=1))), ("boundary", _timestamp(cutoff))],
+        "INSERT INTO diagnostic_snapshots("
+        "id, monitor_id, ciphertext, nonce, created_at, expires_at"
+        ") VALUES (?, 'monitor', X'01', X'02', ?, ?)",
+        [
+            (
+                "expired",
+                _timestamp(now - timedelta(days=7)),
+                _timestamp(now - timedelta(microseconds=1)),
+            ),
+            ("boundary", _timestamp(now - timedelta(days=7)), _timestamp(now)),
+            (
+                "live",
+                _timestamp(now - timedelta(days=7)),
+                _timestamp(now + timedelta(microseconds=1)),
+            ),
+        ],
     )
 
     Maintenance(connection).run(now=now)
 
-    assert not _exists(connection, "diagnostic_snapshots", "old")
-    assert _exists(connection, "diagnostic_snapshots", "boundary")
+    assert not _exists(connection, "diagnostic_snapshots", "expired")
+    assert not _exists(connection, "diagnostic_snapshots", "boundary")
+    assert _exists(connection, "diagnostic_snapshots", "live")
 
 
 def test_removes_old_disabled_monitor_dependencies_without_removing_shared_owner_data(
@@ -225,12 +236,6 @@ def test_removes_old_disabled_monitor_dependencies_without_removing_shared_owner
 def test_removes_diagnostic_snapshots_of_an_old_disabled_monitor(
     connection: sqlite3.Connection, now: datetime
 ) -> None:
-    connection.execute(
-        "CREATE TABLE diagnostic_snapshots("
-        "id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, created_at TEXT NOT NULL, "
-        "expires_at TEXT NOT NULL, FOREIGN KEY(monitor_id) REFERENCES monitors(id)"
-        ")"
-    )
     _add_monitor(
         connection,
         "old",
@@ -238,8 +243,9 @@ def test_removes_diagnostic_snapshots_of_an_old_disabled_monitor(
         disabled_at=now - timedelta(days=30, microseconds=1),
     )
     connection.execute(
-        "INSERT INTO diagnostic_snapshots(id, monitor_id, created_at, expires_at) "
-        "VALUES ('snapshot', 'old', ?, ?)",
+        "INSERT INTO diagnostic_snapshots("
+        "id, monitor_id, ciphertext, nonce, created_at, expires_at"
+        ") VALUES ('snapshot', 'old', X'01', X'02', ?, ?)",
         (_timestamp(now), _timestamp(now + timedelta(days=7))),
     )
 

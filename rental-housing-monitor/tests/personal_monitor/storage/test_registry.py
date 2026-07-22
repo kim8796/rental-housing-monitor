@@ -59,8 +59,54 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
     assert second.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert second.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     versions = second.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in versions] == [1]
+    assert [row["version"] for row in versions] == [1, 2]
+    columns = {
+        row["name"]: row for row in second.execute("PRAGMA table_info(diagnostic_snapshots)")
+    }
+    assert set(columns) == {"id", "monitor_id", "ciphertext", "nonce", "created_at", "expires_at"}
+    assert columns["ciphertext"]["type"] == "BLOB"
+    assert columns["nonce"]["type"] == "BLOB"
+    assert second.execute("PRAGMA foreign_key_list(diagnostic_snapshots)").fetchone()["table"] == (
+        "monitors"
+    )
+    indexes = {row["name"] for row in second.execute("PRAGMA index_list(diagnostic_snapshots)")}
+    assert "diagnostic_snapshots_expiry_idx" in indexes
     second.close()
+
+
+def test_existing_v1_database_migrates_to_v2_atomically_and_reruns(tmp_path) -> None:
+    database_path = tmp_path / "existing-v1.db"
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    for statement in schema._statements(schema._MIGRATION_1):
+        connection.execute(statement)
+    connection.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)",
+        (datetime.now(UTC).isoformat(),),
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = open_database(database_path)
+    migrated_versions = migrated.execute("SELECT version FROM schema_migrations")
+    assert [row["version"] for row in migrated_versions] == [
+        1,
+        2,
+    ]
+    assert migrated.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='diagnostic_snapshots'"
+    ).fetchone()
+    migrated.close()
+
+    rerun = open_database(database_path)
+    migration_count = rerun.execute(
+        "SELECT count(*) FROM schema_migrations WHERE version = 2"
+    ).fetchone()[0]
+    assert migration_count == 1
+    rerun.close()
 
 
 def test_schema_rejects_a_migration_newer_than_the_binary(tmp_path) -> None:
@@ -70,7 +116,7 @@ def test_schema_rejects_a_migration_newer_than_the_binary(tmp_path) -> None:
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
     )
     connection.execute(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)",
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)",
         (datetime.now(UTC).isoformat(),),
     )
     connection.commit()
@@ -78,6 +124,23 @@ def test_schema_rejects_a_migration_newer_than_the_binary(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="newer than supported"):
         open_database(database_path)
+
+
+def test_open_existing_rejects_an_incomplete_v1_schema(tmp_path) -> None:
+    database_path = tmp_path / "incomplete.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)",
+        (datetime.now(UTC).isoformat(),),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        schema.open_existing_database(database_path)
 
 
 def test_schema_migration_rolls_back_every_statement_on_failure(

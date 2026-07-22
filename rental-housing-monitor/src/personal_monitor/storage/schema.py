@@ -72,7 +72,16 @@ CREATE INDEX outbox_due_idx ON outbox(status, available_at);
 CREATE INDEX runs_monitor_started_idx ON runs(monitor_id, started_at);
 """
 
-_MIGRATIONS = ((1, _MIGRATION_1),)
+_MIGRATION_2 = """
+CREATE TABLE diagnostic_snapshots(
+  id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, ciphertext BLOB NOT NULL,
+  nonce BLOB NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  FOREIGN KEY(monitor_id) REFERENCES monitors(id)
+);
+CREATE INDEX diagnostic_snapshots_expiry_idx ON diagnostic_snapshots(expires_at);
+"""
+
+_MIGRATIONS = ((1, _MIGRATION_1), (2, _MIGRATION_2))
 
 
 def open_database(path: str | Path) -> sqlite3.Connection:

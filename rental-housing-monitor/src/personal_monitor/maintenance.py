@@ -92,8 +92,8 @@ class Maintenance:
     def _delete_old_diagnostic_snapshots(self, columns: frozenset[str], cutoffs: _Cutoffs) -> None:
         if "expires_at" in columns:
             self.connection.execute(
-                "DELETE FROM diagnostic_snapshots WHERE created_at < ? OR expires_at < ?",
-                (cutoffs.snapshots, cutoffs.now),
+                "DELETE FROM diagnostic_snapshots WHERE expires_at <= ?",
+                (cutoffs.now,),
             )
             return
         self.connection.execute(
