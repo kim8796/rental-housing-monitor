@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import signal
 import threading
 import weakref
 from contextlib import suppress
@@ -82,6 +83,206 @@ class FakeResponse:
         self.body = body
         self.url = url
         self.history = [] if history is None else history
+
+
+class FakeProfileConnection:
+    def __init__(self, wire: object | None, events: list[str]) -> None:
+        self._wire = wire
+        self._events = events
+
+    def poll(self) -> bool:
+        return self._wire is not None
+
+    def recv(self) -> object:
+        wire = self._wire
+        self._wire = None
+        return wire
+
+    def close(self) -> None:
+        self._events.append("connection.close")
+
+
+class FakeProfileProcess:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        exits_on_join: bool,
+        resists_terminate: bool = False,
+        raises_on_start: bool = False,
+    ) -> None:
+        self._events = events
+        self._alive = False
+        self._exits_on_join = exits_on_join
+        self._resists_terminate = resists_terminate
+        self._raises_on_start = raises_on_start
+        self.pid = 4242
+
+    def start(self) -> None:
+        self._events.append("start")
+        if self._raises_on_start:
+            raise RuntimeError
+        self._alive = True
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def terminate(self) -> None:
+        self._events.append("terminate")
+        if not self._resists_terminate:
+            self._alive = False
+
+    def kill(self) -> None:
+        self._events.append("kill")
+        self._alive = False
+
+    def join(self, _timeout: float | None = None) -> None:
+        self._events.append("join")
+        if self._exits_on_join:
+            self._alive = False
+
+    def close(self) -> None:
+        self._events.append("process.close")
+
+
+def fake_profile_supervisor(
+    process: FakeProfileProcess,
+    connection: FakeProfileConnection,
+    calls: list[tuple[FetchStrategy, str, dict[str, object]]] | None = None,
+):
+    def factory(
+        strategy: FetchStrategy,
+        url: str,
+        kwargs: dict[str, object],
+    ) -> tuple[FakeProfileProcess, FakeProfileConnection]:
+        if calls is not None:
+            calls.append((strategy, url, kwargs))
+        return process, connection
+
+    return backend_module._ProfiledBrowserSupervisor._for_test(factory)
+
+
+def test_production_profile_boundary_signals_entire_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    signals: list[tuple[int, signal.Signals]] = []
+    process = FakeProfileProcess(events, exits_on_join=False)
+    process.start()
+    monkeypatch.setattr(
+        backend_module.os,
+        "killpg",
+        lambda process_group, sent_signal: signals.append((process_group, sent_signal)),
+    )
+
+    boundary = backend_module._ProfileProcessBoundary(process)
+    boundary.terminate()
+    boundary.kill()
+
+    assert signals == [
+        (process.pid, signal.SIGTERM),
+        (process.pid, signal.SIGKILL),
+    ]
+    assert events == ["start"]
+
+
+def test_production_profile_session_pickles_strategy_instead_of_fetcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    receiver = FakeProfileConnection(None, events)
+    sender = FakeProfileConnection(None, events)
+    process = FakeProfileProcess(events, exits_on_join=True)
+    recorded: dict[str, object] = {}
+
+    class FakeSpawnContext:
+        def Pipe(self, *, duplex: bool):
+            assert duplex is False
+            return receiver, sender
+
+        def Process(self, **kwargs: object):
+            recorded.update(kwargs)
+            return process
+
+    monkeypatch.setattr(
+        backend_module.multiprocessing,
+        "get_context",
+        lambda method: FakeSpawnContext() if method == "spawn" else None,
+    )
+    child_kwargs: dict[str, object] = {
+        "timeout": 90_000,
+        "headless": True,
+        "user_data_dir": "/private/profile",
+    }
+
+    boundary, actual_receiver, actual_sender = backend_module._production_profile_session(
+        FetchStrategy.DYNAMIC,
+        "https://example.com/source",
+        child_kwargs,
+    )
+
+    assert isinstance(boundary, backend_module._ProfileProcessBoundary)
+    assert actual_receiver is receiver
+    assert actual_sender is sender
+    assert recorded == {
+        "target": backend_module._profiled_browser_child,
+        "args": (
+            FetchStrategy.DYNAMIC.value,
+            "https://example.com/source",
+            child_kwargs,
+            sender,
+        ),
+        "daemon": False,
+    }
+    assert not any(callable(item) for item in recorded["args"])  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected"),
+    [
+        (FetchStrategy.DYNAMIC, "dynamic"),
+        (FetchStrategy.STEALTHY, "stealthy"),
+    ],
+)
+def test_profiled_child_imports_real_fetcher_by_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+    strategy: FetchStrategy,
+    expected: str,
+) -> None:
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def fetcher(kind: str):
+        def run(url: str, **kwargs: object) -> FakeResponse:
+            calls.append((kind, url, kwargs))
+            return FakeResponse()
+
+        return staticmethod(run)
+
+    class Sender:
+        wire: object | None = None
+        closed = False
+
+        def send(self, wire: object) -> None:
+            self.wire = wire
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(backend_module.os, "setsid", lambda: None)
+    monkeypatch.setattr(backend_module.DynamicFetcher, "fetch", fetcher("dynamic"))
+    monkeypatch.setattr(backend_module.StealthyFetcher, "fetch", fetcher("stealthy"))
+    sender = Sender()
+
+    backend_module._profiled_browser_child(
+        strategy.value,
+        "https://example.com/source",
+        {"headless": True},
+        sender,
+    )
+
+    assert calls == [(expected, "https://example.com/source", {"headless": True})]
+    assert isinstance(sender.wire, tuple) and sender.wire[0] == "response"
+    assert sender.closed
 
 
 class RawHttpxStream(httpx.AsyncByteStream):
@@ -934,16 +1135,17 @@ def test_http_fetch_uses_approved_url_and_bounded_fetcher_kwargs() -> None:
 def test_browser_fetch_uses_profile_and_bounded_fetcher_kwargs(
     tmp_path: Path, method_name: str, strategy: FetchStrategy
 ) -> None:
-    calls: list[tuple[str, dict[str, object]]] = []
-
-    def fetcher(url: str, **kwargs: object) -> FakeResponse:
-        calls.append((url, kwargs))
-        return FakeResponse()
+    calls: list[tuple[FetchStrategy, str, dict[str, object]]] = []
+    events: list[str] = []
+    process = FakeProfileProcess(events, exits_on_join=True)
+    connection = FakeProfileConnection(
+        backend_module._serialize_profile_response(FakeResponse()),
+        events,
+    )
 
     backend = make_test_backend(
         egress_proxy_url="http://proxy.internal:8080",
-        dynamic_fetcher=fetcher,
-        stealthy_fetcher=fetcher,
+        profile_supervisor=fake_profile_supervisor(process, connection, calls),
     )
 
     document = asyncio.run(getattr(backend, method_name)(target(), profile=tmp_path))
@@ -973,7 +1175,7 @@ def test_browser_fetch_uses_profile_and_bounded_fetcher_kwargs(
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
             "--force-webrtc-ip-handling-policy",
         ]
-    assert calls == [("https://example.com/source", expected_kwargs)]
+    assert calls == [(strategy, "https://example.com/source", expected_kwargs)]
 
 
 @pytest.mark.parametrize("method_name", ["fetch_dynamic", "fetch_stealthy"])
@@ -1152,7 +1354,7 @@ def test_outer_cancellation_is_not_swallowed() -> None:
 
 
 @pytest.mark.parametrize("exit_kind", ["timeout", "cancellation"])
-def test_profile_lease_waits_for_late_browser_worker_before_archive_and_cleanup(
+def test_profiled_exit_stops_worker_and_cleans_before_context_return(
     tmp_path: Path, exit_kind: str
 ) -> None:
     source = tmp_path / "source-profile"
@@ -1161,58 +1363,171 @@ def test_profile_lease_waits_for_late_browser_worker_before_archive_and_cleanup(
     vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
     profiles = BrowserProfileStore(vault, materialization_root=tmp_path / "workspaces")
     profiles.archive("profile", source)
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-
-    def fetcher(_url: str, **kwargs: object) -> FakeResponse:
-        started.set()
-        release.wait(timeout=2)
-        workspace = Path(str(kwargs["user_data_dir"]))
-        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
-        (workspace / "Cookies").write_bytes(b"late-private-cookie")
-        finished.set()
-        return FakeResponse()
+    gate = threading.BoundedSemaphore(1)
+    events: list[str] = []
+    process = FakeProfileProcess(
+        events,
+        exits_on_join=False,
+        resists_terminate=True,
+    )
+    connection = FakeProfileConnection(None, events)
 
     backend = make_test_backend(
-        dynamic_fetcher=fetcher,
-        browser_gate=threading.BoundedSemaphore(1),
+        browser_gate=gate,
         browser_timeout_seconds=0.03,
+        profile_supervisor=fake_profile_supervisor(process, connection),
     )
 
     async def scenario() -> None:
         workspace: Path | None = None
-        try:
-            async with profiles.materialize("profile") as active_workspace:
-                workspace = active_workspace
-                if exit_kind == "timeout":
-                    with pytest.raises(MonitorError, match="timed out"):
-                        await backend.fetch_dynamic(target(), profile=active_workspace)
-                else:
-                    task = asyncio.create_task(
-                        backend.fetch_dynamic(target(), profile=active_workspace)
-                    )
-                    assert await asyncio.to_thread(started.wait, 1)
-                    task.cancel()
-                    with pytest.raises(asyncio.CancelledError):
-                        await task
-        finally:
-            assert workspace is not None
-        assert workspace.exists()
-        release.set()
-        assert await asyncio.to_thread(finished.wait, 1)
-        for _ in range(100):
-            if not workspace.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert not workspace.exists()
-        async with profiles.materialize("profile") as restored:
-            assert (restored / "Cookies").read_bytes() == b"late-private-cookie"
+        async with profiles.materialize("profile") as active_workspace:
+            workspace = active_workspace
+            if exit_kind == "timeout":
+                with pytest.raises(MonitorError, match="timed out"):
+                    await backend.fetch_dynamic(target(), profile=active_workspace)
+            else:
+                task = asyncio.create_task(
+                    backend.fetch_dynamic(target(), profile=active_workspace)
+                )
+                while "start" not in events:
+                    await asyncio.sleep(0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        assert workspace is not None and not workspace.exists()
+        assert gate.acquire(blocking=False)
+        gate.release()
+        async with profiles.materialize("profile"):
+            pass
 
-    try:
-        asyncio.run(scenario())
-    finally:
-        release.set()
+    asyncio.run(scenario())
+
+    assert not process.is_alive()
+    assert events == [
+        "start",
+        "terminate",
+        "join",
+        "kill",
+        "join",
+        "process.close",
+        "connection.close",
+    ]
+
+
+def test_profiled_normal_response_uses_primitive_wire(tmp_path: Path) -> None:
+    events: list[str] = []
+    process = FakeProfileProcess(events, exits_on_join=True)
+    wire = backend_module._serialize_profile_response(FakeResponse())
+    connection = FakeProfileConnection(wire, events)
+    backend = make_test_backend(
+        profile_supervisor=fake_profile_supervisor(process, connection),
+    )
+
+    document = asyncio.run(backend.fetch_dynamic(target(), profile=tmp_path))
+
+    assert document.status == 200
+    assert document.body == b"<html><h1>ok</h1></html>"
+    assert document.strategy is FetchStrategy.DYNAMIC
+    assert events == [
+        "start",
+        "terminate",
+        "join",
+        "process.close",
+        "connection.close",
+    ]
+
+
+def test_profiled_response_still_terminates_hung_child_before_return(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    process = FakeProfileProcess(
+        events,
+        exits_on_join=False,
+        resists_terminate=True,
+    )
+    connection = FakeProfileConnection(
+        backend_module._serialize_profile_response(FakeResponse()),
+        events,
+    )
+    backend = make_test_backend(
+        profile_supervisor=fake_profile_supervisor(process, connection),
+    )
+
+    document = asyncio.run(backend.fetch_dynamic(target(), profile=tmp_path))
+
+    assert document.status == 200
+    assert not process.is_alive()
+    assert events == [
+        "start",
+        "terminate",
+        "join",
+        "kill",
+        "join",
+        "process.close",
+        "connection.close",
+    ]
+
+
+def test_profiled_start_failure_closes_process_connection_and_gate(tmp_path: Path) -> None:
+    events: list[str] = []
+    gate = threading.BoundedSemaphore(1)
+    process = FakeProfileProcess(
+        events,
+        exits_on_join=False,
+        raises_on_start=True,
+    )
+    connection = FakeProfileConnection(None, events)
+    backend = make_test_backend(
+        browser_gate=gate,
+        profile_supervisor=fake_profile_supervisor(process, connection),
+    )
+
+    with pytest.raises(MonitorError, match="fetch failed") as caught:
+        asyncio.run(backend.fetch_dynamic(target(), profile=tmp_path))
+
+    assert caught.value.error_class is ErrorClass.TRANSIENT_NETWORK
+    assert events == ["start", "process.close", "connection.close"]
+    assert gate.acquire(blocking=False)
+    gate.release()
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected_type", "expected_class"),
+    [
+        (("failure",), MonitorError, ErrorClass.TRANSIENT_NETWORK),
+        (
+            (
+                "response",
+                401,
+                "https://example.com/final",
+                (),
+                (("content-type", ("text/html",)),),
+                b"",
+            ),
+            FetchError,
+            ErrorClass.AUTHENTICATION,
+        ),
+    ],
+)
+def test_profiled_error_and_status_wires_are_reconstructed_safely(
+    tmp_path: Path,
+    wire: object,
+    expected_type: type[MonitorError],
+    expected_class: ErrorClass,
+) -> None:
+    events: list[str] = []
+    process = FakeProfileProcess(events, exits_on_join=True)
+    connection = FakeProfileConnection(wire, events)
+    backend = make_test_backend(
+        profile_supervisor=fake_profile_supervisor(process, connection),
+    )
+
+    with pytest.raises(expected_type) as caught:
+        asyncio.run(backend.fetch_dynamic(target(), profile=tmp_path))
+
+    assert caught.value.error_class is expected_class
+    assert not process.is_alive()
 
 
 @pytest.mark.parametrize(

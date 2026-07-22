@@ -442,3 +442,53 @@ def test_vault_is_sealed_after_construction(tmp_path: Path) -> None:
 
     with pytest.raises(AttributeError):
         vault._expected_uid = os.geteuid()  # type: ignore[misc]
+
+
+def test_cipher_symbol_replacement_before_construction_cannot_receive_key_or_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    CredentialVault, _, _ = vault_types()
+    import personal_monitor.security.vault as vault_module
+    from personal_monitor.security.encryption import AesGcmCipher as OriginalCipher
+
+    captured: list[bytes] = []
+
+    class CapturingCipher:
+        def __init__(self, key: bytes) -> None:
+            captured.append(bytes(key))
+            self._delegate = OriginalCipher(key)
+
+        def encrypt(self, value: bytes, aad: bytes):
+            captured.append(bytes(value))
+            return self._delegate.encrypt(value, aad)
+
+        def decrypt(self, blob, aad: bytes) -> bytes:
+            return self._delegate.decrypt(blob, aad)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(vault_module, "AesGcmCipher", CapturingCipher)
+        vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+        vault.put("profile", b"private-value")
+        assert vault.get("profile") == b"private-value"
+
+    vault.close()
+    assert captured == []
+
+
+def test_vault_accessor_symbol_replacement_before_construction_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    CredentialVault, _, _ = vault_types()
+    import personal_monitor.security.vault as vault_module
+
+    calls: list[str] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(vault_module, "_pin_vault", lambda *_args: calls.append("pin"))
+        patch.setattr(vault_module, "_acquire_vault", lambda *_args: calls.append("acquire"))
+        patch.setattr(vault_module, "_release_vault", lambda *_args: calls.append("release"))
+        vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+        vault.put("profile", b"private-value")
+        assert vault.get("profile") == b"private-value"
+
+    vault.close()
+    assert calls == []

@@ -53,6 +53,34 @@ def _private_vault_pins():
 _pin_vault, _acquire_vault, _release_vault = _private_vault_pins()
 
 
+def _exact_type_guard():
+    expected: list[type[object]] = []
+
+    def bind(value: type[object]) -> None:
+        if expected:
+            raise RuntimeError("credential vault type is already bound")
+        expected.append(value)
+
+    def matches(value: object) -> bool:
+        return len(expected) == 1 and type(value) is expected[0]
+
+    return bind, matches
+
+
+def _cipher_boundary(cipher_type: type[AesGcmCipher] = AesGcmCipher):
+    def construct(key: bytes) -> AesGcmCipher:
+        return cipher_type(key)
+
+    def matches(value: object) -> bool:
+        return type(value) is cipher_type
+
+    return construct, matches
+
+
+_bind_vault_type, _is_exact_vault = _exact_type_guard()
+_construct_cipher, _is_exact_cipher = _cipher_boundary()
+
+
 class VaultError(RuntimeError):
     """Fixed, redacted failure at the encrypted-record boundary."""
 
@@ -117,12 +145,18 @@ class CredentialVault:
         key: bytes | None = None,
         key_path: Path | None = None,
         expected_uid: int | None = None,
+        _is_original_type: Callable[[object], bool] = _is_exact_vault,
+        _new_cipher: Callable[[bytes], AesGcmCipher] = _construct_cipher,
+        _load_key: Callable[..., bytes] = load_master_key,
+        _pin: Callable[[object, tuple[object, ...]], None] = _pin_vault,
     ) -> None:
+        if not _is_original_type(self):
+            raise TypeError("credential vault subclasses are not allowed")
         if (key is None) == (key_path is None):
             raise ValueError("provide exactly one master key source")
         uid = os.geteuid() if expected_uid is None else expected_uid
-        cipher_key = load_master_key(key_path, expected_uid=uid) if key_path is not None else key
-        self._cipher = AesGcmCipher(cipher_key)  # type: ignore[arg-type]
+        cipher_key = _load_key(key_path, expected_uid=uid) if key_path is not None else key
+        self._cipher = _new_cipher(cipher_key)  # type: ignore[arg-type]
         self._expected_uid = uid
         self._root = Path(root)
         self._dir_fd = -1
@@ -149,7 +183,7 @@ class CredentialVault:
                 self._lock,
             )
             self._sealed = True
-            _pin_vault(self, self._composition)
+            _pin(self, self._composition)
         except VaultError:
             self.close()
             raise
@@ -170,8 +204,11 @@ class CredentialVault:
         _cipher, _dir_fd, _uid, identity, _lock = self._trusted_snapshot()
         return identity
 
-    def close(self) -> None:
-        pinned = _release_vault(self)
+    def close(
+        self,
+        _release: Callable[[object], tuple[object, ...] | None] = _release_vault,
+    ) -> None:
+        pinned = _release(self)
         fd = pinned[1] if pinned is not None else getattr(self, "_dir_fd", -1)
         if fd >= 0:
             os.close(fd)  # type: ignore[arg-type]
@@ -364,14 +401,16 @@ class CredentialVault:
     def _trusted_snapshot(
         self,
         _acquire: Callable[[object], tuple[object, ...]] = _acquire_vault,
+        _is_original_type: Callable[[object], bool] = _is_exact_vault,
+        _is_original_cipher: Callable[[object], bool] = _is_exact_cipher,
     ) -> tuple[AesGcmCipher, int, int, tuple[int, int], threading.RLock]:
         try:
             pinned = _acquire(self)
             cipher, directory_fd, uid, identity, lock = pinned
             metadata = os.fstat(directory_fd)
             valid = (
-                type(self) is CredentialVault
-                and type(cipher) is AesGcmCipher
+                _is_original_type(self)
+                and _is_original_cipher(cipher)
                 and type(directory_fd) is int
                 and type(uid) is int
                 and isinstance(identity, tuple)
@@ -391,6 +430,9 @@ class CredentialVault:
         if not valid:
             raise VaultError
         return cipher, directory_fd, uid, identity, lock  # type: ignore[return-value]
+
+
+_bind_vault_type(CredentialVault)
 
 
 def _record_name(logical_key: str) -> str:

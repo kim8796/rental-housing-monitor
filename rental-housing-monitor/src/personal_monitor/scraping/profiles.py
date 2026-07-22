@@ -32,7 +32,6 @@ _BOOTSTRAP_TIMEOUT_SECONDS = 900.0
 
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[tuple[tuple[int, int], str], threading.Lock] = {}
-_DEFERRED_FINALIZERS: set[asyncio.Task[None]] = set()
 
 BootstrapRunner = Callable[..., object]
 PageAction = Callable[[object], object]
@@ -44,6 +43,31 @@ ProfileStoreSnapshot = tuple[
     Path,
     tuple[int, int],
 ]
+
+
+def _exact_dependency_type(expected: type[object]):
+    def matches(value: object) -> bool:
+        return type(value) is expected
+
+    return matches
+
+
+def _profile_store_type_guard():
+    expected: list[type[object]] = []
+
+    def bind(value: type[object]) -> None:
+        if expected:
+            raise RuntimeError("browser profile store type is already bound")
+        expected.append(value)
+
+    def matches(value: object) -> bool:
+        return len(expected) == 1 and type(value) is expected[0]
+
+    return bind, matches
+
+
+_is_exact_credential_vault = _exact_dependency_type(CredentialVault)
+_bind_profile_store_type, _is_exact_profile_store = _profile_store_type_guard()
 
 
 def _private_profile_store_pins():
@@ -71,58 +95,6 @@ def _private_profile_store_pins():
 
 
 _pin_profile_store, _acquire_profile_store, _release_profile_store = _private_profile_store_pins()
-
-
-def _profile_lease_registry():
-    leases: dict[tuple[int, int], _PinnedWorkspace] = {}
-    lock = threading.RLock()
-
-    def register(workspace: _PinnedWorkspace) -> None:
-        with lock:
-            if workspace.identity in leases:
-                raise ProfileUnavailableError
-            leases[workspace.identity] = workspace
-
-    def attach(path: Path, worker: asyncio.Task[object]) -> None:
-        fd = -1
-        try:
-            fd = os.open(
-                path,
-                os.O_RDONLY
-                | os.O_CLOEXEC
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_DIRECTORY", 0),
-            )
-            metadata = os.fstat(fd)
-            identity = (metadata.st_dev, metadata.st_ino)
-        except Exception:
-            return
-        finally:
-            if fd >= 0:
-                os.close(fd)
-        with lock:
-            workspace = leases.get(identity)
-            if workspace is not None:
-                workspace.workers.add(worker)
-
-    def pending(workspace: _PinnedWorkspace) -> tuple[asyncio.Task[object], ...]:
-        with lock:
-            return tuple(worker for worker in workspace.workers if not worker.done())
-
-    def unregister(workspace: _PinnedWorkspace) -> None:
-        with lock:
-            if leases.get(workspace.identity) is workspace:
-                del leases[workspace.identity]
-
-    return register, attach, pending, unregister
-
-
-(
-    _register_profile_lease,
-    attach_profile_worker,
-    _pending_profile_workers,
-    _unregister_profile_lease,
-) = _profile_lease_registry()
 
 
 async def _acquire_lock_async(lock: threading.Lock) -> None:
@@ -158,8 +130,13 @@ class BrowserProfileStore:
         materialization_root: Path,
         require_memory_backed: bool = False,
         expected_uid: int | None = None,
+        _is_original_store: Callable[[object], bool] = _is_exact_profile_store,
+        _is_original_vault: Callable[[object], bool] = _is_exact_credential_vault,
+        _pin: Callable[[object, tuple[object, ...]], None] = _pin_profile_store,
     ) -> None:
-        if type(vault) is not CredentialVault:
+        if not _is_original_store(self):
+            raise TypeError("browser profile store subclasses are not allowed")
+        if not _is_original_vault(vault):
             raise TypeError("vault must be a CredentialVault")
         vault_identity = vault._lock_identity
         self._vault = vault
@@ -195,7 +172,7 @@ class BrowserProfileStore:
                 vault_identity,
             )
             self._sealed = True
-            _pin_profile_store(self, self._composition)
+            _pin(self, self._composition)
         except ProfileUnavailableError:
             self.close()
             raise
@@ -211,8 +188,11 @@ class BrowserProfileStore:
             raise AttributeError("browser profile store is sealed")
         object.__setattr__(self, name, value)
 
-    def close(self) -> None:
-        pinned = _release_profile_store(self)
+    def close(
+        self,
+        _release: Callable[[object], tuple[object, ...] | None] = _release_profile_store,
+    ) -> None:
+        pinned = _release(self)
         fd = pinned[2] if pinned is not None else getattr(self, "_root_fd", -1)
         if fd >= 0:
             os.close(fd)  # type: ignore[arg-type]
@@ -294,7 +274,6 @@ class BrowserProfileStore:
                 root_fd=root_fd,
                 expected_uid=expected_uid,
             )
-            _register_profile_lease(workspace)
             return workspace
         except BaseException as error:
             cleanup_error: BaseException | None = None
@@ -351,6 +330,8 @@ class BrowserProfileStore:
     def _trusted_snapshot(
         self,
         _acquire: Callable[[object], tuple[object, ...]] = _acquire_profile_store,
+        _is_original_store: Callable[[object], bool] = _is_exact_profile_store,
+        _is_original_vault: Callable[[object], bool] = _is_exact_credential_vault,
     ) -> ProfileStoreSnapshot:
         try:
             pinned = _acquire(self)
@@ -358,8 +339,8 @@ class BrowserProfileStore:
             vault_snapshot = vault._trusted_snapshot()
             metadata = os.fstat(root_fd)
             valid = (
-                type(self) is BrowserProfileStore
-                and type(vault) is CredentialVault
+                _is_original_store(self)
+                and _is_original_vault(vault)
                 and type(uid) is int
                 and type(root_fd) is int
                 and isinstance(root_identity, tuple)
@@ -391,8 +372,11 @@ class BrowserProfileStore:
         )
 
 
+_bind_profile_store_type(BrowserProfileStore)
+
+
 class _PinnedWorkspace:
-    __slots__ = ("expected_uid", "fd", "identity", "name", "path", "root_fd", "workers")
+    __slots__ = ("expected_uid", "fd", "identity", "name", "path", "root_fd")
 
     def __init__(
         self,
@@ -410,7 +394,6 @@ class _PinnedWorkspace:
         self.identity = identity
         self.root_fd = root_fd
         self.expected_uid = expected_uid
-        self.workers: set[asyncio.Task[object]] = set()
 
     def __repr__(self) -> str:
         return "<_PinnedWorkspace>"
@@ -471,23 +454,6 @@ class _MaterializedProfile:
         return self._exit_after_lock(exc)
 
     async def __aexit__(self, exc_type, exc, traceback) -> bool:
-        workspace = self._workspace
-        if workspace is not None:
-            pending = _pending_profile_workers(workspace)
-            if pending:
-                self._workspace = None
-                finalizer = asyncio.create_task(
-                    _finalize_after_workers(
-                        pending,
-                        vault=self._snapshot[0],
-                        profile=self._profile,
-                        workspace=workspace,
-                        profile_lock=self._lock,
-                    )
-                )
-                _DEFERRED_FINALIZERS.add(finalizer)
-                finalizer.add_done_callback(_finish_deferred_finalizer)
-                return False
         return self._exit_after_lock(exc)
 
     def _exit_after_lock(self, exc: BaseException | None) -> bool:
@@ -547,85 +513,6 @@ class _MaterializedProfile:
         return False
 
 
-async def _finalize_after_workers(
-    workers: tuple[asyncio.Task[object], ...],
-    *,
-    vault: CredentialVault,
-    profile: str,
-    workspace: _PinnedWorkspace,
-    profile_lock: threading.Lock,
-) -> None:
-    cancelled = False
-    for worker in workers:
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                cancelled = True
-            except BaseException:
-                break
-        if worker.done() and not worker.cancelled():
-            with suppress(BaseException):
-                worker.exception()
-    try:
-        await asyncio.to_thread(_finalize_deferred_workspace, vault, profile, workspace)
-    finally:
-        profile_lock.release()
-    if cancelled:
-        raise asyncio.CancelledError
-
-
-def _finalize_deferred_workspace(
-    vault: CredentialVault,
-    profile: str,
-    workspace: _PinnedWorkspace,
-) -> None:
-    persistence_error: BaseException | None = None
-    cleanup_error: BaseException | None = None
-    try:
-        archive = _encode_profile_archive_fd(
-            workspace.fd,
-            expected_uid=workspace.expected_uid,
-        )
-        vault.put(profile, archive)
-    except BaseException as error:
-        persistence_error = error
-    try:
-        _remove_workspace(workspace)
-    except BaseException as error:
-        cleanup_error = error
-    if persistence_error is not None and not isinstance(persistence_error, Exception):
-        if cleanup_error is not None:
-            persistence_error.add_note("browser profile cleanup failed")
-        raise persistence_error
-    if cleanup_error is not None and not isinstance(cleanup_error, Exception):
-        raise cleanup_error
-    if persistence_error is not None or cleanup_error is not None:
-        failure = ProfileUnavailableError()
-        if persistence_error is not None:
-            failure.add_note("browser profile persistence failed")
-        if cleanup_error is not None:
-            failure.add_note("browser profile cleanup failed")
-        raise failure
-
-
-def _finish_deferred_finalizer(task: asyncio.Task[None]) -> None:
-    _DEFERRED_FINALIZERS.discard(task)
-    if task.cancelled():
-        return
-    try:
-        error = task.exception()
-    except BaseException:
-        return
-    if error is not None:
-        task.get_loop().call_exception_handler(
-            {
-                "message": "browser profile deferred cleanup failed",
-                "exception": ProfileUnavailableError(),
-            }
-        )
-
-
 def bootstrap_profile(
     store: BrowserProfileStore,
     profile_id: str,
@@ -635,10 +522,11 @@ def bootstrap_profile(
     egress_proxy_url: str,
     page_action: PageAction,
     operator_timeout_seconds: float = _BOOTSTRAP_TIMEOUT_SECONDS,
+    _is_original_store: Callable[[object], bool] = _is_exact_profile_store,
 ) -> None:
     """Run one real headful Scrapling session and archive it only on success."""
 
-    if type(store) is not BrowserProfileStore or not isinstance(target, ResolvedTarget):
+    if not _is_original_store(store) or not isinstance(target, ResolvedTarget):
         raise ProfileUnavailableError
     profile = validate_logical_key(profile_id)
     if (
@@ -1176,7 +1064,6 @@ def _remove_workspace(workspace: _PinnedWorkspace) -> None:
     except BaseException as error:
         cleanup_error = error
     finally:
-        _unregister_profile_lease(workspace)
         os.close(workspace.fd)
         workspace.fd = -1
     if cleanup_error is not None:

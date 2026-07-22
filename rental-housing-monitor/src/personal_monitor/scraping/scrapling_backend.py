@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import multiprocessing
+import os
 import re
+import signal
 import threading
+import weakref
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -17,9 +21,8 @@ from scrapling.core.utils import reset_logger, set_logger
 from scrapling.fetchers import DynamicFetcher, Fetcher, StealthyFetcher
 
 from personal_monitor.domain.spec import FetchStrategy
-from personal_monitor.engine.errors import ErrorClass, FetchError, MonitorError
+from personal_monitor.engine.errors import ErrorClass, FailureCode, FetchError, MonitorError
 from personal_monitor.scraping.document import SourceDocument
-from personal_monitor.scraping.profiles import attach_profile_worker
 from personal_monitor.security.egress import (
     HTTP_EGRESS_GATE,
     EgressProxyIdentity,
@@ -40,6 +43,8 @@ BROWSER_CONCURRENCY = 1
 HTTP_TIMEOUT_SECONDS = 30.0
 BROWSER_TIMEOUT_SECONDS = 90.0
 GATE_POLL_SECONDS = 0.01
+PROFILE_PROCESS_POLL_SECONDS = 0.005
+PROFILE_PROCESS_JOIN_SECONDS = 0.25
 NAVIGATION_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 _RETAINED_HEADERS = frozenset({"content-type", "location", "retry-after"})
@@ -69,6 +74,379 @@ _QUIET_LOGGER.handlers.clear()
 _QUIET_LOGGER.addHandler(logging.NullHandler())
 _QUIET_LOGGER.propagate = False
 _QUIET_LOGGER.setLevel(logging.CRITICAL + 1)
+
+
+def _private_supervisor_pins():
+    pins: weakref.WeakKeyDictionary[object, object] = weakref.WeakKeyDictionary()
+    lock = threading.RLock()
+
+    def bind(owner: object, factory: object) -> None:
+        with lock:
+            if owner in pins:
+                raise RuntimeError("profiled browser supervisor is already bound")
+            pins[owner] = factory
+
+    def acquire(owner: object) -> object | None:
+        with lock:
+            return pins.get(owner)
+
+    return bind, acquire
+
+
+def _private_backend_supervisors():
+    pins: weakref.WeakKeyDictionary[object, object] = weakref.WeakKeyDictionary()
+    lock = threading.RLock()
+
+    def bind(owner: object, supervisor: object) -> None:
+        with lock:
+            if owner in pins:
+                raise RuntimeError("backend supervisor is already bound")
+            pins[owner] = supervisor
+
+    def matches(owner: object, supervisor: object) -> bool:
+        with lock:
+            return pins.get(owner) is supervisor
+
+    return bind, matches
+
+
+def _supervisor_type_guard():
+    expected: list[type[object]] = []
+
+    def bind(value: type[object]) -> None:
+        if expected:
+            raise RuntimeError("profiled browser supervisor type is already bound")
+        expected.append(value)
+
+    def matches(value: object) -> bool:
+        return len(expected) == 1 and type(value) is expected[0]
+
+    return bind, matches
+
+
+_pin_supervisor, _acquire_supervisor = _private_supervisor_pins()
+_pin_backend_supervisor, _matches_backend_supervisor = _private_backend_supervisors()
+_bind_supervisor_type, _is_exact_supervisor = _supervisor_type_guard()
+
+
+class _WireHistoryItem:
+    __slots__ = ("url",)
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+
+class _WireHeaders(dict[str, str]):
+    __slots__ = ("_values",)
+
+    def __init__(self, values: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
+        self._values = dict(values)
+        super().__init__((name, items[0]) for name, items in values if len(items) == 1)
+
+    def get_list(self, name: str) -> list[str]:
+        return list(self._values.get(name.casefold(), ()))
+
+
+class _WireResponse:
+    __slots__ = ("body", "headers", "history", "status", "url")
+
+    def __init__(
+        self,
+        status: object,
+        url: object,
+        history: object,
+        headers: object,
+        body: object,
+    ) -> None:
+        self.status = status
+        self.url = url
+        self.history = (
+            tuple(_WireHistoryItem(item) for item in history)
+            if isinstance(history, tuple) and all(isinstance(item, str) for item in history)
+            else history
+        )
+        self.headers = _WireHeaders(headers) if isinstance(headers, tuple) else headers
+        self.body = body
+
+
+def _serialize_profile_response(response: object) -> tuple[object, ...]:
+    status = _read_status(response)
+    final_url = _read_final_url(response)
+    redirects = _read_redirect_urls(response)
+    _headers, header_values = _copy_safe_headers(response)
+    body = _read_body(response)
+    return (
+        "response",
+        status,
+        final_url,
+        redirects,
+        tuple(sorted(header_values.items())),
+        body,
+    )
+
+
+def _profiled_browser_child(
+    strategy_value: str,
+    url: str,
+    kwargs: dict[str, object],
+    sender: object,
+) -> None:
+    try:
+        if hasattr(os, "setsid"):
+            os.setsid()
+        from scrapling.fetchers import DynamicFetcher as ChildDynamicFetcher
+        from scrapling.fetchers import StealthyFetcher as ChildStealthyFetcher
+
+        fetcher = (
+            ChildDynamicFetcher.fetch
+            if strategy_value == FetchStrategy.DYNAMIC.value
+            else ChildStealthyFetcher.fetch
+        )
+        response = _invoke_quietly(fetcher, url, kwargs)
+        wire: tuple[object, ...] = _serialize_profile_response(response)
+    except MonitorError as error:
+        wire = (
+            "monitor_error",
+            error.error_class.value,
+            error.stage,
+            error.safe_detail,
+            error.code.value if error.code is not None else None,
+        )
+    except BaseException:
+        wire = ("failure",)
+    try:
+        sender.send(wire)  # type: ignore[attr-defined]
+    except BaseException:
+        pass
+    finally:
+        with suppress(BaseException):
+            sender.close()  # type: ignore[attr-defined]
+
+
+class _ProfileProcessBoundary:
+    __slots__ = ("_process",)
+
+    def __init__(self, process: object) -> None:
+        self._process = process
+
+    @property
+    def pid(self) -> object:
+        return self._process.pid  # type: ignore[attr-defined]
+
+    def start(self) -> None:
+        self._process.start()  # type: ignore[attr-defined]
+
+    def is_alive(self) -> bool:
+        if self._process.is_alive():  # type: ignore[attr-defined]
+            return True
+        pid = self.pid
+        if isinstance(pid, int) and hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            else:
+                return True
+        return False
+
+    def terminate(self) -> None:
+        self._signal_group(signal.SIGTERM, self._process.terminate)  # type: ignore[attr-defined]
+
+    def kill(self) -> None:
+        self._signal_group(signal.SIGKILL, self._process.kill)  # type: ignore[attr-defined]
+
+    def join(self, timeout: float | None = None) -> None:
+        self._process.join(timeout)  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self._process.close()  # type: ignore[attr-defined]
+
+    def _signal_group(
+        self,
+        sent_signal: signal.Signals,
+        fallback: Callable[[], None],
+    ) -> None:
+        pid = self.pid
+        if isinstance(pid, int) and hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, sent_signal)
+                return
+            except ProcessLookupError:
+                pass
+        fallback()
+
+
+def _production_profile_session(
+    strategy: FetchStrategy,
+    url: str,
+    kwargs: dict[str, object],
+) -> tuple[object, object, object]:
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_profiled_browser_child,
+        args=(strategy.value, url, kwargs, sender),
+        daemon=False,
+    )
+    return _ProfileProcessBoundary(process), receiver, sender
+
+
+class _ProfiledBrowserSupervisor:
+    __slots__ = ("_factory", "_sealed", "__weakref__")
+
+    def __init__(
+        self,
+        factory: Callable[..., tuple[object, ...]],
+        _is_original_type: Callable[[object], bool] = _is_exact_supervisor,
+        _pin: Callable[[object, object], None] = _pin_supervisor,
+    ) -> None:
+        if not _is_original_type(self):
+            raise TypeError("profiled browser supervisor subclasses are not allowed")
+        if not callable(factory):
+            raise TypeError("profiled browser process factory must be callable")
+        self._factory = factory
+        self._sealed = True
+        _pin(self, factory)
+
+    @classmethod
+    def _for_test(cls, factory: Callable[..., tuple[object, ...]]):
+        return cls(factory)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("profiled browser supervisor is sealed")
+        object.__setattr__(self, name, value)
+
+    def _trusted_factory(
+        self,
+        _acquire: Callable[[object], object | None] = _acquire_supervisor,
+        _is_original_type: Callable[[object], bool] = _is_exact_supervisor,
+    ) -> Callable[..., tuple[object, ...]]:
+        factory = _acquire(self)
+        if (
+            not _is_original_type(self)
+            or factory is None
+            or self._factory is not factory
+            or not callable(factory)
+        ):
+            raise MonitorError(
+                ErrorClass.POLICY,
+                "fetch",
+                "profiled browser supervisor integrity check failed",
+            )
+        return factory
+
+    async def fetch(
+        self,
+        *,
+        strategy: FetchStrategy,
+        url: str,
+        kwargs: dict[str, object],
+        gate: threading.BoundedSemaphore,
+        timeout_seconds: float,
+    ) -> tuple[object, ...]:
+        factory = self._trusted_factory()
+        process: object | None = None
+        receiver: object | None = None
+        sender: object | None = None
+        gate_acquired = False
+        process_started = False
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await _acquire_gate(gate)
+                gate_acquired = True
+                session = factory(strategy, url, dict(kwargs))
+                if not isinstance(session, tuple) or len(session) not in {2, 3}:
+                    raise RuntimeError
+                process, receiver = session[:2]
+                sender = session[2] if len(session) == 3 else None
+                process.start()  # type: ignore[attr-defined]
+                process_started = True
+                if sender is not None:
+                    sender.close()  # type: ignore[attr-defined]
+                    sender = None
+                while True:
+                    if receiver.poll():  # type: ignore[attr-defined]
+                        wire = receiver.recv()  # type: ignore[attr-defined]
+                        if not isinstance(wire, tuple):
+                            raise RuntimeError
+                        _stop_profile_process(process, force=True)
+                        process = None
+                        return wire
+                    if not process.is_alive():  # type: ignore[attr-defined]
+                        raise RuntimeError
+                    await asyncio.sleep(PROFILE_PROCESS_POLL_SECONDS)
+        except asyncio.CancelledError as error:
+            if process_started and process is not None:
+                try:
+                    _stop_profile_process(process, force=True)
+                    process = None
+                except Exception:
+                    error.add_note("profiled browser cleanup failed")
+            raise
+        except TimeoutError:
+            if process_started and process is not None:
+                try:
+                    _stop_profile_process(process, force=True)
+                    process = None
+                except Exception:
+                    raise _profile_process_cleanup_error() from None
+            raise MonitorError(
+                ErrorClass.TRANSIENT_NETWORK,
+                "fetch",
+                "fetch timed out",
+            ) from None
+        except MonitorError:
+            raise
+        except Exception:
+            if process is not None:
+                try:
+                    if process_started or process.is_alive():  # type: ignore[attr-defined]
+                        _stop_profile_process(process, force=True)
+                    else:
+                        process.close()  # type: ignore[attr-defined]
+                    process = None
+                except Exception:
+                    raise _profile_process_cleanup_error() from None
+            raise MonitorError(ErrorClass.TRANSIENT_NETWORK, "fetch", "fetch failed") from None
+        finally:
+            if sender is not None:
+                with suppress(BaseException):
+                    sender.close()  # type: ignore[attr-defined]
+            if receiver is not None:
+                with suppress(BaseException):
+                    receiver.close()  # type: ignore[attr-defined]
+            if gate_acquired:
+                gate.release()
+
+
+_bind_supervisor_type(_ProfiledBrowserSupervisor)
+_DEFAULT_PROFILE_SUPERVISOR = _ProfiledBrowserSupervisor(_production_profile_session)
+
+
+def _stop_profile_process(process: object, *, force: bool) -> None:
+    try:
+        if force and process.is_alive():  # type: ignore[attr-defined]
+            process.terminate()  # type: ignore[attr-defined]
+        process.join(PROFILE_PROCESS_JOIN_SECONDS)  # type: ignore[attr-defined]
+        if process.is_alive():  # type: ignore[attr-defined]
+            process.kill()  # type: ignore[attr-defined]
+            process.join(PROFILE_PROCESS_JOIN_SECONDS)  # type: ignore[attr-defined]
+        if process.is_alive():  # type: ignore[attr-defined]
+            raise RuntimeError
+        process.close()  # type: ignore[attr-defined]
+    except Exception:
+        raise _profile_process_cleanup_error() from None
+
+
+def _profile_process_cleanup_error() -> MonitorError:
+    return MonitorError(
+        ErrorClass.INTERNAL,
+        "fetch",
+        "profiled browser cleanup failed",
+    )
 
 
 class _BodyLimitExceeded(RuntimeError):
@@ -171,6 +549,7 @@ class ScraplingBackend:
     _block_page_detector: BlockPageDetector | None = field(repr=False)
     _clock: Clock = field(repr=False)
     _background_calls: set[asyncio.Task[object]] = field(repr=False)
+    _profile_supervisor: _ProfiledBrowserSupervisor = field(repr=False)
 
     def __init__(
         self,
@@ -180,6 +559,7 @@ class ScraplingBackend:
         browser_timeout_seconds: float = BROWSER_TIMEOUT_SECONDS,
         block_page_detector: BlockPageDetector | None = None,
         clock: Clock = lambda: datetime.now(UTC),
+        profile_supervisor: _ProfiledBrowserSupervisor = _DEFAULT_PROFILE_SUPERVISOR,
     ) -> None:
         self._initialize(
             EgressProxyPolicy.from_url(egress_proxy_url),
@@ -187,6 +567,7 @@ class ScraplingBackend:
             browser_timeout_seconds=browser_timeout_seconds,
             block_page_detector=block_page_detector,
             clock=clock,
+            profile_supervisor=profile_supervisor,
         )
 
     @classmethod
@@ -195,6 +576,7 @@ class ScraplingBackend:
         policy: EgressProxyPolicy,
         *,
         clock: Clock,
+        profile_supervisor: _ProfiledBrowserSupervisor = _DEFAULT_PROFILE_SUPERVISOR,
     ) -> ScraplingBackend:
         instance = cls.__new__(cls)
         instance._initialize(
@@ -203,6 +585,7 @@ class ScraplingBackend:
             browser_timeout_seconds=BROWSER_TIMEOUT_SECONDS,
             block_page_detector=None,
             clock=clock,
+            profile_supervisor=profile_supervisor,
         )
         return instance
 
@@ -214,7 +597,13 @@ class ScraplingBackend:
         browser_timeout_seconds: float,
         block_page_detector: BlockPageDetector | None,
         clock: Clock,
+        profile_supervisor: _ProfiledBrowserSupervisor,
+        _pin_supervisor: Callable[[object, object], None] = _pin_backend_supervisor,
+        _is_original_supervisor: Callable[[object], bool] = _is_exact_supervisor,
     ) -> None:
+        if not _is_original_supervisor(profile_supervisor):
+            raise TypeError("profiled browser supervisor is invalid")
+        profile_supervisor._trusted_factory()
         object.__setattr__(self, "_egress_policy", policy)
         object.__setattr__(self, "_http_fetcher", _DEFAULT_HTTP_FETCHER)
         object.__setattr__(self, "_dynamic_fetcher", _DEFAULT_DYNAMIC_FETCHER)
@@ -242,6 +631,8 @@ class ScraplingBackend:
         object.__setattr__(self, "_block_page_detector", block_page_detector)
         object.__setattr__(self, "_clock", clock)
         object.__setattr__(self, "_background_calls", set())
+        object.__setattr__(self, "_profile_supervisor", profile_supervisor)
+        _pin_supervisor(self, profile_supervisor)
         _bind_egress_snapshot(self, policy)
 
     @property
@@ -267,7 +658,23 @@ class ScraplingBackend:
             and self._stealthy_fetcher is _DEFAULT_STEALTHY_FETCHER
             and self._http_gate is HTTP_EGRESS_GATE
             and self._browser_gate is _BROWSER_GATE
+            and self._has_pinned_profile_supervisor()
         )
+
+    def _has_pinned_profile_supervisor(
+        self,
+        _matches: Callable[[object, object], bool] = _matches_backend_supervisor,
+        _is_original_supervisor: Callable[[object], bool] = _is_exact_supervisor,
+    ) -> bool:
+        try:
+            supervisor = self._profile_supervisor
+            return (
+                _is_original_supervisor(supervisor)
+                and _matches(self, supervisor)
+                and supervisor._trusted_factory() is not None
+            )
+        except Exception:
+            return False
 
     @property
     def proxy_identity(self) -> EgressProxyIdentity:
@@ -359,6 +766,21 @@ class ScraplingBackend:
             kwargs.update(solve_cloudflare=False, block_webrtc=True)
         else:
             kwargs["extra_flags"] = list(_DYNAMIC_WEBRTC_FLAGS)
+        if profile is not None:
+            wire = await self._profile_supervisor.fetch(
+                strategy=strategy,
+                url=target.normalized_url,
+                kwargs=kwargs,
+                gate=self._browser_gate,
+                timeout_seconds=self._browser_timeout_seconds,
+            )
+            response = _profile_wire_response(wire)
+            return normalize_response(
+                response,
+                strategy=strategy,
+                block_page_detector=self._block_page_detector,
+                clock=self._clock,
+            )
         return await self._fetch(
             target,
             strategy=strategy,
@@ -366,7 +788,6 @@ class ScraplingBackend:
             gate=self._browser_gate,
             outer_timeout_seconds=self._browser_timeout_seconds,
             kwargs=kwargs,
-            profile_lease=profile,
         )
 
     async def _fetch(
@@ -379,7 +800,6 @@ class ScraplingBackend:
         outer_timeout_seconds: float,
         kwargs: dict[str, object],
         body_collector: _BoundedBodyCollector | None = None,
-        profile_lease: Path | None = None,
     ) -> SourceDocument:
         if not isinstance(target, ResolvedTarget):
             raise TypeError("target must be an approved ResolvedTarget")
@@ -395,8 +815,6 @@ class ScraplingBackend:
         )
         self._background_calls.add(worker)
         worker.add_done_callback(self._discard_background_call)
-        if profile_lease is not None:
-            attach_profile_worker(profile_lease, worker)
         try:
             async with asyncio.timeout(outer_timeout_seconds):
                 response = await asyncio.shield(worker)
@@ -479,6 +897,28 @@ def _invoke_quietly(
         return fetcher(url, **kwargs)
     finally:
         reset_logger(token)
+
+
+def _profile_wire_response(wire: tuple[object, ...]) -> _WireResponse:
+    if len(wire) == 6 and wire[0] == "response":
+        return _WireResponse(wire[1], wire[2], wire[3], wire[4], wire[5])
+    if len(wire) == 5 and wire[0] == "monitor_error":
+        try:
+            error_class = ErrorClass(wire[1])
+            stage = wire[2]
+            detail = wire[3]
+            raw_code = wire[4]
+            code = FailureCode(raw_code) if raw_code is not None else None
+            if not isinstance(stage, str) or not isinstance(detail, str):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise MonitorError(
+                ErrorClass.TRANSIENT_NETWORK,
+                "fetch",
+                "fetch failed",
+            ) from None
+        raise MonitorError(error_class, stage, detail, code=code)
+    raise MonitorError(ErrorClass.TRANSIENT_NETWORK, "fetch", "fetch failed")
 
 
 def _bounded_timeout(value: float, *, maximum: float, label: str) -> float:

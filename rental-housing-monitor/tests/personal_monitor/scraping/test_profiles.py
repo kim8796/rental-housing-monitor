@@ -698,14 +698,11 @@ def test_bootstrap_failure_never_archives_or_leaves_plaintext(tmp_path: Path) ->
 
 
 def test_profile_store_rejects_vault_subclasses(tmp_path: Path) -> None:
-    BrowserProfileStore, _, _ = profile_types()
-
     class VaultSubclass(CredentialVault):
         pass
 
-    vault = VaultSubclass(tmp_path / "vault", key=b"k" * 32)
     with pytest.raises(TypeError):
-        BrowserProfileStore(vault, materialization_root=tmp_path / "workspaces")
+        VaultSubclass(tmp_path / "vault", key=b"k" * 32)
 
 
 def test_profile_store_rejects_low_level_vault_swap_before_archive_dispatch(
@@ -759,8 +756,7 @@ def test_bootstrap_rejects_profile_store_subclasses_before_runner_dispatch(
     class StoreSubclass(BrowserProfileStore):
         pass
 
-    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
-    store = StoreSubclass(vault, materialization_root=tmp_path / "workspaces")
+    store = object.__new__(StoreSubclass)
     target = ResolvedTarget(
         normalized_url="https://example.com/login",
         hostname="example.com",
@@ -787,3 +783,87 @@ def test_profile_store_is_sealed_after_construction(tmp_path: Path) -> None:
 
     with pytest.raises(AttributeError):
         store._vault = vault  # type: ignore[misc]
+
+
+def test_vault_symbol_replacement_before_store_construction_cannot_receive_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    BrowserProfileStore, _, _ = profile_types()
+    import personal_monitor.scraping.profiles as profiles_module
+
+    captured: list[bytes] = []
+
+    class CapturingVault:
+        _lock_identity = (123, 456)
+
+        def _trusted_snapshot(self):
+            return object(), -1, os.geteuid(), self._lock_identity, threading.RLock()
+
+        def put(self, _key: str, value: bytes) -> None:
+            captured.append(value)
+
+    source = tmp_path / "source"
+    source.mkdir(mode=0o700)
+    (source / "Cookies").write_bytes(b"private-cookie")
+    rejected = False
+    with monkeypatch.context() as patch:
+        patch.setattr(profiles_module, "CredentialVault", CapturingVault)
+        try:
+            store = BrowserProfileStore(
+                CapturingVault(),
+                materialization_root=tmp_path / "workspaces",
+            )
+            store.archive("profile", source)
+        except TypeError:
+            rejected = True
+
+    assert rejected
+    assert captured == []
+
+
+def test_store_symbol_replacement_before_subclass_construction_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    BrowserProfileStore, _, _ = profile_types()
+
+    class StoreSubclass(BrowserProfileStore):
+        pass
+
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    import personal_monitor.scraping.profiles as profiles_module
+
+    with monkeypatch.context() as patch:
+        patch.setattr(profiles_module, "BrowserProfileStore", StoreSubclass)
+        with pytest.raises(TypeError):
+            StoreSubclass(vault, materialization_root=tmp_path / "workspaces")
+
+
+def test_profile_accessor_symbol_replacement_before_construction_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    BrowserProfileStore, _, _ = profile_types()
+    import personal_monitor.scraping.profiles as profiles_module
+
+    source = tmp_path / "source"
+    source.mkdir(mode=0o700)
+    (source / "Cookies").write_bytes(b"private-cookie")
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    calls: list[str] = []
+
+    with monkeypatch.context() as patch:
+        patch.setattr(profiles_module, "_pin_profile_store", lambda *_args: calls.append("pin"))
+        patch.setattr(
+            profiles_module,
+            "_acquire_profile_store",
+            lambda *_args: calls.append("acquire"),
+        )
+        patch.setattr(
+            profiles_module,
+            "_release_profile_store",
+            lambda *_args: calls.append("release"),
+        )
+        store = BrowserProfileStore(vault, materialization_root=tmp_path / "workspaces")
+        store.archive("profile", source)
+
+    store.close()
+    assert calls == []
