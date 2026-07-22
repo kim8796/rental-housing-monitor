@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -32,6 +33,8 @@ class Maintenance:
             snapshot_columns = self._table_columns("diagnostic_snapshots")
             if snapshot_columns:
                 self._delete_old_diagnostic_snapshots(snapshot_columns, cutoffs)
+            if self._table_columns("adaptive_features"):
+                self._delete_old_adaptive_features(cutoffs.now)
             self._delete_old_disabled_monitors(cutoffs.disabled_monitors)
         self.connection.execute("PRAGMA optimize")
 
@@ -99,6 +102,25 @@ class Maintenance:
         self.connection.execute(
             "DELETE FROM diagnostic_snapshots WHERE created_at < ?", (cutoffs.snapshots,)
         )
+
+    def _delete_old_adaptive_features(self, now: str) -> None:
+        self.connection.execute("DELETE FROM adaptive_features WHERE expires_at <= ?", (now,))
+        namespace_hashes = [
+            hashlib.sha256(
+                f"{row['owner_id']}\0{row['monitor_id']}\0{row['version_id']}".encode()
+            ).hexdigest()
+            for row in self.connection.execute(
+                "SELECT m.owner_id, m.id AS monitor_id, v.id AS version_id "
+                "FROM monitors AS m JOIN monitor_versions AS v ON v.monitor_id = m.id "
+                "WHERE m.status = 'disabled'"
+            )
+        ]
+        if namespace_hashes:
+            placeholders = _placeholders(namespace_hashes)
+            self.connection.execute(
+                f"DELETE FROM adaptive_features WHERE namespace_hash IN ({placeholders})",
+                namespace_hashes,
+            )
 
     def _table_columns(self, name: str) -> frozenset[str]:
         if (

@@ -202,6 +202,22 @@ class RegistryRepository:
             spec=MonitorSpec.model_validate_json(row["spec_json"]),
         )
 
+    def get_active_monitor_for_recovery(self, monitor_id: str, *, owner_id: str) -> ActiveMonitor:
+        row = self.connection.execute(
+            "SELECT m.id, m.owner_id, v.id AS version_id, v.spec_json "
+            "FROM monitors AS m JOIN monitor_versions AS v ON v.id = m.active_version_id "
+            "WHERE m.id = ? AND m.owner_id = ? AND m.status = ?",
+            (monitor_id, owner_id, MonitorStatus.ACTIVE.value),
+        ).fetchone()
+        if row is None:
+            raise ValueError("monitor is not eligible for adaptive recovery")
+        return ActiveMonitor(
+            id=row["id"],
+            owner_id=row["owner_id"],
+            version_id=row["version_id"],
+            spec=MonitorSpec.model_validate_json(row["spec_json"]),
+        )
+
     def get_primary_target(self, owner_id: str) -> DeliveryTargetRow:
         row = self.connection.execute(
             "SELECT id, owner_id, kind, address FROM delivery_targets "

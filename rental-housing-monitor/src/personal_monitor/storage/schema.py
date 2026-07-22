@@ -81,7 +81,17 @@ CREATE TABLE diagnostic_snapshots(
 CREATE INDEX diagnostic_snapshots_expiry_idx ON diagnostic_snapshots(expires_at);
 """
 
-_MIGRATIONS = ((1, _MIGRATION_1), (2, _MIGRATION_2))
+_MIGRATION_3 = """
+CREATE TABLE adaptive_features(
+  key_hash TEXT PRIMARY KEY, namespace_hash TEXT NOT NULL,
+  nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
+CREATE INDEX adaptive_features_namespace_idx ON adaptive_features(namespace_hash);
+CREATE INDEX adaptive_features_expiry_idx ON adaptive_features(expires_at);
+"""
+
+_MIGRATIONS = ((1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3))
 
 
 def open_database(path: str | Path) -> sqlite3.Connection:
@@ -128,14 +138,11 @@ def _validate_existing_schema(connection: sqlite3.Connection) -> None:
     ).fetchone()
     if has_migrations is None:
         raise RuntimeError("database is not initialized")
-    applied = {
-        row["version"] for row in connection.execute("SELECT version FROM schema_migrations")
-    }
+    applied = _validated_migration_history(connection)
     supported = _MIGRATIONS[-1][0]
-    if any(version > supported for version in applied):
-        raise RuntimeError("database migration is newer than supported by this binary")
-    if supported not in applied:
+    if not applied or applied[-1] != supported:
         raise RuntimeError("database schema is incomplete")
+    _validate_schema_integrity(connection, supported)
 
 
 def _apply_migrations(connection: sqlite3.Connection) -> None:
@@ -144,13 +151,8 @@ def _apply_migrations(connection: sqlite3.Connection) -> None:
             "CREATE TABLE IF NOT EXISTS schema_migrations("
             "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
-        applied = {
-            row["version"] if isinstance(row, sqlite3.Row) else row[0]
-            for row in connection.execute("SELECT version FROM schema_migrations")
-        }
-        supported = _MIGRATIONS[-1][0]
-        if any(version > supported for version in applied):
-            raise RuntimeError("database migration is newer than supported by this binary")
+        applied = _validated_migration_history(connection)
+        _validate_schema_integrity(connection, applied[-1] if applied else 0)
         for version, script in _MIGRATIONS:
             if version in applied:
                 continue
@@ -160,6 +162,106 @@ def _apply_migrations(connection: sqlite3.Connection) -> None:
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (version, utc_now().isoformat()),
             )
+            _validate_schema_integrity(connection, version)
+
+
+def _validated_migration_history(connection: sqlite3.Connection) -> list[int]:
+    try:
+        rows = connection.execute(
+            "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    except sqlite3.Error:
+        raise RuntimeError("database migration history is invalid") from None
+    supported = _MIGRATIONS[-1][0]
+    versions: list[int] = []
+    for row in rows:
+        version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
+        applied_at = row["applied_at"] if isinstance(row, sqlite3.Row) else row[1]
+        if type(version) is not int:
+            raise RuntimeError("database migration history is invalid")
+        if version > supported:
+            raise RuntimeError("database migration is newer than supported by this binary")
+        if not isinstance(applied_at, str):
+            raise RuntimeError("database migration history is invalid")
+        try:
+            parsed = datetime.fromisoformat(applied_at)
+        except ValueError:
+            raise RuntimeError("database migration history is invalid") from None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise RuntimeError("database migration history is invalid")
+        versions.append(version)
+    known_prefix = [version for version, _ in _MIGRATIONS[: len(versions)]]
+    if versions != known_prefix:
+        raise RuntimeError("database migration history is invalid")
+    return versions
+
+
+def _validate_schema_integrity(connection: sqlite3.Connection, version: int) -> None:
+    if _schema_snapshot(connection) != _expected_schema_snapshot(version):
+        raise RuntimeError("database schema integrity check failed")
+
+
+def _expected_schema_snapshot(version: int) -> tuple[object, ...]:
+    expected = sqlite3.connect(":memory:", isolation_level=None)
+    expected.row_factory = sqlite3.Row
+    expected.execute("PRAGMA foreign_keys = ON")
+    try:
+        expected.execute(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        for migration_version, script in _MIGRATIONS:
+            if migration_version > version:
+                break
+            for statement in _statements(script):
+                expected.execute(statement)
+        return _schema_snapshot(expected)
+    finally:
+        expected.close()
+
+
+def _schema_snapshot(connection: sqlite3.Connection) -> tuple[object, ...]:
+    objects = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    object_rows = tuple(tuple(row) for row in objects)
+    table_names = [
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in objects
+        if (row["type"] if isinstance(row, sqlite3.Row) else row[0]) == "table"
+    ]
+    tables: list[object] = []
+    for table_name in table_names:
+        quoted_table = _quoted_identifier(table_name)
+        columns = tuple(
+            tuple(row) for row in connection.execute(f"PRAGMA table_xinfo({quoted_table})")
+        )
+        foreign_keys = tuple(
+            tuple(row) for row in connection.execute(f"PRAGMA foreign_key_list({quoted_table})")
+        )
+        index_rows = connection.execute(f"PRAGMA index_list({quoted_table})").fetchall()
+        indexes: list[object] = []
+        for index_row in index_rows:
+            index_name = index_row["name"] if isinstance(index_row, sqlite3.Row) else index_row[1]
+            indexes.append(
+                (
+                    tuple(index_row),
+                    tuple(
+                        tuple(row)
+                        for row in connection.execute(
+                            f"PRAGMA index_xinfo({_quoted_identifier(index_name)})"
+                        )
+                    ),
+                )
+            )
+        tables.append(
+            (table_name, columns, foreign_keys, tuple(sorted(indexes, key=lambda item: item[0][1])))
+        )
+    return object_rows, tuple(tables)
+
+
+def _quoted_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _statements(script: str) -> Iterator[str]:

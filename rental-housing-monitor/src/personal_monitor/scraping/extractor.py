@@ -49,7 +49,7 @@ class DeclarativeExtractor:
         from scrapling import Selector
 
         try:
-            page = Selector(document.body, url=document.final_url, adaptive=True)
+            page = Selector(document.body, url=document.final_url, adaptive=False)
             roots = _select(page, spec.item_scope, scoped=False)
         except Exception:
             raise _structure_error("item selector failed") from None

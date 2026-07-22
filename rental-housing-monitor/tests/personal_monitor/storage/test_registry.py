@@ -59,7 +59,7 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
     assert second.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert second.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     versions = second.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in versions] == [1, 2]
+    assert [row["version"] for row in versions] == [1, 2, 3]
     columns = {
         row["name"]: row for row in second.execute("PRAGMA table_info(diagnostic_snapshots)")
     }
@@ -71,6 +71,27 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
     )
     indexes = {row["name"] for row in second.execute("PRAGMA index_list(diagnostic_snapshots)")}
     assert "diagnostic_snapshots_expiry_idx" in indexes
+    adaptive_columns = {
+        row["name"]: row for row in second.execute("PRAGMA table_info(adaptive_features)")
+    }
+    assert set(adaptive_columns) == {
+        "key_hash",
+        "namespace_hash",
+        "nonce",
+        "ciphertext",
+        "created_at",
+        "updated_at",
+        "expires_at",
+    }
+    assert adaptive_columns["nonce"]["type"] == "BLOB"
+    assert adaptive_columns["ciphertext"]["type"] == "BLOB"
+    adaptive_indexes = {
+        row["name"] for row in second.execute("PRAGMA index_list(adaptive_features)")
+    }
+    assert {
+        "adaptive_features_namespace_idx",
+        "adaptive_features_expiry_idx",
+    } <= adaptive_indexes
     second.close()
 
 
@@ -92,10 +113,7 @@ def test_existing_v1_database_migrates_to_v2_atomically_and_reruns(tmp_path) -> 
 
     migrated = open_database(database_path)
     migrated_versions = migrated.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in migrated_versions] == [
-        1,
-        2,
-    ]
+    assert [row["version"] for row in migrated_versions] == [1, 2, 3]
     assert migrated.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='diagnostic_snapshots'"
     ).fetchone()
@@ -116,7 +134,7 @@ def test_schema_rejects_a_migration_newer_than_the_binary(tmp_path) -> None:
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
     )
     connection.execute(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)",
         (datetime.now(UTC).isoformat(),),
     )
     connection.commit()
@@ -141,6 +159,65 @@ def test_open_existing_rejects_an_incomplete_v1_schema(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="incomplete"):
         schema.open_existing_database(database_path)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    (
+        "DROP TABLE adaptive_features",
+        "ALTER TABLE adaptive_features RENAME COLUMN expires_at TO expires_broken",
+        "DROP INDEX adaptive_features_expiry_idx",
+        "DROP TABLE diagnostic_snapshots",
+    ),
+)
+def test_applied_migrations_do_not_mask_concrete_schema_corruption(tmp_path, damage: str) -> None:
+    database_path = tmp_path / "corrupt-schema.db"
+    connection = open_database(database_path)
+    connection.execute(damage)
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="schema integrity"):
+        open_database(database_path)
+    with pytest.raises(RuntimeError, match="schema integrity"):
+        schema.open_existing_database(database_path)
+
+
+def test_migration_history_must_be_an_exact_contiguous_known_prefix(tmp_path) -> None:
+    database_path = tmp_path / "migration-gap.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    for version in (1, 3):
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (version, datetime.now(UTC).isoformat()),
+        )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="migration history"):
+        open_database(database_path)
+
+
+@pytest.mark.parametrize("applied_at", ("not-a-time", "2026-07-23T00:00:00"))
+def test_migration_timestamps_must_be_parseable_and_timezone_aware(
+    tmp_path, applied_at: str
+) -> None:
+    database_path = tmp_path / "bad-migration-time.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)",
+        (applied_at,),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="migration history"):
+        open_database(database_path)
 
 
 def test_schema_migration_rolls_back_every_statement_on_failure(

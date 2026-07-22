@@ -25,7 +25,7 @@ def test_removes_active_hidden_form_and_credential_content() -> None:
 
     result = sanitize(html)
 
-    assert result == "<label>Login</label><h1>상품</h1>"
+    assert result == "<label>Login</label><h1>상품</h1><p></p><p></p>"
     for forbidden in (
         "comment",
         "script-secret",
@@ -127,6 +127,36 @@ def test_removes_every_nonempty_supplied_secret_without_mutating_the_caller_set(
     assert result == "<div>before  middle  after</div>"
 
 
+def test_credential_pattern_removes_only_the_offending_text_node() -> None:
+    result = sanitize("<p>before<span>token=private-value</span>after<b>safe sibling</b></p>")
+
+    assert result == "<p>before<span></span>after<b>safe sibling</b></p>"
+
+
+def test_supplied_secrets_are_removed_from_decoded_nodes_before_serialization() -> None:
+    result = sanitize(
+        '<div id="abc&#38;def-safe" class="pre&#60;post">'
+        "abc&amp;def | &lt; | &quot; | &#x26;"
+        "</div>",
+        secret_values={"abc&def"},
+    )
+
+    assert result == '<div id="-safe"> | &lt; | " | &amp;</div>'
+
+    assert sanitize("before&lt;middle&quot;after", secret_values={"<", '"'}) == (
+        "beforemiddleafter"
+    )
+
+
+@pytest.mark.parametrize("structural_secret", ("div", "<", ">", "</"))
+def test_secret_collision_with_unavoidable_serialized_structure_fails_closed(
+    structural_secret: str,
+) -> None:
+    result = sanitize("<div>safe</div>", secret_values={structural_secret})
+
+    assert result == ""
+
+
 def test_output_is_deterministic_valid_unicode_and_bounded_before_secret_boundary() -> None:
     secret = "BOUNDARY-SECRET"
     html = "<p>" + ("한😀" * 30_000) + secret + "tail</p>\ud800"
@@ -138,6 +168,26 @@ def test_output_is_deterministic_valid_unicode_and_bounded_before_secret_boundar
     assert len(first) == 40_000
     assert secret not in first
     first.encode("utf-8", errors="strict")
+
+
+def test_bounded_serialization_never_cuts_tags_or_entities() -> None:
+    result = sanitize("<main><p>" + ("abc&amp;def&lt;" * 20_000) + "</p><b>tail</b></main>")
+
+    assert len(result) == 40_000
+    assert not result.endswith(("&", "&a", "&am", "&amp", "&#", "</", "<m", "<ma"))
+    assert sanitize(result) == result.rstrip() or sanitize(result) == result
+    assert result.count("<main>") == result.count("</main>") == 1
+    assert result.count("<p>") == result.count("</p>") == 1
+
+
+def test_adversarial_nesting_is_depth_bounded_without_stack_exhaustion() -> None:
+    html = "<div>" * 2_000 + "safe" + "</div>" * 2_000
+
+    result = sanitize(html)
+
+    assert len(result) <= 40_000
+    assert result.count("<div>") == result.count("</div>")
+    assert result.encode("utf-8", errors="strict")
 
 
 @pytest.mark.parametrize("secret_values", [None, ["ok", 7], [object()]])

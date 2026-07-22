@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -186,6 +187,58 @@ def test_removes_diagnostic_snapshots_at_exact_expiry_without_changing_other_bou
     assert not _exists(connection, "diagnostic_snapshots", "expired")
     assert not _exists(connection, "diagnostic_snapshots", "boundary")
     assert _exists(connection, "diagnostic_snapshots", "live")
+
+
+def test_removes_expired_and_disabled_monitor_adaptive_features(
+    connection: sqlite3.Connection, now: datetime
+) -> None:
+    _add_monitor(connection, "active")
+    _add_monitor(connection, "disabled", status="disabled", disabled_at=now)
+    for monitor_id in ("active", "disabled"):
+        connection.execute(
+            "INSERT INTO monitor_versions("
+            "id, monitor_id, version_number, spec_json, created_by, created_at"
+            ") VALUES (?, ?, 1, '{}', 'owner', ?)",
+            (f"{monitor_id}-version", monitor_id, _timestamp(now)),
+        )
+
+    def namespace_hash(monitor_id: str) -> str:
+        value = f"owner\0{monitor_id}\0{monitor_id}-version".encode()
+        return hashlib.sha256(value).hexdigest()
+
+    connection.executemany(
+        "INSERT INTO adaptive_features("
+        "key_hash, namespace_hash, nonce, ciphertext, created_at, updated_at, expires_at"
+        ") VALUES (?, ?, X'000000000000000000000000', X'00', ?, ?, ?)",
+        [
+            (
+                "expired",
+                namespace_hash("active"),
+                _timestamp(now),
+                _timestamp(now),
+                _timestamp(now),
+            ),
+            (
+                "active-live",
+                namespace_hash("active"),
+                _timestamp(now),
+                _timestamp(now),
+                _timestamp(now + timedelta(days=1)),
+            ),
+            (
+                "disabled-live",
+                namespace_hash("disabled"),
+                _timestamp(now),
+                _timestamp(now),
+                _timestamp(now + timedelta(days=90)),
+            ),
+        ],
+    )
+
+    Maintenance(connection).run(now=now)
+
+    keys = {row["key_hash"] for row in connection.execute("SELECT key_hash FROM adaptive_features")}
+    assert keys == {"active-live"}
 
 
 def test_removes_old_disabled_monitor_dependencies_without_removing_shared_owner_data(

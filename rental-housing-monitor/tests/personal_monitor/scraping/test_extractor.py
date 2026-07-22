@@ -60,6 +60,31 @@ def test_declared_html_fields_are_typed_and_descendant_visible_text_is_selected(
     assert "credential" not in repr(items)
 
 
+def test_normal_html_extraction_explicitly_disables_adaptive_global_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scrapling
+
+    real_selector = scrapling.Selector
+    calls: list[dict[str, object]] = []
+
+    def sentinel_selector(*args: object, **kwargs: object):
+        calls.append(dict(kwargs))
+        return real_selector(*args, **kwargs)
+
+    monkeypatch.setattr(scrapling, "Selector", sentinel_selector)
+
+    items = DeclarativeExtractor().extract(
+        document(b"<main><h1>Safe</h1></main>"),
+        extract_spec(
+            {"item_scope": "main", "fields": {"title": {"selector": "h1", "type": "text"}}}
+        ),
+    )
+
+    assert items[0].fields == {"title": "Safe"}
+    assert calls == [{"url": "https://example.com/catalog", "adaptive": False}]
+
+
 def test_xpath_prefixes_are_supported_within_each_item_root() -> None:
     spec = extract_spec(
         {

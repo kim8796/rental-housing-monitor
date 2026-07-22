@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from html import escape
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
@@ -21,8 +22,25 @@ _CREDENTIAL_TEXT = re.compile(
     re.IGNORECASE,
 )
 _VALID_PERCENT = re.compile(r"%(?:[0-9A-Fa-f]{2})")
+_MAX_SERIALIZATION_DEPTH = 128
 _DUPLICATE_ATTRIBUTE = "__pm_duplicate_attribute__"
 _VISIBILITY_ATTRIBUTES = frozenset({"aria-hidden", "hidden", "style"})
+_VOID_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "link",
+        "meta",
+        "source",
+        "track",
+        "wbr",
+    }
+)
 
 
 def sanitize_for_ai(html: str, *, secret_values: Iterable[str] = ()) -> str:
@@ -57,22 +75,22 @@ def sanitize_for_ai(html: str, *, secret_values: Iterable[str] = ()) -> str:
         if not isinstance(text, NavigableString):
             continue
         if _CREDENTIAL_TEXT.search(str(text)):
-            parent = text.parent
-            if isinstance(parent, Tag):
-                parent.decompose()
-            else:
-                text.extract()
-            continue
-        if not str(text).strip():
             text.extract()
+            continue
+        sanitized_text = _remove_secrets(str(text), secrets)
+        if not sanitized_text.strip():
+            text.extract()
+        elif sanitized_text != str(text):
+            text.replace_with(NavigableString(sanitized_text))
 
     for tag in soup.find_all(True):
+        _remove_attribute_secrets(tag, secrets)
         _sanitize_attributes(tag, secrets)
 
-    result = "".join(str(node) for node in soup.contents)
-    for secret in secrets:
-        result = result.replace(secret, "")
-    return result[:MAX_SANITIZED_CHARACTERS]
+    result = _serialize_bounded(soup)
+    if any(secret in result for secret in secrets):
+        return ""
+    return result
 
 
 def _copy_secrets(secret_values: Iterable[str]) -> tuple[str, ...]:
@@ -129,6 +147,97 @@ def _sanitize_attributes(tag: Tag, secrets: tuple[str, ...]) -> None:
         if sanitized_href is not None:
             safe["href"] = sanitized_href
     tag.attrs = safe
+
+
+def _remove_attribute_secrets(tag: Tag, secrets: tuple[str, ...]) -> None:
+    replaced: dict[str, str | list[str]] = {}
+    for name, value in tag.attrs.items():
+        if isinstance(value, str):
+            replaced[name] = _remove_secrets(value, secrets)
+        elif isinstance(value, list):
+            replaced[name] = [
+                _remove_secrets(item, secrets) if isinstance(item, str) else item for item in value
+            ]
+        else:
+            replaced[name] = value
+    tag.attrs = replaced
+
+
+def _remove_secrets(value: str, secrets: tuple[str, ...]) -> str:
+    result = value
+    for secret in secrets:
+        result = result.replace(secret, "")
+    return result
+
+
+def _serialize_bounded(soup: BeautifulSoup) -> str:
+    pieces: list[str] = []
+    length = 0
+    truncated = False
+    for node in soup.contents:
+        remaining = MAX_SANITIZED_CHARACTERS - length
+        serialized, complete = _serialize_node_bounded(node, remaining)
+        pieces.append(serialized)
+        length += len(serialized)
+        if not complete:
+            truncated = True
+            break
+    if truncated and length < MAX_SANITIZED_CHARACTERS:
+        pieces.append(" " * (MAX_SANITIZED_CHARACTERS - length))
+    return "".join(pieces)
+
+
+def _serialize_node_bounded(node: object, limit: int, *, depth: int = 0) -> tuple[str, bool]:
+    if limit <= 0 or depth >= _MAX_SERIALIZATION_DEPTH:
+        return "", False
+    if not isinstance(node, Tag):
+        return _escaped_text_bounded(str(node), limit)
+    opening = _opening_tag(node)
+    if node.name in _VOID_TAGS:
+        return (opening, True) if len(opening) <= limit else ("", False)
+    closing = f"</{node.name}>"
+    if len(opening) + len(closing) > limit:
+        return "", False
+    pieces = [opening]
+    used = len(opening)
+    for child in node.contents:
+        available = limit - used - len(closing)
+        if available <= 0:
+            pieces.append(closing)
+            return "".join(pieces), False
+        serialized, complete = _serialize_node_bounded(child, available, depth=depth + 1)
+        pieces.append(serialized)
+        used += len(serialized)
+        if not complete:
+            pieces.append(closing)
+            return "".join(pieces), False
+    pieces.append(closing)
+    return "".join(pieces), True
+
+
+def _escaped_text_bounded(value: str, limit: int) -> tuple[str, bool]:
+    pieces: list[str] = []
+    used = 0
+    for character in value:
+        encoded = escape(character, quote=False)
+        if used + len(encoded) > limit:
+            return "".join(pieces), False
+        pieces.append(encoded)
+        used += len(encoded)
+    return "".join(pieces), True
+
+
+def _opening_tag(tag: Tag) -> str:
+    attributes: list[str] = []
+    for name in sorted(tag.attrs):
+        value = tag.attrs[name]
+        if isinstance(value, list):
+            serialized = " ".join(item for item in value if isinstance(item, str))
+        else:
+            serialized = str(value)
+        attributes.append(f' {name}="{escape(serialized, quote=True)}"')
+    suffix = "/>" if tag.name in _VOID_TAGS else ">"
+    return f"<{tag.name}{''.join(attributes)}{suffix}"
 
 
 def _safe_value(value: str, secrets: tuple[str, ...]) -> bool:
