@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from personal_monitor.cli import main
+from personal_monitor.cli import build_parser, main
 
 
 def valid_spec() -> dict[str, object]:
@@ -162,3 +162,128 @@ def test_module_entry_point_lists_operator_commands() -> None:
     assert "validate-spec" in result.stdout
     assert "database" in result.stdout
     assert "maintenance" in result.stdout
+    assert "profile" in result.stdout
+
+
+def test_profile_bootstrap_parser_accepts_only_the_documented_fields() -> None:
+    arguments = build_parser().parse_args(
+        [
+            "profile",
+            "bootstrap",
+            "--id",
+            "shopping",
+            "--url",
+            "https://example.com/login?state=opaque",
+            "--profiles-root",
+            "/srv/personal-monitor/profiles",
+        ]
+    )
+
+    assert arguments.command == "profile"
+    assert arguments.action == "bootstrap"
+    assert vars(arguments) == {
+        "command": "profile",
+        "action": "bootstrap",
+        "profile_id": "shopping",
+        "url": "https://example.com/login?state=opaque",
+        "profiles_root": Path("/srv/personal-monitor/profiles"),
+    }
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    ["--username", "--password", "--otp", "--cookie", "--token", "--browser-args"],
+)
+def test_profile_bootstrap_rejects_credentials_and_arbitrary_browser_arguments_safely(
+    forbidden: str, capsys
+) -> None:
+    secret = "operator-private-value"
+
+    result = main(
+        [
+            "profile",
+            "bootstrap",
+            "--id",
+            "shopping",
+            "--url",
+            "https://example.com/login?token=private-query",
+            "--profiles-root",
+            "/srv/personal-monitor/profiles",
+            forbidden,
+            secret,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == ""
+    assert captured.err.endswith("invalid command arguments\n")
+    assert secret not in captured.err
+    assert "private-query" not in captured.err
+    assert "shopping" not in captured.err
+
+
+def test_profile_bootstrap_delegates_without_printing_the_url_or_identifier(
+    monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path
+) -> None:
+    import personal_monitor.cli as cli_module
+
+    calls: list[tuple[str, str, Path]] = []
+
+    def command(profile_id: str, url: str, profiles_root: Path) -> None:
+        calls.append((profile_id, url, profiles_root))
+
+    monkeypatch.setattr(cli_module, "_profile_bootstrap_command", command)
+    url = "https://example.com/login?token=private-query"
+
+    assert (
+        main(
+            [
+                "profile",
+                "bootstrap",
+                "--id",
+                "shopping",
+                "--url",
+                url,
+                "--profiles-root",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+
+    assert calls == [("shopping", url, tmp_path)]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_profile_bootstrap_has_one_fixed_redacted_failure_boundary(
+    monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path
+) -> None:
+    import personal_monitor.cli as cli_module
+
+    def fail(_profile_id: str, _url: str, _profiles_root: Path) -> None:
+        raise RuntimeError("shopping private-query password=private")
+
+    monkeypatch.setattr(cli_module, "_profile_bootstrap_command", fail)
+
+    assert (
+        main(
+            [
+                "profile",
+                "bootstrap",
+                "--id",
+                "shopping",
+                "--url",
+                "https://example.com/login?token=private-query",
+                "--profiles-root",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "profile bootstrap failed\n"
