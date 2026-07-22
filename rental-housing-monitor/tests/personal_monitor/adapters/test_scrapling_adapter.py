@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from weakref import ref
 
 import httpx
 import pytest
 
+import personal_monitor.adapters.scrapling as scrapling_module
 from personal_monitor.adapters.official_api import BoundedPolicyHttpClient
 from personal_monitor.adapters.scrapling import ScraplingSourceAdapter
 from personal_monitor.domain.spec import FetchStrategy, MonitorSpec
@@ -116,15 +119,15 @@ def policy_client(handler=None) -> BoundedPolicyHttpClient:
 
 
 def adapter(backend: FakeBackend, **overrides: object) -> ScraplingSourceAdapter:
+    make_scrapling_backend(backend)
+    overrides.pop("http_client", None)
     arguments: dict[str, object] = {
         "url_policy": UrlPolicy(Resolver()),
         "rate_limiter": RecordingRateLimiter(),
-        "backend": make_scrapling_backend(backend),
+        "egress_proxy_url": "http://proxy.internal:8080",
         "clock": lambda: NOW,
     }
     arguments.update(overrides)
-    if "http_client" not in arguments:
-        arguments["http_client"] = policy_client()
     return ScraplingSourceAdapter(**arguments)  # type: ignore[arg-type]
 
 
@@ -144,25 +147,24 @@ def test_auto_stops_after_valid_http_result() -> None:
     assert len(batch.source_hash) == 64
 
 
-def test_production_constructor_rejects_an_unsealed_backend() -> None:
-    async def unused_fetcher(*_args, **_kwargs):
-        raise AssertionError("must not run")
+def test_production_constructor_rejects_supplied_egress_components() -> None:
+    arguments = {
+        "url_policy": UrlPolicy(Resolver()),
+        "rate_limiter": RecordingRateLimiter(),
+        "egress_proxy_url": "http://proxy.internal:8080",
+        "clock": lambda: NOW,
+    }
 
-    unsealed = ScraplingBackend(
-        egress_proxy_url="http://proxy.internal:8080",
-        http_fetcher=unused_fetcher,
-        dynamic_fetcher=unused_fetcher,
-        stealthy_fetcher=unused_fetcher,
-    )
-    for backend in (FakeBackend(http=document()), unsealed):
-        with pytest.raises(TypeError, match="backend"):
-            ScraplingSourceAdapter(
-                url_policy=UrlPolicy(Resolver()),
-                rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
-                http_client=policy_client(),
-                backend=backend,  # type: ignore[arg-type]
-                clock=lambda: NOW,
-            )
+    with pytest.raises(TypeError, match="http_client"):
+        ScraplingSourceAdapter(  # type: ignore[call-arg]
+            **arguments,
+            http_client=policy_client(),
+        )
+    with pytest.raises(TypeError, match="backend"):
+        ScraplingSourceAdapter(  # type: ignore[call-arg]
+            **arguments,
+            backend=ScraplingBackend(egress_proxy_url="http://proxy.internal:8080"),
+        )
 
 
 def test_production_constructor_rejects_a_sealed_backend_subclass() -> None:
@@ -170,10 +172,10 @@ def test_production_constructor_rejects_a_sealed_backend_subclass() -> None:
         pass
 
     with pytest.raises(TypeError, match="backend"):
-        ScraplingSourceAdapter(
+        ScraplingSourceAdapter(  # type: ignore[call-arg]
             url_policy=UrlPolicy(Resolver()),
             rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
-            http_client=policy_client(),
+            egress_proxy_url="http://proxy.internal:8080",
             backend=SubclassedBackend(
                 egress_proxy_url="http://proxy.internal:8080",
             ),
@@ -185,15 +187,130 @@ def test_production_adapter_has_no_public_test_backend_factory() -> None:
     assert not hasattr(ScraplingSourceAdapter, "for_test")
 
 
-def test_production_adapter_rejects_mismatched_policy_proxies() -> None:
-    with pytest.raises(TypeError, match="proxy"):
-        ScraplingSourceAdapter(
+def test_production_adapter_constructs_both_egress_components_from_one_proxy() -> None:
+    fake = FakeBackend(http=document())
+    make_scrapling_backend(fake)
+    source = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+
+    batch = asyncio.run(source.fetch("m", spec(fetch_strategy="http")))
+
+    assert batch.items
+
+
+def test_low_level_backend_policy_mutation_is_rejected_at_adapter_use_time() -> None:
+    fake = FakeBackend(http=document())
+    make_scrapling_backend(fake)
+    source = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+    object.__setattr__(
+        source._backend,
+        "_http_fetcher",
+        lambda *_args, **_kwargs: document(),
+    )
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(source.fetch("m", spec(fetch_strategy="http")))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+
+
+def test_low_level_proxy_rebinding_cannot_forge_factory_provenance() -> None:
+    fake = FakeBackend(http=document())
+    make_scrapling_backend(fake)
+    source = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+    other_client = BoundedPolicyHttpClient(egress_proxy_url="http://other-proxy.internal:8080")
+    other_policy = other_client._egress_policy
+    object.__setattr__(source._http_client, "_egress_policy", other_policy)
+    object.__setattr__(source._backend, "_egress_policy", other_policy)
+    object.__setattr__(source, "_egress_policy", other_policy)
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(source.fetch("m", spec(fetch_strategy="http")))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+
+
+def test_factory_provenance_registry_is_not_exposed_as_module_global_state() -> None:
+    assert not hasattr(scrapling_module, "_ADAPTER_EGRESS_PROVENANCE")
+
+
+@pytest.mark.parametrize(
+    ("attribute", "replacement"),
+    [
+        ("_http_fetcher", lambda *_args, **_kwargs: document()),
+        ("_http_gate", object()),
+        ("_http_timeout_seconds", float("inf")),
+    ],
+)
+def test_each_low_level_execution_mutation_fails_use_time_sealing(
+    attribute: str,
+    replacement: object,
+) -> None:
+    fake = FakeBackend(http=document())
+    make_scrapling_backend(fake)
+    source = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+    object.__setattr__(source._backend, attribute, replacement)
+
+    with pytest.raises(MonitorError, match="backend policy"):
+        asyncio.run(source.fetch("m", spec(fetch_strategy="http")))
+
+
+def test_provenance_registry_does_not_retain_or_reuse_adapter_instances() -> None:
+    fake = FakeBackend(http=document())
+    make_scrapling_backend(fake)
+    first = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+    first_policy = first._http_client._egress_policy
+    first_reference = ref(first)
+    del first
+    gc.collect()
+    assert first_reference() is None
+
+    second = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+    object.__setattr__(second._http_client, "_egress_policy", first_policy)
+    object.__setattr__(second._backend, "_egress_policy", first_policy)
+
+    with pytest.raises(MonitorError, match="backend policy"):
+        asyncio.run(second.fetch("m", spec(fetch_strategy="http")))
+
+
+def test_production_adapter_has_no_independent_proxy_components() -> None:
+    with pytest.raises(TypeError, match="http_client"):
+        ScraplingSourceAdapter(  # type: ignore[call-arg]
             url_policy=UrlPolicy(Resolver()),
             rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+            egress_proxy_url="http://proxy.internal:8080",
             http_client=BoundedPolicyHttpClient(
-                egress_proxy_url="http://policy-proxy.internal:8080"
+                egress_proxy_url="http://other-proxy.internal:8080"
             ),
-            backend=ScraplingBackend(egress_proxy_url="http://scrapling-proxy.internal:8080"),
             clock=lambda: NOW,
         )
 
@@ -461,6 +578,49 @@ def test_profile_cleanup_cannot_mask_cancellation(tmp_path: Path, asynchronous: 
         )
 
     assert caught.value is cancellation
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_profile_cleanup_cannot_mask_system_exceptions(
+    tmp_path: Path,
+    asynchronous: bool,
+    exception_type: type[BaseException],
+) -> None:
+    original = exception_type("stop")
+    exits: list[tuple[object, object, object]] = []
+
+    class SyncContext:
+        def __enter__(self):
+            return tmp_path
+
+        def __exit__(self, *exception):
+            exits.append(exception)
+            raise RuntimeError("secret cleanup detail")
+
+    class AsyncContext:
+        async def __aenter__(self):
+            return tmp_path
+
+        async def __aexit__(self, *exception):
+            exits.append(exception)
+            raise RuntimeError("secret cleanup detail")
+
+    class Profiles:
+        def materialize(self, _reference: str):
+            return AsyncContext() if asynchronous else SyncContext()
+
+    with pytest.raises(exception_type) as caught:
+        asyncio.run(
+            adapter(FakeBackend(dynamic=original), profile_provider=Profiles()).fetch(
+                "m", spec(fetch_strategy="dynamic", auth_profile_ref="profile-1")
+            )
+        )
+
+    assert caught.value is original
+    assert exits[0][0] is exception_type
+    assert exits[0][1] is original
+    assert exits[0][2] is not None
 
 
 def test_missing_profile_is_safe_authentication_failure() -> None:

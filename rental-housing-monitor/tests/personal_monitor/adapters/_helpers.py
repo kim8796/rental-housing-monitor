@@ -15,6 +15,17 @@ HttpHandler = Callable[[httpx.Request], httpx.Response]
 _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
+class _RawStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def __aiter__(self):
+        yield self._body
+
+    async def aclose(self) -> None:
+        return None
+
+
 class FakeBackend(Protocol):
     async def fetch_http(self, target): ...
 
@@ -35,9 +46,20 @@ def install_policy_test_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
     def async_client_factory(**kwargs: object) -> httpx.AsyncClient:
         assert "proxy" in kwargs
         kwargs.pop("proxy")
+
+        def streaming_handler(request: httpx.Request) -> httpx.Response:
+            response = _http_handler(request)
+            return httpx.Response(
+                response.status_code,
+                headers=response.headers,
+                stream=_RawStream(response.content),
+                request=request,
+                extensions=response.extensions,
+            )
+
         return _REAL_ASYNC_CLIENT(
             **kwargs,  # type: ignore[arg-type]
-            transport=httpx.MockTransport(lambda request: _http_handler(request)),
+            transport=httpx.MockTransport(streaming_handler),
         )
 
     async def fetch_http(_self: ScraplingBackend, target):

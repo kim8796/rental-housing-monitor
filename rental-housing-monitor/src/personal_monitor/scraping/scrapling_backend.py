@@ -7,6 +7,7 @@ import re
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.security.egress import (
     HTTP_EGRESS_GATE,
     EgressProxyIdentity,
-    require_egress_proxy,
+    EgressProxyPolicy,
 )
 from personal_monitor.security.url_policy import (
     MAX_REDIRECTS,
@@ -120,6 +121,8 @@ def normalize_response(
         retry_after_seconds=retry_after_seconds,
         detected_interstitial=detected_interstitial,
     )
+    if status not in NAVIGATION_REDIRECT_STATUSES and not 200 <= status <= 299:
+        raise _policy_error("response returned an invalid terminal status")
 
     redirect_location = None
     if status in NAVIGATION_REDIRECT_STATUSES:
@@ -143,6 +146,7 @@ def normalize_response(
     )
 
 
+@dataclass(frozen=True, slots=True, init=False)
 class ScraplingBackend:
     """A bounded async boundary around Scrapling's synchronous fetchers.
 
@@ -153,58 +157,120 @@ class ScraplingBackend:
     executor call actually finishes.
     """
 
+    _egress_policy: EgressProxyPolicy = field(repr=False)
+    _http_fetcher: BlockingFetcher = field(repr=False)
+    _dynamic_fetcher: BlockingFetcher = field(repr=False)
+    _stealthy_fetcher: BlockingFetcher = field(repr=False)
+    _http_gate: threading.BoundedSemaphore = field(repr=False)
+    _browser_gate: threading.BoundedSemaphore = field(repr=False)
+    _http_timeout_seconds: float = field(repr=False)
+    _browser_timeout_seconds: float = field(repr=False)
+    _block_page_detector: BlockPageDetector | None = field(repr=False)
+    _clock: Clock = field(repr=False)
+    _background_calls: set[asyncio.Task[object]] = field(repr=False)
+
     def __init__(
         self,
         *,
         egress_proxy_url: str | None,
-        http_fetcher: BlockingFetcher = _DEFAULT_HTTP_FETCHER,
-        dynamic_fetcher: BlockingFetcher = _DEFAULT_DYNAMIC_FETCHER,
-        stealthy_fetcher: BlockingFetcher = _DEFAULT_STEALTHY_FETCHER,
-        http_gate: threading.BoundedSemaphore | None = None,
-        browser_gate: threading.BoundedSemaphore | None = None,
         http_timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
         browser_timeout_seconds: float = BROWSER_TIMEOUT_SECONDS,
         block_page_detector: BlockPageDetector | None = None,
         clock: Clock = lambda: datetime.now(UTC),
     ) -> None:
-        proxy, proxy_identity = require_egress_proxy(egress_proxy_url)
+        self._initialize(
+            EgressProxyPolicy.from_url(egress_proxy_url),
+            http_timeout_seconds=http_timeout_seconds,
+            browser_timeout_seconds=browser_timeout_seconds,
+            block_page_detector=block_page_detector,
+            clock=clock,
+        )
 
-        self._egress_proxy_url = proxy
-        self._proxy_identity = proxy_identity
-        self._http_fetcher = http_fetcher
-        self._dynamic_fetcher = dynamic_fetcher
-        self._stealthy_fetcher = stealthy_fetcher
-        self._http_gate = http_gate or HTTP_EGRESS_GATE
-        self._browser_gate = browser_gate or _BROWSER_GATE
-        self._http_timeout_seconds = _bounded_timeout(
-            http_timeout_seconds,
-            maximum=HTTP_TIMEOUT_SECONDS,
-            label="HTTP",
+    @classmethod
+    def _from_egress_policy(
+        cls,
+        policy: EgressProxyPolicy,
+        *,
+        clock: Clock,
+    ) -> ScraplingBackend:
+        instance = cls.__new__(cls)
+        instance._initialize(
+            policy,
+            http_timeout_seconds=HTTP_TIMEOUT_SECONDS,
+            browser_timeout_seconds=BROWSER_TIMEOUT_SECONDS,
+            block_page_detector=None,
+            clock=clock,
         )
-        self._browser_timeout_seconds = _bounded_timeout(
-            browser_timeout_seconds,
-            maximum=BROWSER_TIMEOUT_SECONDS,
-            label="browser",
+        return instance
+
+    def _initialize(
+        self,
+        policy: EgressProxyPolicy,
+        *,
+        http_timeout_seconds: float,
+        browser_timeout_seconds: float,
+        block_page_detector: BlockPageDetector | None,
+        clock: Clock,
+    ) -> None:
+        object.__setattr__(self, "_egress_policy", policy)
+        object.__setattr__(self, "_http_fetcher", _DEFAULT_HTTP_FETCHER)
+        object.__setattr__(self, "_dynamic_fetcher", _DEFAULT_DYNAMIC_FETCHER)
+        object.__setattr__(self, "_stealthy_fetcher", _DEFAULT_STEALTHY_FETCHER)
+        object.__setattr__(self, "_http_gate", HTTP_EGRESS_GATE)
+        object.__setattr__(self, "_browser_gate", _BROWSER_GATE)
+        object.__setattr__(
+            self,
+            "_http_timeout_seconds",
+            _bounded_timeout(
+                http_timeout_seconds,
+                maximum=HTTP_TIMEOUT_SECONDS,
+                label="HTTP",
+            ),
         )
-        self._block_page_detector = block_page_detector
-        self._clock = clock
-        self._background_calls: set[asyncio.Task[object]] = set()
-        self._policy_sealed = (
-            http_fetcher is _DEFAULT_HTTP_FETCHER
-            and dynamic_fetcher is _DEFAULT_DYNAMIC_FETCHER
-            and stealthy_fetcher is _DEFAULT_STEALTHY_FETCHER
-            and http_gate is None
-            and browser_gate is None
+        object.__setattr__(
+            self,
+            "_browser_timeout_seconds",
+            _bounded_timeout(
+                browser_timeout_seconds,
+                maximum=BROWSER_TIMEOUT_SECONDS,
+                label="browser",
+            ),
         )
+        object.__setattr__(self, "_block_page_detector", block_page_detector)
+        object.__setattr__(self, "_clock", clock)
+        object.__setattr__(self, "_background_calls", set())
 
     @property
     def is_policy_sealed(self) -> bool:
         """Whether production fetchers and process-wide concurrency gates are intact."""
-        return self._policy_sealed
+        try:
+            _bounded_timeout(
+                self._http_timeout_seconds,
+                maximum=HTTP_TIMEOUT_SECONDS,
+                label="HTTP",
+            )
+            _bounded_timeout(
+                self._browser_timeout_seconds,
+                maximum=BROWSER_TIMEOUT_SECONDS,
+                label="browser",
+            )
+        except ValueError:
+            return False
+        return (
+            self._egress_policy.is_valid
+            and self._http_fetcher is _DEFAULT_HTTP_FETCHER
+            and self._dynamic_fetcher is _DEFAULT_DYNAMIC_FETCHER
+            and self._stealthy_fetcher is _DEFAULT_STEALTHY_FETCHER
+            and self._http_gate is HTTP_EGRESS_GATE
+            and self._browser_gate is _BROWSER_GATE
+        )
 
     @property
     def proxy_identity(self) -> EgressProxyIdentity:
-        return self._proxy_identity
+        return self._egress_policy.identity
+
+    def _uses_egress_policy(self, policy: EgressProxyPolicy) -> bool:
+        return self._egress_policy.has_same_provenance(policy)
 
     async def fetch_http(self, target: ResolvedTarget) -> SourceDocument:
         body_collector = _BoundedBodyCollector()
@@ -222,7 +288,7 @@ class ScraplingBackend:
                 "max_redirects": 0,
                 # Scrapling 0.4.11 counts total attempts, so one means no retry.
                 "retries": 1,
-                "proxy": self._egress_proxy_url,
+                "proxy": self._egress_policy.url,
                 "headers": {"Accept-Encoding": "identity"},
                 "accept_encoding": "identity",
                 "content_callback": body_collector,
@@ -268,7 +334,7 @@ class ScraplingBackend:
             "google_search": False,
             "dns_over_https": False,
             "retries": 1,
-            "proxy": self._egress_proxy_url,
+            "proxy": self._egress_policy.url,
             "selector_config": dict(_SELECTOR_CONFIG),
         }
         if profile is not None:

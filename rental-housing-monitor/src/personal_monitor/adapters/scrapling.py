@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
+from weakref import WeakKeyDictionary
 
 from personal_monitor.adapters._policy import (
     MONITOR_USER_AGENT,
@@ -27,6 +28,7 @@ from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.extractor import DeclarativeExtractor
 from personal_monitor.scraping.scrapling_backend import ScraplingBackend
 from personal_monitor.scraping.validator import ObservationValidator
+from personal_monitor.security.egress import EgressProxyPolicy
 from personal_monitor.security.rate_limit import HostRateLimiter
 from personal_monitor.security.robots import RobotsPolicy
 from personal_monitor.security.url_policy import MAX_REDIRECTS, ResolvedTarget, UrlPolicy
@@ -36,6 +38,21 @@ _RETRY_DELAYS = (1.0, 4.0)
 Clock = Callable[[], datetime]
 Sleeper = Callable[[float], Awaitable[None]]
 ShellDetector = Callable[[SourceDocument], bool]
+
+
+def _provenance_accessors():
+    registry: WeakKeyDictionary[object, EgressProxyPolicy] = WeakKeyDictionary()
+
+    def bind(owner: object, policy: EgressProxyPolicy) -> None:
+        registry[owner] = policy
+
+    def lookup(owner: object) -> EgressProxyPolicy | None:
+        return registry.get(owner)
+
+    return bind, lookup
+
+
+_bind_egress_provenance, _lookup_egress_provenance = _provenance_accessors()
 
 
 class ProfileProvider(Protocol):
@@ -50,8 +67,7 @@ class ScraplingSourceAdapter:
         *,
         url_policy: UrlPolicy,
         rate_limiter: HostRateLimiter,
-        http_client: BoundedPolicyHttpClient,
-        backend: ScraplingBackend,
+        egress_proxy_url: str | None,
         extractor: DeclarativeExtractor | None = None,
         validator: ObservationValidator | None = None,
         clock: Clock = lambda: datetime.now(UTC),
@@ -59,8 +75,9 @@ class ScraplingSourceAdapter:
         js_shell_detector: ShellDetector | None = None,
         profile_provider: ProfileProvider | None = None,
     ) -> None:
-        if type(backend) is not ScraplingBackend or not backend.is_policy_sealed:
-            raise TypeError("backend must preserve the bounded proxy policy")
+        egress_policy = EgressProxyPolicy.from_url(egress_proxy_url)
+        http_client = BoundedPolicyHttpClient._from_egress_policy(egress_policy, clock=clock)
+        backend = ScraplingBackend._from_egress_policy(egress_policy, clock=clock)
         self._initialize(
             url_policy=url_policy,
             rate_limiter=rate_limiter,
@@ -72,6 +89,7 @@ class ScraplingSourceAdapter:
             sleeper=sleeper,
             js_shell_detector=js_shell_detector,
             profile_provider=profile_provider,
+            egress_policy=egress_policy,
         )
 
     def _initialize(
@@ -87,11 +105,14 @@ class ScraplingSourceAdapter:
         sleeper: Sleeper,
         js_shell_detector: ShellDetector | None,
         profile_provider: ProfileProvider | None,
+        egress_policy: EgressProxyPolicy,
     ) -> None:
-        if type(http_client) is not BoundedPolicyHttpClient:
-            raise TypeError("http_client must preserve the bounded proxy policy")
-        if not backend.proxy_identity.matches(http_client.proxy_identity):
-            raise TypeError("backend and policy client must use the same egress proxy")
+        if (
+            type(http_client) is not BoundedPolicyHttpClient
+            or type(backend) is not ScraplingBackend
+        ):
+            raise TypeError("adapter egress components are invalid")
+        _bind_egress_provenance(self, egress_policy)
         self._url_policy = url_policy
         self._rate_limiter = rate_limiter
         self._http_client = http_client
@@ -106,6 +127,7 @@ class ScraplingSourceAdapter:
     async def fetch(self, monitor_id: str, spec: MonitorSpec) -> ObservationBatch:
         if spec.source_adapter is not SourceAdapterKind.SCRAPLING or spec.adapter_ref is not None:
             raise MonitorError(ErrorClass.POLICY, "adapter", "monitor adapter is incompatible")
+        self._require_sealed_egress()
 
         if spec.fetch_strategy is not FetchStrategy.AUTO:
             return await self._run_strategy(monitor_id, spec, spec.fetch_strategy)
@@ -205,6 +227,7 @@ class ScraplingSourceAdapter:
         target: ResolvedTarget,
         profile_reference: str | None,
     ) -> SourceDocument:
+        self._require_sealed_egress()
         if strategy is FetchStrategy.HTTP:
             return await self._backend.fetch_http(target)
         method = (
@@ -242,20 +265,13 @@ class ScraplingSourceAdapter:
                 raise _profile_error() from None
             try:
                 result = await method(target, profile=_profile_path(profile))
-            except asyncio.CancelledError as cancellation:
+            except BaseException as original:
                 exception = sys.exc_info()
                 try:
                     await async_exit(*exception)
                 except BaseException:
-                    raise cancellation from None
-                raise
-            except Exception:
-                exception = sys.exc_info()
-                try:
-                    await async_exit(*exception)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
+                    if not isinstance(original, Exception):
+                        raise original from None
                     raise _profile_error() from None
                 raise
             try:
@@ -278,20 +294,13 @@ class ScraplingSourceAdapter:
             raise _profile_error() from None
         try:
             result = await method(target, profile=_profile_path(profile))
-        except asyncio.CancelledError as cancellation:
+        except BaseException as original:
             exception = sys.exc_info()
             try:
                 exit_context(*exception)
             except BaseException:
-                raise cancellation from None
-            raise
-        except Exception:
-            exception = sys.exc_info()
-            try:
-                exit_context(*exception)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
+                if not isinstance(original, Exception):
+                    raise original from None
                 raise _profile_error() from None
             raise
         try:
@@ -365,6 +374,7 @@ class ScraplingSourceAdapter:
         seen = {robots_target.normalized_url}
         redirect_count = 0
         while True:
+            self._require_sealed_egress()
             try:
                 response = await self._http_client.get_robots(robots_target)
             except FetchError as error:
@@ -418,6 +428,21 @@ class ScraplingSourceAdapter:
                     "robots response returned an invalid status",
                 )
             return policy.check(MONITOR_USER_AGENT, target.normalized_url), retry_after
+
+    def _require_sealed_egress(self) -> None:
+        egress_policy = _lookup_egress_provenance(self)
+        if (
+            egress_policy is None
+            or not egress_policy.is_valid
+            or not self._http_client._uses_egress_policy(egress_policy)
+            or not self._backend._uses_egress_policy(egress_policy)
+            or not self._backend.is_policy_sealed
+        ):
+            raise MonitorError(
+                ErrorClass.POLICY,
+                "adapter",
+                "adapter backend policy integrity check failed",
+            )
 
     async def _validate_policy_response(
         self,

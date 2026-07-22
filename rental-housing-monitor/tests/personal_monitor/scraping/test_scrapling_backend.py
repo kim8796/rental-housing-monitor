@@ -79,6 +79,17 @@ class FakeResponse:
         self.history = [] if history is None else history
 
 
+class RawHttpxStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def __aiter__(self):
+        yield self._body
+
+    async def aclose(self) -> None:
+        return None
+
+
 def target(url: str = "https://example.com/source") -> ResolvedTarget:
     return ResolvedTarget(
         normalized_url=url,
@@ -95,12 +106,19 @@ def noop_fetcher(_url: str, **_kwargs: object) -> FakeResponse:
 def make_test_backend(**overrides: object) -> ScraplingBackend:
     arguments: dict[str, object] = {
         "egress_proxy_url": "http://proxy.test:8080",
-        "http_fetcher": noop_fetcher,
-        "dynamic_fetcher": noop_fetcher,
-        "stealthy_fetcher": noop_fetcher,
+    }
+    execution = {
+        "_http_fetcher": overrides.pop("http_fetcher", noop_fetcher),
+        "_dynamic_fetcher": overrides.pop("dynamic_fetcher", noop_fetcher),
+        "_stealthy_fetcher": overrides.pop("stealthy_fetcher", noop_fetcher),
+        "_http_gate": overrides.pop("http_gate", backend_module.HTTP_EGRESS_GATE),
+        "_browser_gate": overrides.pop("browser_gate", backend_module._BROWSER_GATE),
     }
     arguments.update(overrides)
-    return ScraplingBackend(**arguments)  # type: ignore[arg-type]
+    backend = ScraplingBackend(**arguments)  # type: ignore[arg-type]
+    for name, value in execution.items():
+        object.__setattr__(backend, name, value)
+    return backend
 
 
 def test_response_is_bounded_normalized_and_immutable() -> None:
@@ -251,7 +269,7 @@ def test_redirect_body_is_not_allowed_to_bypass_content_type_policy() -> None:
 
 
 def test_not_modified_is_not_treated_as_a_navigation_redirect() -> None:
-    with pytest.raises(MonitorError, match="Content-Type"):
+    with pytest.raises(MonitorError, match="terminal status"):
         normalize_response(
             FakeResponse(status=304, headers=FakeHeaders({}), body=b""),
             strategy=FetchStrategy.HTTP,
@@ -361,6 +379,51 @@ def test_http_callback_size_abort_is_policy_not_transient() -> None:
     assert caught.value.error_class is ErrorClass.POLICY
 
 
+@pytest.mark.parametrize(
+    ("strategy", "status"),
+    [
+        (FetchStrategy.HTTP, 100),
+        (FetchStrategy.HTTP, 304),
+        (FetchStrategy.DYNAMIC, 199),
+        (FetchStrategy.STEALTHY, 304),
+    ],
+)
+def test_non_navigation_non_success_scrapling_status_fails_closed(
+    strategy: FetchStrategy,
+    status: int,
+) -> None:
+    with pytest.raises(MonitorError) as caught:
+        normalize_response(
+            FakeResponse(status=status),
+            strategy=strategy,
+        )
+
+    assert caught.value.error_class is ErrorClass.POLICY
+
+
+def test_official_total_timeout_includes_waiting_for_the_shared_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acquired = 0
+    for _ in range(4):
+        if backend_module.HTTP_EGRESS_GATE.acquire(blocking=False):
+            acquired += 1
+    assert acquired == 4
+    monkeypatch.setattr(policy_module, "TOTAL_TIMEOUT_SECONDS", 0.02, raising=False)
+    client = BoundedPolicyHttpClient(egress_proxy_url="http://proxy.internal:8080")
+
+    async def scenario() -> None:
+        with pytest.raises(FetchError, match="timed out") as caught:
+            await asyncio.wait_for(client.get_json(target()), timeout=0.2)
+        assert caught.value.error_class is ErrorClass.TRANSIENT_NETWORK
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        for _ in range(acquired):
+            backend_module.HTTP_EGRESS_GATE.release()
+
+
 def test_policy_http_requests_share_global_four_request_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -374,7 +437,11 @@ def test_policy_http_requests_share_global_four_request_gate(
         peak = max(peak, active)
         await asyncio.sleep(0.02)
         active -= 1
-        return httpx.Response(200, headers={"Content-Type": "application/json"}, json={})
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=RawHttpxStream(b"{}"),
+        )
 
     def client_factory(**kwargs: object) -> httpx.AsyncClient:
         kwargs.pop("proxy")
@@ -417,7 +484,11 @@ def test_scrapling_and_policy_http_share_one_global_four_request_gate(
         enter()
         await asyncio.sleep(0.03)
         leave()
-        return httpx.Response(200, headers={"Content-Type": "application/json"}, json={})
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=RawHttpxStream(b"{}"),
+        )
 
     def client_factory(**kwargs: object) -> httpx.AsyncClient:
         kwargs.pop("proxy")
@@ -604,6 +675,31 @@ def test_production_backend_requires_an_egress_proxy() -> None:
     ScraplingBackend(egress_proxy_url="http://proxy.test:8080")
 
 
+def test_production_backend_rejects_custom_fetchers_and_gates() -> None:
+    def evil_fetcher(_url: str, **_kwargs: object) -> FakeResponse:
+        return FakeResponse()
+
+    with pytest.raises(TypeError, match="http_fetcher"):
+        ScraplingBackend(  # type: ignore[call-arg]
+            egress_proxy_url="http://proxy.test:8080",
+            http_fetcher=evil_fetcher,
+        )
+    with pytest.raises(TypeError, match="http_gate"):
+        ScraplingBackend(  # type: ignore[call-arg]
+            egress_proxy_url="http://proxy.test:8080",
+            http_gate=threading.BoundedSemaphore(1),
+        )
+
+
+def test_production_backend_execution_policy_cannot_be_replaced() -> None:
+    backend = ScraplingBackend(egress_proxy_url="http://proxy.test:8080")
+
+    with pytest.raises(AttributeError):
+        backend._http_fetcher = lambda *_args, **_kwargs: FakeResponse()
+    with pytest.raises(AttributeError):
+        backend._http_gate = threading.BoundedSemaphore(1)
+
+
 @pytest.mark.parametrize(
     "proxy",
     [
@@ -615,6 +711,8 @@ def test_production_backend_requires_an_egress_proxy() -> None:
         "http://proxy.example/path",
         "http://proxy.example?secret=value",
         "http://proxy.example:8080\r\n",
+        "http://proxy.internal:",
+        "http://proxy.internal:/",
     ],
 )
 def test_proxy_url_is_syntax_checked_without_leaking_credentials(proxy: str) -> None:
@@ -631,7 +729,7 @@ def test_http_fetch_uses_approved_url_and_bounded_fetcher_kwargs() -> None:
         calls.append((url, kwargs))
         return FakeResponse()
 
-    backend = ScraplingBackend(
+    backend = make_test_backend(
         egress_proxy_url="http://proxy.internal:8080",
         http_fetcher=fetcher,
     )
@@ -717,7 +815,7 @@ def test_browser_fetch_uses_profile_and_bounded_fetcher_kwargs(
         calls.append((url, kwargs))
         return FakeResponse()
 
-    backend = ScraplingBackend(
+    backend = make_test_backend(
         egress_proxy_url="http://proxy.internal:8080",
         dynamic_fetcher=fetcher,
         stealthy_fetcher=fetcher,
@@ -763,7 +861,7 @@ def test_browser_fetch_omits_profile_when_absent_and_passes_real_validator(
         calls.append(kwargs)
         return FakeResponse()
 
-    backend = ScraplingBackend(
+    backend = make_test_backend(
         egress_proxy_url="http://proxy.internal:8080",
         dynamic_fetcher=fetcher,
         stealthy_fetcher=fetcher,
@@ -1125,7 +1223,7 @@ def test_proxy_credentials_are_absent_from_logs_and_errors(
         log.error("proxy failure: %s", kwargs["proxy"])
         raise RuntimeError(kwargs["proxy"])
 
-    backend = ScraplingBackend(
+    backend = make_test_backend(
         egress_proxy_url=f"http://user:{secret}@proxy.internal:8080",
         http_fetcher=fetcher,
     )

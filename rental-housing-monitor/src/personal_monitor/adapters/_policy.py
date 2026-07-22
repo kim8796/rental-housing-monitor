@@ -14,13 +14,14 @@ import httpx
 from personal_monitor.engine.errors import ErrorClass, FetchError, MonitorError
 from personal_monitor.security.egress import (
     EgressProxyIdentity,
+    EgressProxyPolicy,
     hold_http_egress_slot,
-    require_egress_proxy,
 )
 from personal_monitor.security.url_policy import ResolvedTarget, has_unsafe_url_characters
 
 MONITOR_USER_AGENT = "personal-monitor/0.1"
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+TOTAL_TIMEOUT_SECONDS = 30.0
 _JSON_HEADERS = {
     "User-Agent": MONITOR_USER_AGENT,
     "Accept": "application/json",
@@ -66,8 +67,12 @@ class _BoundedBodyAccumulator:
         return bytes(self._body)
 
 
+@dataclass(frozen=True, slots=True, init=False)
 class BoundedPolicyHttpClient:
     """A proxy-required, GET-only HTTP client with two fixed request shapes."""
+
+    _egress_policy: EgressProxyPolicy = field(repr=False)
+    _clock: Clock = field(repr=False)
 
     def __init__(
         self,
@@ -75,12 +80,27 @@ class BoundedPolicyHttpClient:
         egress_proxy_url: str | None,
         clock: Clock = lambda: datetime.now(UTC),
     ) -> None:
-        self._proxy_url, self._proxy_identity = require_egress_proxy(egress_proxy_url)
-        self._clock = clock
+        object.__setattr__(self, "_egress_policy", EgressProxyPolicy.from_url(egress_proxy_url))
+        object.__setattr__(self, "_clock", clock)
+
+    @classmethod
+    def _from_egress_policy(
+        cls,
+        policy: EgressProxyPolicy,
+        *,
+        clock: Clock,
+    ) -> BoundedPolicyHttpClient:
+        instance = cls.__new__(cls)
+        object.__setattr__(instance, "_egress_policy", policy)
+        object.__setattr__(instance, "_clock", clock)
+        return instance
 
     @property
     def proxy_identity(self) -> EgressProxyIdentity:
-        return self._proxy_identity
+        return self._egress_policy.identity
+
+    def _uses_egress_policy(self, policy: EgressProxyPolicy) -> bool:
+        return self._egress_policy.has_same_provenance(policy)
 
     async def get_json(self, target: ResolvedTarget) -> PolicyHttpResponse:
         return await self._get(target, headers=_JSON_HEADERS, require_json=True)
@@ -101,27 +121,27 @@ class BoundedPolicyHttpClient:
         kwargs: dict[str, object] = {
             "timeout": timeout,
             "follow_redirects": False,
-            "proxy": self._proxy_url,
+            "proxy": self._egress_policy.url,
         }
         try:
-            async with (
-                hold_http_egress_slot(),
-                httpx.AsyncClient(**kwargs) as client,  # type: ignore[arg-type]
-            ):
-                request = httpx.Request(
-                    "GET",
-                    target.normalized_url,
-                    headers=headers,
-                    extensions={
-                        "timeout": {
-                            "connect": 10.0,
-                            "read": 30.0,
-                            "write": 30.0,
-                            "pool": 30.0,
-                        }
-                    },
-                )
-                async with asyncio.timeout(30.0):
+            async with asyncio.timeout(TOTAL_TIMEOUT_SECONDS):
+                async with (
+                    hold_http_egress_slot(),
+                    httpx.AsyncClient(**kwargs) as client,  # type: ignore[arg-type]
+                ):
+                    request = httpx.Request(
+                        "GET",
+                        target.normalized_url,
+                        headers=headers,
+                        extensions={
+                            "timeout": {
+                                "connect": 10.0,
+                                "read": 30.0,
+                                "write": 30.0,
+                                "pool": 30.0,
+                            }
+                        },
+                    )
                     response = await client.send(request, stream=True, follow_redirects=False)
                     try:
                         return await _read_response(
@@ -161,8 +181,14 @@ async def _read_response(
     require_json: bool,
     clock: Clock,
 ) -> PolicyHttpResponse:
+    content_encodings = response.headers.get_list("content-encoding")
+    if len(content_encodings) > 1 or (
+        content_encodings
+        and ("," in content_encodings[0] or content_encodings[0].strip().casefold() != "identity")
+    ):
+        raise _policy_error("response Content-Encoding must be identity")
     body = _BoundedBodyAccumulator()
-    async for chunk in response.aiter_bytes():
+    async for chunk in response.aiter_raw():
         body.extend(chunk)
 
     status = response.status_code

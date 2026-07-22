@@ -162,6 +162,16 @@ def test_production_client_has_no_public_test_transport_factory() -> None:
         )
 
 
+def test_policy_client_proxy_identity_cannot_be_replaced() -> None:
+    client = BoundedPolicyHttpClient(egress_proxy_url="http://proxy.internal:8080")
+    other = BoundedPolicyHttpClient(egress_proxy_url="http://other-proxy.internal:8080")
+
+    with pytest.raises((AttributeError, TypeError)):
+        client._proxy_identity = other.proxy_identity
+    with pytest.raises((AttributeError, TypeError)):
+        client._proxy_url = "http://other-proxy.internal:8080"
+
+
 def test_official_constructor_rejects_policy_client_subclasses() -> None:
     class SubclassedClient(BoundedPolicyHttpClient):
         pass
@@ -262,10 +272,48 @@ def test_official_rejects_gzip_body_over_decompressed_limit() -> None:
         clock=lambda: NOW,
     )
 
-    with pytest.raises(MonitorError, match="10 MiB") as caught:
+    with pytest.raises(MonitorError, match="(?i)encoding") as caught:
         asyncio.run(adapter.fetch("monitor-1", official_spec()))
 
     assert caught.value.error_class is ErrorClass.POLICY
+
+
+def test_official_rejects_encoded_body_before_decoded_iteration() -> None:
+    decoded_path_entered = False
+    secret = "compressed-secret"
+
+    class EncodedResponse:
+        status_code = 200
+        url = "https://example.com/products"
+        headers = httpx.Headers(
+            {
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip",
+            }
+        )
+
+        async def aiter_bytes(self):
+            nonlocal decoded_path_entered
+            decoded_path_entered = True
+            raise AssertionError("decoded allocation path entered")
+            yield b""  # pragma: no cover
+
+        async def aiter_raw(self):
+            yield secret.encode()
+
+    with pytest.raises(MonitorError, match="(?i)encoding") as caught:
+        asyncio.run(
+            policy_module._read_response(
+                EncodedResponse(),  # type: ignore[arg-type]
+                require_json=True,
+                clock=lambda: NOW,
+            )
+        )
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert decoded_path_entered is False
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
 
 
 def test_official_manual_redirect_rechecks_full_policy_before_next_get() -> None:
