@@ -1,0 +1,10 @@
+{
+  "products": [
+    {
+      "title": "무선 키보드",
+      "price": "99,000원",
+      "stock": "재고 있음",
+      "url": "/products/sku-7"
+    }
+  ]
+}

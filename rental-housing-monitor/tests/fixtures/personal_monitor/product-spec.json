@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "owner_id": "owner-1",
+  "name": "상품 가격 감시",
+  "target_url": "https://example.com/catalog",
+  "source_adapter": "scrapling",
+  "adapter_ref": null,
+  "fetch_strategy": "auto",
+  "schedule": "0 */6 * * *",
+  "timezone": "Asia/Seoul",
+  "extract": {
+    "item_scope": "main",
+    "fields": {
+      "title": {"selector": "h1", "type": "text", "required": true},
+      "price": {"selector": ".price", "type": "krw", "required": true},
+      "stock": {"selector": ".stock", "type": "text", "required": true},
+      "url": {"selector": "a.detail", "type": "url", "required": true, "attribute": "href"}
+    }
+  },
+  "validators": {
+    "min_items": 1,
+    "max_items": 10,
+    "allowed_link_domains": ["example.com"]
+  },
+  "rules": [
+    {"kind": "numeric_threshold", "field": "price", "operator": "lte", "value": 100000}
+  ],
+  "notify_on_no_change": false,
+  "auth_profile_ref": null
+}
