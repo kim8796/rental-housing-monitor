@@ -61,18 +61,21 @@ class RegistryRepository:
             )
 
     def create_monitor(self, spec: MonitorSpec, *, created_by: str) -> str:
+        if created_by != spec.owner_id:
+            raise ValueError("initial monitor approver must be the monitor owner")
         monitor_id = uuid4().hex
         version_id = uuid4().hex
         created_at = utc_now().isoformat()
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "INSERT INTO monitors(id, owner_id, name, status, active_version_id, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?)",
+                "next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
                 (
                     monitor_id,
                     spec.owner_id,
                     spec.name,
                     MonitorStatus.ACTIVE.value,
+                    created_at,
                     created_at,
                     created_at,
                 ),
@@ -115,6 +118,8 @@ class RegistryRepository:
                 raise ValueError("monitor does not exist")
             if monitor["owner_id"] != spec.owner_id:
                 raise ValueError("monitor version owner must match monitor owner")
+            if approved and created_by != monitor["owner_id"]:
+                raise ValueError("approved monitor version must be created by the owner")
             next_version = self.connection.execute(
                 "SELECT COALESCE(MAX(version_number), 0) + 1 FROM monitor_versions "
                 "WHERE monitor_id = ?",
@@ -139,28 +144,36 @@ class RegistryRepository:
 
     def approve_version(self, version_id: str, *, approved_by: str) -> None:
         with transaction(self.connection):
+            version = self.connection.execute(
+                "SELECT m.owner_id, v.approved_at FROM monitor_versions AS v "
+                "JOIN monitors AS m ON m.id = v.monitor_id WHERE v.id = ?",
+                (version_id,),
+            ).fetchone()
+            if version is None:
+                raise ValueError("monitor version does not exist")
+            if version["owner_id"] != approved_by:
+                raise ValueError("only the monitor owner may approve a version")
+            if version["approved_at"] is not None:
+                return
             cursor = self.connection.execute(
                 "UPDATE monitor_versions SET approved_by = ?, approved_at = ? "
                 "WHERE id = ? AND approved_at IS NULL",
                 (approved_by, utc_now().isoformat(), version_id),
             )
-            if (
-                cursor.rowcount == 0
-                and self.connection.execute(
-                    "SELECT 1 FROM monitor_versions WHERE id = ?", (version_id,)
-                ).fetchone()
-                is None
-            ):
-                raise ValueError("monitor version does not exist")
+            if cursor.rowcount != 1:
+                raise ValueError("monitor version approval changed concurrently")
 
-    def activate_version(self, monitor_id: str, version_id: str) -> None:
+    def activate_version(self, monitor_id: str, version_id: str, *, owner_id: str) -> None:
         with transaction(self.connection, immediate=True):
             version = self.connection.execute(
-                "SELECT monitor_id, approved_at FROM monitor_versions WHERE id = ?",
+                "SELECT v.monitor_id, v.approved_at, m.owner_id FROM monitor_versions AS v "
+                "JOIN monitors AS m ON m.id = v.monitor_id WHERE v.id = ?",
                 (version_id,),
             ).fetchone()
             if version is None or version["monitor_id"] != monitor_id:
                 raise ValueError("version does not belong to monitor")
+            if version["owner_id"] != owner_id:
+                raise ValueError("only the monitor owner may activate a version")
             if version["approved_at"] is None:
                 raise ValueError("version must be approved before activation")
             cursor = self.connection.execute(

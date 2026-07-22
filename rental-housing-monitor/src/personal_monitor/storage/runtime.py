@@ -13,6 +13,7 @@ from personal_monitor.domain.observation import (
     ObservedItem,
     content_hash,
 )
+from personal_monitor.domain.spec import MonitorStatus
 from personal_monitor.storage.schema import (
     canonical_json,
     transaction,
@@ -46,6 +47,12 @@ class OutboxRow:
 
 
 @dataclass(frozen=True, slots=True)
+class MonitorLease:
+    monitor_id: str
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
 class DeliveryCandidate:
     dedupe_key: str
     target_id: str
@@ -59,7 +66,9 @@ class RuntimeRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
-    def claim_due(self, *, worker_id: str, now: datetime, lease_seconds: int = 300) -> list[str]:
+    def claim_due(
+        self, *, worker_id: str, now: datetime, lease_seconds: int = 300
+    ) -> list[MonitorLease]:
         now_timestamp = utc_timestamp(now, parameter="now")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -68,39 +77,73 @@ class RuntimeRepository:
         )
         with transaction(self.connection, immediate=True):
             rows = self.connection.execute(
-                "SELECT id FROM monitors WHERE status = 'active' "
+                "SELECT id, lease_generation FROM monitors WHERE status = 'active' "
                 "AND next_run_at IS NOT NULL AND next_run_at <= ? "
                 "AND (lease_expires_at IS NULL OR lease_expires_at <= ?) "
                 "ORDER BY next_run_at, id",
                 (now_timestamp, now_timestamp),
             ).fetchall()
-            monitor_ids = [row["id"] for row in rows]
-            for monitor_id in monitor_ids:
-                self.connection.execute(
-                    "UPDATE monitors SET lease_owner = ?, lease_expires_at = ? WHERE id = ?",
-                    (worker_id, lease_expires_at, monitor_id),
+            leases: list[MonitorLease] = []
+            for row in rows:
+                generation = row["lease_generation"] + 1
+                cursor = self.connection.execute(
+                    "UPDATE monitors SET lease_owner = ?, lease_expires_at = ?, "
+                    "lease_generation = ? WHERE id = ? AND lease_generation = ?",
+                    (
+                        worker_id,
+                        lease_expires_at,
+                        generation,
+                        row["id"],
+                        row["lease_generation"],
+                    ),
                 )
-        return monitor_ids
+                if cursor.rowcount == 1:
+                    leases.append(MonitorLease(row["id"], generation))
+        return leases
 
-    def release_lease(self, monitor_id: str, *, worker_id: str, next_run_at: datetime) -> None:
+    def release_lease(self, lease: MonitorLease, *, worker_id: str, next_run_at: datetime) -> None:
         next_timestamp = utc_timestamp(next_run_at, parameter="next_run_at")
         with transaction(self.connection):
             cursor = self.connection.execute(
                 "UPDATE monitors SET lease_owner = NULL, lease_expires_at = NULL, "
-                "next_run_at = ?, updated_at = ? WHERE id = ? AND lease_owner = ?",
-                (next_timestamp, next_timestamp, monitor_id, worker_id),
+                "next_run_at = ?, updated_at = ? WHERE id = ? AND lease_owner = ? "
+                "AND lease_generation = ?",
+                (
+                    next_timestamp,
+                    next_timestamp,
+                    lease.monitor_id,
+                    worker_id,
+                    lease.generation,
+                ),
             )
             if cursor.rowcount != 1:
-                raise ValueError("worker is not the monitor lease owner")
+                raise ValueError("worker does not own this monitor lease generation")
 
-    def start_run(self, monitor_id: str, version_id: str, *, started_at: datetime) -> str:
+    def start_run(
+        self,
+        lease: MonitorLease,
+        version_id: str,
+        *,
+        worker_id: str,
+        fetch_strategy: str,
+        started_at: datetime,
+    ) -> str:
         started_timestamp = utc_timestamp(started_at, parameter="started_at")
         run_id = uuid4().hex
         with transaction(self.connection):
+            self._assert_monitor_lease(lease, worker_id)
             self.connection.execute(
-                "INSERT INTO runs(id, monitor_id, version_id, stage, status, started_at) "
-                "VALUES (?, ?, ?, 'fetch', 'running', ?)",
-                (run_id, monitor_id, version_id, started_timestamp),
+                "INSERT INTO runs(id, monitor_id, version_id, lease_generation, stage, "
+                "fetch_strategy, status, started_at) "
+                "VALUES (?, ?, ?, ?, 'fetch', ?, 'running', ?)",
+                (
+                    run_id,
+                    lease.monitor_id,
+                    version_id,
+                    lease.generation,
+                    fetch_strategy,
+                    started_timestamp,
+                ),
             )
         return run_id
 
@@ -108,6 +151,8 @@ class RuntimeRepository:
         self,
         run_id: str,
         *,
+        lease: MonitorLease,
+        worker_id: str,
         status: str,
         stage: str,
         error_class: str | None = None,
@@ -117,13 +162,47 @@ class RuntimeRepository:
         if error_class is not None and len(error_class) > 120:
             raise ValueError("error_class must be at most 120 characters")
         with transaction(self.connection):
+            self._assert_monitor_lease(lease, worker_id)
             cursor = self.connection.execute(
                 "UPDATE runs SET status = ?, stage = ?, finished_at = ?, error_class = ?, "
-                "error_detail = ? WHERE id = ?",
-                (status, stage, utc_now().isoformat(), error_class, error_detail, run_id),
+                "error_detail = ? WHERE id = ? AND monitor_id = ? AND lease_generation = ?",
+                (
+                    status,
+                    stage,
+                    utc_now().isoformat(),
+                    error_class,
+                    error_detail,
+                    run_id,
+                    lease.monitor_id,
+                    lease.generation,
+                ),
             )
             if cursor.rowcount != 1:
-                raise ValueError("run does not exist")
+                raise ValueError("run does not belong to this monitor lease generation")
+
+    def transition_monitor_status(
+        self,
+        lease: MonitorLease,
+        *,
+        worker_id: str,
+        expected: MonitorStatus,
+        target: MonitorStatus,
+    ) -> None:
+        with transaction(self.connection):
+            cursor = self.connection.execute(
+                "UPDATE monitors SET status = ?, updated_at = ? WHERE id = ? AND status = ? "
+                "AND lease_owner = ? AND lease_generation = ?",
+                (
+                    target.value,
+                    utc_now().isoformat(),
+                    lease.monitor_id,
+                    expected.value,
+                    worker_id,
+                    lease.generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("worker does not own this monitor lease generation")
 
     def load_items(self, monitor_id: str) -> list[ObservedItem]:
         rows = self.connection.execute(
@@ -186,23 +265,41 @@ class RuntimeRepository:
         with transaction(self.connection, immediate=True):
             return self._enqueue_delivery(
                 monitor_id,
-                DeliveryCandidate(
-                    dedupe_key=dedupe_key, target_id=target_id, payload=payload
-                ),
+                DeliveryCandidate(dedupe_key=dedupe_key, target_id=target_id, payload=payload),
             )
 
     def apply_snapshot_and_deliveries(
-        self, batch: ObservationBatch, candidates: Sequence[DeliveryCandidate]
+        self,
+        batch: ObservationBatch,
+        candidates: Sequence[DeliveryCandidate],
+        *,
+        lease: MonitorLease,
+        worker_id: str,
     ) -> list[str]:
         with transaction(self.connection, immediate=True):
+            if batch.monitor_id != lease.monitor_id:
+                raise ValueError("batch monitor does not match lease")
+            self._assert_monitor_lease(lease, worker_id)
             self._upsert_items(batch)
             return [self._enqueue_delivery(batch.monitor_id, candidate) for candidate in candidates]
 
     def _enqueue_delivery(self, monitor_id: str, candidate: DeliveryCandidate) -> str:
+        ownership = self.connection.execute(
+            "SELECT m.owner_id AS monitor_owner, t.owner_id AS target_owner "
+            "FROM monitors AS m JOIN delivery_targets AS t ON t.id = ? WHERE m.id = ?",
+            (candidate.target_id, monitor_id),
+        ).fetchone()
+        if ownership is None:
+            raise ValueError("monitor or delivery target does not exist")
+        if ownership["monitor_owner"] != ownership["target_owner"]:
+            raise ValueError("delivery target owner must match monitor owner")
         existing = self.connection.execute(
-            "SELECT id FROM outbox WHERE dedupe_key = ?", (candidate.dedupe_key,)
+            "SELECT id, monitor_id, target_id FROM outbox WHERE dedupe_key = ?",
+            (candidate.dedupe_key,),
         ).fetchone()
         if existing is not None:
+            if existing["monitor_id"] != monitor_id or existing["target_id"] != candidate.target_id:
+                raise ValueError("delivery dedupe key belongs to another aggregate")
             return existing["id"]
         outbox_id = uuid4().hex
         created_at = utc_now().isoformat()
@@ -220,6 +317,14 @@ class RuntimeRepository:
             ),
         )
         return outbox_id
+
+    def _assert_monitor_lease(self, lease: MonitorLease, worker_id: str) -> None:
+        owned = self.connection.execute(
+            "SELECT 1 FROM monitors WHERE id = ? AND lease_owner = ? AND lease_generation = ?",
+            (lease.monitor_id, worker_id, lease.generation),
+        ).fetchone()
+        if owned is None:
+            raise ValueError("worker does not own this monitor lease generation")
 
     def claim_due_outbox(
         self,

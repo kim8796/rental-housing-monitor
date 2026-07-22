@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from personal_monitor.cli import main
 
 
@@ -79,7 +81,7 @@ def test_database_integrity_check_returns_safe_nonzero_for_failure(
             self.closed = True
 
     connection = CorruptConnection()
-    monkeypatch.setattr("personal_monitor.cli.open_database", lambda path: connection)
+    monkeypatch.setattr("personal_monitor.cli.open_existing_database", lambda path: connection)
 
     assert main(["database", "integrity-check", "--path", str(tmp_path / "db")]) != 0
 
@@ -101,7 +103,8 @@ def test_database_integrity_check_requires_an_ok_result(
             pass
 
     monkeypatch.setattr(
-        "personal_monitor.cli.open_database", lambda path: EmptyIntegrityConnection()
+        "personal_monitor.cli.open_existing_database",
+        lambda path: EmptyIntegrityConnection(),
     )
 
     assert main(["database", "integrity-check", "--path", str(tmp_path / "db")]) != 0
@@ -118,6 +121,7 @@ def test_database_vacuum_uses_a_database_connection(tmp_path: Path) -> None:
 
 def test_maintenance_command_runs_once_and_closes_its_database(tmp_path: Path) -> None:
     database_path = tmp_path / "monitor.sqlite3"
+    assert main(["database", "init", "--path", str(database_path)]) == 0
     assert main(["maintenance", "run", "--database", str(database_path)]) == 0
 
     connection = sqlite3.connect(database_path)
@@ -125,6 +129,25 @@ def test_maintenance_command_runs_once_and_closes_its_database(tmp_path: Path) -
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["database", "integrity-check", "--path"],
+        ["database", "vacuum", "--path"],
+        ["maintenance", "run", "--database"],
+    ],
+)
+def test_non_init_commands_reject_a_misspelled_path_without_creating_it(
+    tmp_path: Path, arguments: list[str]
+) -> None:
+    database_path = tmp_path / "misspelled-parent" / "monitor.sqlite3"
+
+    assert main([*arguments, str(database_path)]) != 0
+
+    assert not database_path.exists()
+    assert not database_path.parent.exists()
 
 
 def test_module_entry_point_lists_operator_commands() -> None:

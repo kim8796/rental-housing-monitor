@@ -6,10 +6,10 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 
 _MIGRATION_1 = """
-CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 CREATE TABLE users(
   id TEXT PRIMARY KEY, telegram_user_id INTEGER NOT NULL UNIQUE,
   status TEXT NOT NULL, created_at TEXT NOT NULL
@@ -22,7 +22,8 @@ CREATE TABLE delivery_targets(
 CREATE TABLE monitors(
   id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL,
   status TEXT NOT NULL, active_version_id TEXT, next_run_at TEXT,
-  lease_owner TEXT, lease_expires_at TEXT, disabled_at TEXT,
+  lease_owner TEXT, lease_expires_at TEXT, lease_generation INTEGER NOT NULL DEFAULT 0,
+  disabled_at TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   FOREIGN KEY(owner_id) REFERENCES users(id)
 );
@@ -39,7 +40,8 @@ CREATE TABLE observations(
 );
 CREATE TABLE runs(
   id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, version_id TEXT NOT NULL,
-  stage TEXT NOT NULL, fetch_strategy TEXT, status TEXT NOT NULL,
+  lease_generation INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL,
+  fetch_strategy TEXT, status TEXT NOT NULL,
   started_at TEXT NOT NULL, finished_at TEXT, error_class TEXT, error_detail TEXT,
   FOREIGN KEY(monitor_id) REFERENCES monitors(id)
 );
@@ -70,6 +72,8 @@ CREATE INDEX outbox_due_idx ON outbox(status, available_at);
 CREATE INDEX runs_monitor_started_idx ON runs(monitor_id, started_at);
 """
 
+_MIGRATIONS = ((1, _MIGRATION_1),)
+
 
 def open_database(path: str | Path) -> sqlite3.Connection:
     """Open a configured SQLite connection and atomically apply known migrations."""
@@ -77,10 +81,7 @@ def open_database(path: str | Path) -> sqlite3.Connection:
     if str(path) != ":memory:":
         database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA busy_timeout = 5000")
+    _configure_connection(connection)
     try:
         _apply_migrations(connection)
     except BaseException:
@@ -89,22 +90,67 @@ def open_database(path: str | Path) -> sqlite3.Connection:
     return connection
 
 
+def open_existing_database(path: str | Path) -> sqlite3.Connection:
+    """Open an initialized database without creating files or applying migrations."""
+    database_path = Path(path)
+    if str(path) == ":memory:" or not database_path.is_file():
+        raise FileNotFoundError("database file does not exist")
+    uri = f"file:{quote(str(database_path.resolve()))}?mode=rw"
+    connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+    _configure_connection(connection)
+    try:
+        _validate_existing_schema(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _configure_connection(connection: sqlite3.Connection) -> None:
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 5000")
+
+
+def _validate_existing_schema(connection: sqlite3.Connection) -> None:
+    has_migrations = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    ).fetchone()
+    if has_migrations is None:
+        raise RuntimeError("database is not initialized")
+    applied = {
+        row["version"] for row in connection.execute("SELECT version FROM schema_migrations")
+    }
+    supported = _MIGRATIONS[-1][0]
+    if any(version > supported for version in applied):
+        raise RuntimeError("database migration is newer than supported by this binary")
+    if supported not in applied:
+        raise RuntimeError("database schema is incomplete")
+
+
 def _apply_migrations(connection: sqlite3.Connection) -> None:
     with transaction(connection, immediate=True):
-        has_migrations = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
-        ).fetchone()
-        if (
-            has_migrations
-            and connection.execute("SELECT 1 FROM schema_migrations WHERE version = 1").fetchone()
-        ):
-            return
-        for statement in _statements(_MIGRATION_1):
-            connection.execute(statement)
         connection.execute(
-            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)",
-            (utc_now().isoformat(),),
+            "CREATE TABLE IF NOT EXISTS schema_migrations("
+            "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
+        applied = {
+            row["version"] if isinstance(row, sqlite3.Row) else row[0]
+            for row in connection.execute("SELECT version FROM schema_migrations")
+        }
+        supported = _MIGRATIONS[-1][0]
+        if any(version > supported for version in applied):
+            raise RuntimeError("database migration is newer than supported by this binary")
+        for version, script in _MIGRATIONS:
+            if version in applied:
+                continue
+            for statement in _statements(script):
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (version, utc_now().isoformat()),
+            )
 
 
 def _statements(script: str) -> Iterator[str]:

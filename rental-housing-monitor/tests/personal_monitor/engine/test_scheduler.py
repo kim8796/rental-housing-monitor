@@ -8,7 +8,12 @@ import pytest
 
 from personal_monitor.domain.spec import MonitorSpec
 from personal_monitor.engine.scheduler import Scheduler, next_run_at, stable_jitter_seconds
-from personal_monitor.storage import RegistryRepository, RuntimeRepository, open_database
+from personal_monitor.storage import (
+    MonitorLease,
+    RegistryRepository,
+    RuntimeRepository,
+    open_database,
+)
 
 
 def make_spec(*, name: str = "가격 감시", schedule: str = "0 12 * * *") -> MonitorSpec:
@@ -106,7 +111,7 @@ def test_tick_claims_due_monitor_once(
     )
     scheduler = Scheduler(runtime, worker_id="worker-a")
 
-    assert scheduler.tick(now) == [monitor_id]
+    assert scheduler.tick(now) == [MonitorLease(monitor_id, 1)]
     assert scheduler.tick(now) == []
 
 
@@ -135,7 +140,7 @@ def test_tick_reclaims_monitor_after_lease_expiry(
         (now.isoformat(), "worker-a", now.isoformat(), monitor_id),
     )
 
-    assert Scheduler(runtime, worker_id="worker-b").tick(now) == [monitor_id]
+    assert Scheduler(runtime, worker_id="worker-b").tick(now) == [MonitorLease(monitor_id, 1)]
 
 
 def test_release_lease_rejects_a_different_worker(
@@ -147,9 +152,7 @@ def test_release_lease_rejects_a_different_worker(
     connection.execute(
         "UPDATE monitors SET next_run_at = ? WHERE id = ?", (now.isoformat(), monitor_id)
     )
-    Scheduler(runtime, worker_id="worker-a").tick(now)
+    lease = Scheduler(runtime, worker_id="worker-a").tick(now)[0]
 
-    with pytest.raises(ValueError, match="lease owner"):
-        runtime.release_lease(
-            monitor_id, worker_id="worker-b", next_run_at=now + timedelta(hours=1)
-        )
+    with pytest.raises(ValueError, match="lease generation"):
+        runtime.release_lease(lease, worker_id="worker-b", next_run_at=now + timedelta(hours=1))

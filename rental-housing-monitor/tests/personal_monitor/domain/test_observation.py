@@ -30,9 +30,10 @@ def test_item_id_falls_back_to_canonical_core_fields() -> None:
 
 
 def test_content_hash_uses_compact_sorted_utf8_json() -> None:
-    assert content_hash({"title": "서울", "price": 99_000}) == sha256(
-        '{"price":99000,"title":"서울"}'.encode()
-    ).hexdigest()
+    assert (
+        content_hash({"title": "서울", "price": 99_000})
+        == sha256('{"price":99000,"title":"서울"}'.encode()).hexdigest()
+    )
 
 
 def test_diff_reports_changed_fields_in_item_id_order() -> None:

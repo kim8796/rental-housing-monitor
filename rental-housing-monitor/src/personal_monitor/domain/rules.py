@@ -45,9 +45,7 @@ def evaluate_rules(
     return matches
 
 
-def _crossed(
-    previous: Scalar, current: Scalar, operator: str | None, threshold: Scalar
-) -> bool:
+def _crossed(previous: Scalar, current: Scalar, operator: str | None, threshold: Scalar) -> bool:
     if not (_is_number(current) and _is_number(threshold)):
         return False
     if not _satisfies(current, operator, threshold):

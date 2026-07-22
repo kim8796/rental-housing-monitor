@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from personal_monitor.domain.observation import (
+    ObservationBatch,
     ObservedItem,
     SourceWarning,
     content_hash,
@@ -16,10 +17,16 @@ from personal_monitor.domain.observation import (
 )
 from personal_monitor.domain.rules import RuleMatch, evaluate_rules
 from personal_monitor.domain.spec import MonitorSpec, MonitorStatus, RuleKind
+from personal_monitor.domain.validator import BatchValidationError, validate_batch
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.engine.scheduler import next_run_at
 from personal_monitor.ports import AdapterRegistry, Clock
-from personal_monitor.storage import DeliveryCandidate, RegistryRepository, RuntimeRepository
+from personal_monitor.storage import (
+    DeliveryCandidate,
+    MonitorLease,
+    RegistryRepository,
+    RuntimeRepository,
+)
 
 _DIAGNOSTIC_CODES = {
     ErrorClass.TRANSIENT_NETWORK: "network_error",
@@ -65,19 +72,26 @@ class MonitorRunner:
         self.clock = clock
         self.worker_id = worker_id
 
-    async def run(self, monitor_id: str) -> RunResult:
+    async def run(self, lease: MonitorLease) -> RunResult:
+        monitor_id = lease.monitor_id
         active = self.registry.get_active_monitor(monitor_id)
         spec = active.spec
         target = self.registry.get_primary_target(active.owner_id)
         started_at = self.clock.now()
-        run_id = self.runtime.start_run(monitor_id, active.version_id, started_at=started_at)
+        run_id = self.runtime.start_run(
+            lease,
+            active.version_id,
+            worker_id=self.worker_id,
+            fetch_strategy=spec.fetch_strategy.value,
+            started_at=started_at,
+        )
         outcome = _cancellation_outcome()
         pending_error: BaseException | None = None
         cleanup_error: BaseException | None = None
         completed_result = outcome.result
         try:
             try:
-                result = await self._run_started(monitor_id, spec, target.id)
+                result = await self._run_started(lease, spec, target.id)
             except asyncio.CancelledError as caught:
                 pending_error = caught
             except Exception as caught:
@@ -94,9 +108,7 @@ class MonitorRunner:
         finally:
             try:
                 completed_result = await _shield_cleanup(
-                    self._complete_started_run(
-                        monitor_id, spec, run_id, started_at, outcome
-                    )
+                    self._complete_started_run(lease, spec, run_id, started_at, outcome)
                 )
             except BaseException as caught:
                 cleanup_error = caught
@@ -107,16 +119,26 @@ class MonitorRunner:
             raise cleanup_error
         return completed_result
 
-    async def _run_started(self, monitor_id: str, spec: MonitorSpec, target_id: str) -> RunResult:
+    async def _run_started(
+        self, lease: MonitorLease, spec: MonitorSpec, target_id: str
+    ) -> RunResult:
+        monitor_id = lease.monitor_id
         batch = await self.adapters.resolve(spec.source_adapter, spec.adapter_ref).fetch(
             monitor_id, spec
         )
         if batch.monitor_id != monitor_id:
             raise MonitorError(ErrorClass.VALIDATION, "validate", "batch monitor mismatch")
+        try:
+            validate_batch(spec, batch)
+        except BatchValidationError as error:
+            raise MonitorError(
+                ErrorClass.VALIDATION, "validate", "adapter batch validation failed"
+            ) from error
         previous = self.runtime.load_items(monitor_id)
-        changes = diff_items(previous, list(batch.items))
+        snapshot_batch = _snapshot_batch(batch, previous)
+        changes = diff_items(previous, list(snapshot_batch.items))
         previous_by_id = {item.item_id: item for item in previous}
-        current_by_id = {item.item_id: item for item in batch.items}
+        current_by_id = {item.item_id: item for item in snapshot_batch.items}
         candidates: list[DeliveryCandidate] = []
         matched_count = 0
         for change in changes:
@@ -139,12 +161,12 @@ class MonitorRunner:
                     )
                 )
         if batch.warnings:
+            local_date = batch.observed_at.astimezone(ZoneInfo(spec.timezone)).date()
             for warning in batch.warnings:
                 candidates.append(
                     DeliveryCandidate(
                         dedupe_key=(
-                            f"{monitor_id}:warning:{batch.observed_at.date()}:"
-                            f"{warning.source}:{warning.stage}"
+                            f"{monitor_id}:warning:{local_date}:{warning.source}:{warning.stage}"
                         ),
                         target_id=target_id,
                         payload=render_warning(spec, warning, batch.source_status),
@@ -163,7 +185,9 @@ class MonitorRunner:
             run_status = "success"
         else:
             run_status = "success"
-        self.runtime.apply_snapshot_and_deliveries(batch, candidates)
+        self.runtime.apply_snapshot_and_deliveries(
+            snapshot_batch, candidates, lease=lease, worker_id=self.worker_id
+        )
         return RunResult(
             status=run_status,
             matched_count=matched_count,
@@ -172,19 +196,23 @@ class MonitorRunner:
 
     async def _complete_started_run(
         self,
-        monitor_id: str,
+        lease: MonitorLease,
         spec: MonitorSpec,
         run_id: str,
         started_at: datetime,
         outcome: _RunOutcome,
     ) -> RunResult:
+        monitor_id = lease.monitor_id
         cleanup_error: Exception | None = None
         schedule_base = started_at
         try:
             if outcome.transition_to is not None:
                 try:
-                    self.registry.transition_status(
-                        monitor_id, MonitorStatus.ACTIVE, outcome.transition_to
+                    self.runtime.transition_monitor_status(
+                        lease,
+                        worker_id=self.worker_id,
+                        expected=MonitorStatus.ACTIVE,
+                        target=outcome.transition_to,
                     )
                 except Exception as caught:
                     cleanup_error = caught
@@ -203,6 +231,8 @@ class MonitorRunner:
             try:
                 self.runtime.finish_run(
                     run_id,
+                    lease=lease,
+                    worker_id=self.worker_id,
                     status=outcome.result.status,
                     stage=outcome.stage,
                     error_class=(
@@ -215,7 +245,7 @@ class MonitorRunner:
                     cleanup_error = caught
         finally:
             self.runtime.release_lease(
-                monitor_id,
+                lease,
                 worker_id=self.worker_id,
                 next_run_at=scheduled_at,
             )
@@ -281,9 +311,22 @@ def _aware_fallback(value: datetime) -> datetime:
     return value.astimezone(UTC) + timedelta(minutes=5)
 
 
-def render_payload(
-    spec: MonitorSpec, item: ObservedItem, match: RuleMatch
-) -> dict[str, object]:
+def _snapshot_batch(batch: ObservationBatch, previous: list[ObservedItem]) -> ObservationBatch:
+    if not batch.warnings:
+        return batch
+    merged = {item.item_id: item for item in previous}
+    merged.update((item.item_id, item) for item in batch.items)
+    return ObservationBatch(
+        monitor_id=batch.monitor_id,
+        items=tuple(merged[item_id] for item_id in sorted(merged)),
+        observed_at=batch.observed_at,
+        source_hash=batch.source_hash,
+        source_status=batch.source_status,
+        warnings=batch.warnings,
+    )
+
+
+def render_payload(spec: MonitorSpec, item: ObservedItem, match: RuleMatch) -> dict[str, object]:
     del item
     return {
         "text": (

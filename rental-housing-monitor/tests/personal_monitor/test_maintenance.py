@@ -86,7 +86,7 @@ def _exists(
     )
 
 
-def test_removes_completed_runs_strictly_older_than_ninety_days(
+def test_removes_runs_by_finish_or_fallback_start_strictly_older_than_ninety_days(
     connection: sqlite3.Connection, now: datetime
 ) -> None:
     _add_monitor(connection, "monitor")
@@ -110,7 +110,7 @@ def test_removes_completed_runs_strictly_older_than_ninety_days(
 
     assert not _exists(connection, "runs", "old")
     assert _exists(connection, "runs", "boundary")
-    assert _exists(connection, "runs", "unfinished")
+    assert not _exists(connection, "runs", "unfinished")
 
 
 def test_removes_delivery_before_its_delivered_outbox_strictly_after_window(

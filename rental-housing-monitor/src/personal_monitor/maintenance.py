@@ -20,7 +20,7 @@ class Maintenance:
         cutoffs = _Cutoffs.from_now(now)
         with transaction(self.connection, immediate=True):
             self.connection.execute(
-                "DELETE FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?",
+                "DELETE FROM runs WHERE COALESCE(finished_at, started_at) < ?",
                 (cutoffs.runs,),
             )
             self._delete_old_deliveries(cutoffs.deliveries)

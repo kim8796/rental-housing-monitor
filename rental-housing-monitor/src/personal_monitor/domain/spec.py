@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from enum import StrEnum
+from math import isfinite
+from types import MappingProxyType
 from typing import Annotated, Literal
 from urllib.parse import parse_qsl, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True, strict=True)
 
 
 class SourceAdapterKind(StrEnum):
@@ -86,6 +96,11 @@ class FieldSpec(StrictModel):
     attribute: Annotated[str | None, Field(max_length=80)] = None
     pattern: Annotated[str | None, Field(max_length=300)] = None
 
+    @field_validator("type", mode="before")
+    @classmethod
+    def parse_field_type(cls, value: object) -> object:
+        return FieldType(value) if isinstance(value, str) else value
+
     @field_validator("selector")
     @classmethod
     def selector_is_declarative(cls, value: str) -> str:
@@ -98,7 +113,16 @@ class FieldSpec(StrictModel):
 
 class ExtractSpec(StrictModel):
     item_scope: Annotated[str, Field(min_length=1, max_length=500)]
-    fields: dict[Annotated[str, Field(pattern=SAFE_FIELD.pattern)], FieldSpec]
+    fields: Mapping[Annotated[str, Field(pattern=SAFE_FIELD.pattern)], FieldSpec]
+
+    @field_validator("fields")
+    @classmethod
+    def fields_are_read_only(cls, values: Mapping[str, FieldSpec]) -> Mapping[str, FieldSpec]:
+        return MappingProxyType(dict(values))
+
+    @field_serializer("fields")
+    def serialize_fields(self, values: Mapping[str, FieldSpec]) -> dict[str, FieldSpec]:
+        return dict(values)
 
     @field_validator("item_scope")
     @classmethod
@@ -109,18 +133,23 @@ class ExtractSpec(StrictModel):
 class ValidatorSpec(StrictModel):
     min_items: Annotated[int, Field(ge=0, le=10_000)] = 1
     max_items: Annotated[int, Field(ge=1, le=10_000)] = 1
-    allowed_link_domains: list[str] = Field(default_factory=list, max_length=50)
+    allowed_link_domains: tuple[str, ...] = Field(default_factory=tuple, max_length=50)
+
+    @field_validator("allowed_link_domains", mode="before")
+    @classmethod
+    def parse_allowed_link_domains(cls, values: object) -> object:
+        return tuple(values) if isinstance(values, list) else values
 
     @field_validator("allowed_link_domains")
     @classmethod
-    def domains_are_exact_hosts(cls, values: list[str]) -> list[str]:
+    def domains_are_exact_hosts(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         normalized: list[str] = []
         for value in values:
             host = value.rstrip(".").casefold()
             if not re.fullmatch(r"[a-z0-9.-]+", host) or ".." in host or host.startswith("."):
                 raise ValueError("allowed link domains must be exact ASCII hostnames")
             normalized.append(host)
-        return sorted(set(normalized))
+        return tuple(sorted(set(normalized)))
 
     @model_validator(mode="after")
     def item_range_is_ordered(self) -> ValidatorSpec:
@@ -134,7 +163,17 @@ class RuleSpec(StrictModel):
     field: str | None = None
     operator: Literal["lt", "lte", "eq", "gte", "gt"] | None = None
     value: str | int | float | bool | None = None
-    keywords: list[str] = Field(default_factory=list, max_length=50)
+    keywords: tuple[str, ...] = Field(default_factory=tuple, max_length=50)
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def parse_rule_kind(cls, value: object) -> object:
+        return RuleKind(value) if isinstance(value, str) else value
+
+    @field_validator("keywords", mode="before")
+    @classmethod
+    def parse_keywords(cls, values: object) -> object:
+        return tuple(values) if isinstance(values, list) else values
 
     @model_validator(mode="after")
     def required_arguments_match_kind(self) -> RuleSpec:
@@ -163,6 +202,8 @@ class RuleSpec(StrictModel):
                 or self.keywords
             ):
                 raise ValueError("numeric_threshold requires field, operator, and numeric value")
+            if not isfinite(self.value):
+                raise ValueError("numeric_threshold value must be finite")
         elif self.kind is RuleKind.KEYWORD_MATCH:
             if (
                 self.field is None
@@ -190,9 +231,24 @@ class MonitorSpec(StrictModel):
     timezone: str = "Asia/Seoul"
     extract: ExtractSpec
     validators: ValidatorSpec
-    rules: list[RuleSpec] = Field(min_length=1, max_length=20)
+    rules: tuple[RuleSpec, ...] = Field(min_length=1, max_length=20)
     notify_on_no_change: bool = False
     auth_profile_ref: Annotated[str | None, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")] = None
+
+    @field_validator("source_adapter", mode="before")
+    @classmethod
+    def parse_source_adapter(cls, value: object) -> object:
+        return SourceAdapterKind(value) if isinstance(value, str) else value
+
+    @field_validator("fetch_strategy", mode="before")
+    @classmethod
+    def parse_fetch_strategy(cls, value: object) -> object:
+        return FetchStrategy(value) if isinstance(value, str) else value
+
+    @field_validator("rules", mode="before")
+    @classmethod
+    def parse_rules(cls, values: object) -> object:
+        return tuple(values) if isinstance(values, list) else values
 
     @field_validator("target_url")
     @classmethod
@@ -223,7 +279,8 @@ class MonitorSpec(StrictModel):
         previous = iterator.get_next(datetime)
         for _ in range(SCHEDULE_GAP_SAMPLE_COUNT):
             current = iterator.get_next(datetime)
-            if (current - previous).total_seconds() < MIN_SCHEDULE_INTERVAL_SECONDS:
+            gap = current.astimezone(UTC) - previous.astimezone(UTC)
+            if gap.total_seconds() < MIN_SCHEDULE_INTERVAL_SECONDS:
                 raise ValueError("schedule interval must be at least 15 minutes")
             previous = current
         if self.source_adapter is SourceAdapterKind.SCRAPLING and self.adapter_ref is not None:

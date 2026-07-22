@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -63,14 +63,31 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
     second.close()
 
 
+def test_schema_rejects_a_migration_newer_than_the_binary(tmp_path) -> None:
+    database_path = tmp_path / "future.db"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)",
+        (datetime.now(UTC).isoformat(),),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="newer than supported"):
+        open_database(database_path)
+
+
 def test_schema_migration_rolls_back_every_statement_on_failure(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     connection = sqlite3.connect(tmp_path / "broken.db", isolation_level=None)
     monkeypatch.setattr(
         schema,
-        "_MIGRATION_1",
-        schema._MIGRATION_1 + "\nCREATE TABLE must_rollback(id INTEGER);\nINVALID SQL;",
+        "_MIGRATIONS",
+        ((1, schema._MIGRATION_1 + "\nCREATE TABLE must_rollback(id INTEGER);\nINVALID SQL;"),),
     )
 
     with pytest.raises(sqlite3.OperationalError):
@@ -130,9 +147,12 @@ def test_immediate_operation_rejects_a_caller_owned_transaction_before_work(
         )
 
     assert connection.in_transaction
-    assert connection.execute(
-        "SELECT count(*) FROM monitor_versions WHERE monitor_id = ?", (monitor_id,)
-    ).fetchone()[0] == original_count
+    assert (
+        connection.execute(
+            "SELECT count(*) FROM monitor_versions WHERE monitor_id = ?", (monitor_id,)
+        ).fetchone()[0]
+        == original_count
+    )
     connection.rollback()
 
 
@@ -158,6 +178,8 @@ def test_create_monitor_owns_an_approved_active_version(
     )
     assert version["approved_by"] == "telegram-user:1"
     assert version["approved_at"] is not None
+    created = registry.list_monitors("telegram-user:1")[0]
+    assert created.next_run_at is not None
 
 
 def test_unapproved_version_cannot_become_active(registry: RegistryRepository) -> None:
@@ -167,7 +189,7 @@ def test_unapproved_version_cannot_become_active(registry: RegistryRepository) -
     )
 
     with pytest.raises(ValueError, match="approved"):
-        registry.activate_version(monitor_id, candidate)
+        registry.activate_version(monitor_id, candidate, owner_id="telegram-user:1")
 
 
 def test_version_cannot_be_activated_for_a_different_monitor(
@@ -180,7 +202,7 @@ def test_version_cannot_be_activated_for_a_different_monitor(
     )
 
     with pytest.raises(ValueError, match="belong"):
-        registry.activate_version(second, candidate)
+        registry.activate_version(second, candidate, owner_id="telegram-user:1")
 
 
 def test_monitor_version_must_keep_the_monitor_owner(registry: RegistryRepository) -> None:
@@ -198,9 +220,24 @@ def test_approved_candidate_can_become_active(registry: RegistryRepository) -> N
     candidate = registry.add_version(monitor_id, updated, created_by="codex", approved=False)
 
     registry.approve_version(candidate, approved_by="telegram-user:1")
-    registry.activate_version(monitor_id, candidate)
+    registry.activate_version(monitor_id, candidate, owner_id="telegram-user:1")
 
     assert registry.get_active_spec(monitor_id) == updated
+
+
+def test_only_monitor_owner_can_approve_or_activate_a_version(
+    registry: RegistryRepository,
+) -> None:
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    candidate = registry.add_version(
+        monitor_id, make_spec(name="owner only"), created_by="codex", approved=False
+    )
+
+    with pytest.raises(ValueError, match="owner"):
+        registry.approve_version(candidate, approved_by="telegram-user:2")
+    registry.approve_version(candidate, approved_by="telegram-user:1")
+    with pytest.raises(ValueError, match="owner"):
+        registry.activate_version(monitor_id, candidate, owner_id="telegram-user:2")
 
 
 def test_owner_scoped_lists_never_return_another_users_monitor(

@@ -34,9 +34,12 @@ def test_threshold_matches_only_on_crossing() -> None:
         [rule], previous=item(price=120_000), current=item(price=99_000), is_new=False
     )
     assert [match.kind.value for match in matches] == ["numeric_threshold"]
-    assert evaluate_rules(
-        [rule], previous=item(price=99_000), current=item(price=90_000), is_new=False
-    ) == []
+    assert (
+        evaluate_rules(
+            [rule], previous=item(price=99_000), current=item(price=90_000), is_new=False
+        )
+        == []
+    )
 
 
 def test_threshold_matches_when_previous_field_is_absent() -> None:
@@ -62,12 +65,15 @@ def test_status_equals_matches_when_entering_target_status() -> None:
         [rule], previous=item(status="open"), current=item(status="closed"), is_new=False
     )
     assert [(match.previous, match.current) for match in matches] == [("open", "closed")]
-    assert evaluate_rules(
-        [rule],
-        previous=item(status="closed"),
-        current=item(status="closed"),
-        is_new=False,
-    ) == []
+    assert (
+        evaluate_rules(
+            [rule],
+            previous=item(status="closed"),
+            current=item(status="closed"),
+            is_new=False,
+        )
+        == []
+    )
 
 
 def test_keyword_match_uses_casefold_and_only_new_keywords() -> None:
@@ -76,6 +82,9 @@ def test_keyword_match_uses_casefold_and_only_new_keywords() -> None:
         [rule], previous=item(title="ordinary"), current=item(title="Straße DEAL"), is_new=False
     )
     assert [(match.previous, match.current) for match in matches] == [("ordinary", "Straße DEAL")]
-    assert evaluate_rules(
-        [rule], previous=item(title="Straße"), current=item(title="Straße DEAL"), is_new=False
-    ) == []
+    assert (
+        evaluate_rules(
+            [rule], previous=item(title="Straße"), current=item(title="Straße DEAL"), is_new=False
+        )
+        == []
+    )

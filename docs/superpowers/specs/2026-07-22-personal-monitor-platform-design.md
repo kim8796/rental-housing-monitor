@@ -212,9 +212,26 @@ Scrapling adaptive 저장소, SQLite DB, 암호화된 브라우저 프로필 vau
 
 Scheduler는 `next_run_at`이 지난 활성 모니터에 lease를 발급한다. 같은 모니터는 동시에 두 번 실행하지 않으며 lease가 만료된 비정상 실행만 재개할 수 있다.
 
+lease는 worker ID뿐 아니라 모니터마다 단조 증가하는 generation을 포함한다. Scheduler가
+반환한 `(monitor_id, generation)`을 실행 시작, 상태 전이, 관측값·outbox 원자 커밋, 실행
+종료와 lease 해제까지 그대로 전달하고 모든 변경이 worker와 generation을 함께 비교한다.
+lease가 만료되어 다른 worker가 회수하면 이전 worker는 늦게 끝나더라도 관측값, outbox,
+상태와 다음 실행 시각을 변경할 수 없다. 새 모니터는 생성 트랜잭션에서 생성 시각을
+`next_run_at`으로 저장해 즉시 Scheduler가 선택할 수 있다.
+
 수집 결과는 먼저 validator를 통과해야 관측값이 된다. 관측값은 모니터 ID, 안정적인 항목 ID와 내용 해시로 식별한다. 공식 ID가 있으면 우선 사용하고 없으면 정규화 URL과 핵심 필드에서 결정론적 ID를 만든다.
 
+완전한 수집 결과는 최소·최대 항목 수, 필수 필드, 선언된 scalar 타입, 유한 숫자와 URL
+필드의 정확한 허용 host를 모두 검증한다. 경고가 있는 부분 결과는 최대 항목 수와 제공된
+항목의 필드·타입·host 안전성은 그대로 검증하지만 최소 항목 수보다 적을 수 있다. 부분
+결과에 없는 기존 항목은 삭제하지 않고, 빈 부분 결과도 기존 snapshot 전체를 보존한다.
+경고 알림은 고정된 안전 payload만 사용하며 monitor 시간대의 날짜로 중복 제거한다.
+
 알림 조건이 충족되면 알림을 `outbox`에 먼저 기록한다. Telegram 전송 성공 후에만 `deliveries`를 확정한다. 전송 도중 실패하면 같은 outbox 항목을 재시도하므로 알림이 영구 누락되지 않는다. Telegram message ID가 이미 있는 전달은 다시 보내지 않는다.
+
+관측값과 outbox를 함께 기록하는 트랜잭션은 모든 delivery target의 소유자가 monitor
+소유자와 같은지 확인한다. 설정 버전 승인자와 활성화 요청자도 monitor 소유자여야 한다.
+정기 실행의 신뢰된 내부 ID 조회와 사용자 권한이 필요한 제어 경로 API는 구분한다.
 
 범용 모니터의 기본값은 변경이 없을 때 침묵하는 것이다. 기존 임대주택 모니터는 현재 동작을 보존하기 위해 `notify_on_no_change=true`를 사용해 모든 기관이 정상인 날에만 신규 없음 메시지를 보낸다.
 
@@ -392,6 +409,13 @@ CI는 외부 사이트와 실제 Telegram을 호출하지 않는다. 실사이�
 - 필요하면 Telegram과 동일한 제어 API 위에 웹 관리 화면 추가
 
 개인용 단계에서도 모든 핵심 레코드에 `owner_id`를 두고 repository 프로토콜을 사용하므로 이 전환은 수집기 재작성 없이 가능해야 한다.
+
+`MonitorSpec`은 strict/frozen 입력 경계이며 extract fields는 읽기 전용 mapping, rules,
+keywords와 허용 domain은 tuple로 보관한다. JSON enum 입력과 JSON Schema/model dump 왕복은
+유지하며 NaN/Infinity 임계값은 영속화 전에 거부한다. SQLite migration은 순서가 있는
+registry로 적용하고 binary가 지원하는 것보다 높은 기록 버전은 거부한다. Shadow 배포
+전까지 v1은 변경 가능하지만 첫 shadow 배포 이후에는 v1을 동결하고 후속 변경은 새
+migration으로만 추가한다.
 
 ## 완료 기준
 

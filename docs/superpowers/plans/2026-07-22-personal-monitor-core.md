@@ -197,7 +197,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True, strict=True)
 
 
 class SourceAdapterKind(StrEnum):
@@ -609,7 +609,8 @@ CREATE TABLE delivery_targets(
 CREATE TABLE monitors(
   id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL,
   status TEXT NOT NULL, active_version_id TEXT, next_run_at TEXT,
-  lease_owner TEXT, lease_expires_at TEXT, disabled_at TEXT,
+  lease_owner TEXT, lease_expires_at TEXT, lease_generation INTEGER NOT NULL DEFAULT 0,
+  disabled_at TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   FOREIGN KEY(owner_id) REFERENCES users(id)
 );
@@ -626,7 +627,8 @@ CREATE TABLE observations(
 );
 CREATE TABLE runs(
   id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, version_id TEXT NOT NULL,
-  stage TEXT NOT NULL, fetch_strategy TEXT, status TEXT NOT NULL,
+  lease_generation INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL,
+  fetch_strategy TEXT, status TEXT NOT NULL,
   started_at TEXT NOT NULL, finished_at TEXT, error_class TEXT, error_detail TEXT,
   FOREIGN KEY(monitor_id) REFERENCES monitors(id)
 );
@@ -702,7 +704,7 @@ def add_version(
     self, monitor_id: str, spec: MonitorSpec, *, created_by: str, approved: bool
 ) -> str: ...
 def approve_version(self, version_id: str, *, approved_by: str) -> None: ...
-def activate_version(self, monitor_id: str, version_id: str) -> None: ...
+def activate_version(self, monitor_id: str, version_id: str, *, owner_id: str) -> None: ...
 def get_active_spec(self, monitor_id: str) -> MonitorSpec: ...
 def get_active_monitor(self, monitor_id: str) -> ActiveMonitor: ...
 def get_primary_target(self, owner_id: str) -> DeliveryTargetRow: ...
@@ -734,14 +736,20 @@ class DeliveryCandidate:
     payload: Mapping[str, object]
 
 
-def claim_due(self, *, worker_id: str, now: datetime, lease_seconds: int = 300) -> list[str]: ...
-def release_lease(self, monitor_id: str, *, worker_id: str, next_run_at: datetime) -> None: ...
-def start_run(self, monitor_id: str, version_id: str, *, started_at: datetime) -> str: ...
-def finish_run(self, run_id: str, *, status: str, stage: str, error_class: str | None = None, error_detail: str | None = None) -> None: ...
+@dataclass(frozen=True, slots=True)
+class MonitorLease:
+    monitor_id: str
+    generation: int
+
+
+def claim_due(self, *, worker_id: str, now: datetime, lease_seconds: int = 300) -> list[MonitorLease]: ...
+def release_lease(self, lease: MonitorLease, *, worker_id: str, next_run_at: datetime) -> None: ...
+def start_run(self, lease: MonitorLease, version_id: str, *, worker_id: str, fetch_strategy: str, started_at: datetime) -> str: ...
+def finish_run(self, run_id: str, *, lease: MonitorLease, worker_id: str, status: str, stage: str, error_class: str | None = None, error_detail: str | None = None) -> None: ...
 def load_items(self, monitor_id: str) -> list[ObservedItem]: ...
 def upsert_items(self, batch: ObservationBatch) -> None: ...
 def enqueue_delivery(self, *, dedupe_key: str, monitor_id: str, target_id: str, payload: dict[str, object]) -> str: ...
-def apply_snapshot_and_deliveries(self, batch: ObservationBatch, candidates: Sequence[DeliveryCandidate]) -> list[str]: ...
+def apply_snapshot_and_deliveries(self, batch: ObservationBatch, candidates: Sequence[DeliveryCandidate], *, lease: MonitorLease, worker_id: str) -> list[str]: ...
 def claim_due_outbox(self, *, worker_id: str, now: datetime, lease_seconds: int = 300, limit: int = 50) -> list[OutboxRow]: ...
 def mark_delivered(self, outbox_id: str, *, worker_id: str, message_id: str, delivered_at: datetime) -> None: ...
 def reschedule_outbox(self, outbox_id: str, *, worker_id: str, available_at: datetime, error: str) -> None: ...
@@ -778,7 +786,7 @@ git commit -m "feat: persist versioned monitor state"
 
 **Interfaces:**
 - Consumes: `MonitorSpec.schedule`, `MonitorSpec.timezone`, monitor ID, UTC time, `RuntimeRepository.claim_due()`.
-- Produces: `next_run_at(spec, monitor_id, after) -> datetime`, `stable_jitter_seconds(monitor_id) -> int`, and `Scheduler.tick(now) -> list[str]`.
+- Produces: `next_run_at(spec, monitor_id, after) -> datetime`, `stable_jitter_seconds(monitor_id) -> int`, and `Scheduler.tick(now) -> list[MonitorLease]`.
 
 - [ ] **Step 1: Write failing timezone, jitter, and lease tests**
 
@@ -825,7 +833,7 @@ def next_run_at(spec: MonitorSpec, monitor_id: str, after: datetime) -> datetime
     return (scheduled + timedelta(seconds=jitter)).astimezone(UTC)
 ```
 
-`Scheduler.tick()` claims due rows once, returns their IDs for the worker loop, and never executes a monitor itself. Lease duration is 300 seconds and each release checks `lease_owner` to prevent another worker from clearing the lease.
+`Scheduler.tick()` claims due rows once, returns their generation-bearing leases for the worker loop, and never executes a monitor itself. Lease duration is 300 seconds; every scheduled mutation checks both `lease_owner` and `lease_generation`.
 
 - [ ] **Step 4: Run scheduler and storage tests, then commit**
 
@@ -1056,7 +1064,7 @@ Expected: FAIL importing `personal_monitor.cli` and `personal_monitor.maintenanc
 
 - [ ] **Step 3: Implement exact retention transactions**
 
-`Maintenance.run(now)` deletes completed `runs` older than 90 days, successful `deliveries` and their delivered outbox rows older than 180 days, consumed/expired `pending_actions` older than one day, diagnostic snapshots older than seven days when that table is added by the scraping plan, and disabled monitors older than 30 days with all dependent rows. Run `PRAGMA optimize`; do not run `VACUUM` on every service tick. Expose a separate monthly `database vacuum` command.
+`Maintenance.run(now)` deletes `runs` older than 90 days by `finished_at`, falling back to `started_at` when unfinished; successful `deliveries` and their delivered outbox rows older than 180 days; consumed/expired `pending_actions` older than one day; diagnostic snapshots older than seven days when that table is added by the scraping plan; and disabled monitors older than 30 days with all dependent rows. Run `PRAGMA optimize`; do not run `VACUUM` on every service tick. Expose a separate monthly `database vacuum` command.
 
 - [ ] **Step 4: Implement argparse commands and entry point**
 
@@ -1098,6 +1106,42 @@ git commit -m "feat: add personal monitor runtime CLI"
 ```
 
 ## Core plan completion gate
+
+## Whole-branch review contract amendments (authoritative)
+
+These amendments supersede earlier interface snippets in Tasks 2, 4, 5, 6, and 7.
+
+- `StrictModel` uses Pydantic strict mode as well as frozen/extra-forbid behavior. JSON enum input
+  remains supported. Every nested configuration collection is immutable: extract fields are a
+  read-only mapping and domains, rules, and keywords are tuples. Numeric thresholds reject
+  non-finite values. Schedule minimum-gap checks subtract UTC instants so DST folds do not create a
+  false zero-minute interval.
+- Migration v1 remains mutable until the first shadow deployment and now contains monotonic
+  `monitors.lease_generation` plus the generation captured by each `runs` row. Migrations are an
+  ordered registry, and any recorded version newer than the binary supports is rejected before the
+  schema is applied or accepted. The first shadow deployment freezes v1.
+- `create_monitor()` atomically seeds `next_run_at` to its creation instant, so a new active monitor
+  is immediately claimable through the public scheduler path. The initial approver must be the
+  owner. `approve_version()` verifies the approver is the owner, and
+  `activate_version(monitor_id, version_id, *, owner_id)` requires and verifies the owner.
+- `RuntimeRepository.claim_due()` and `Scheduler.tick()` return immutable
+  `MonitorLease(monitor_id, generation)` values. A scheduled runner must carry that exact lease to
+  `start_run`, status transition, snapshot/outbox commit, `finish_run`, and `release_lease`.
+  Every mutation compares both worker and generation. Expiry/reclaim increments the generation, so
+  an older worker can neither commit observations/outbox nor change status/next-run during cleanup.
+- `start_run()` stores the active spec's fetch strategy. Atomic delivery enqueue verifies every
+  delivery target owner equals the monitor owner; a mismatch rolls back snapshot and outbox work.
+- `validate_batch()` is the deterministic adapter boundary before diff or persistence. Complete
+  batches enforce configured min/max counts, required fields, declared scalar types, finite numeric
+  values, and exact allowed URL hosts. Warning-bearing partial batches still enforce max/type/
+  required/domain safety but may fall below min; their supplied items merge into the old snapshot,
+  absent old items are preserved, and removals are suppressed. An empty partial batch preserves the
+  full snapshot while fixed warning candidates may be enqueued atomically. Warning and no-change
+  dedupe dates use the monitor timezone.
+- Only `database init` may create directories/files or apply migrations. `integrity-check`,
+  `vacuum`, and `maintenance run` open an already initialized file read/write without migrating and
+  fail safely on missing paths. Run retention uses `finished_at`, falling back to `started_at` for
+  unfinished runs, at the same strict 90-day boundary.
 
 Run: `cd rental-housing-monitor && ../.venv/bin/python -m pytest -q && ../.venv/bin/python -m ruff check . && ../.venv/bin/python -m compileall -q src && cd .. && git diff --check && git status --short`
 

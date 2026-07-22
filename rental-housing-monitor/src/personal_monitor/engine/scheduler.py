@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 
 from personal_monitor.domain.spec import MonitorSpec
-from personal_monitor.storage.runtime import RuntimeRepository
+from personal_monitor.storage.runtime import MonitorLease, RuntimeRepository
 
 
 def stable_jitter_seconds(monitor_id: str) -> int:
@@ -38,5 +38,5 @@ class Scheduler:
     runtime: RuntimeRepository
     worker_id: str
 
-    def tick(self, now: datetime) -> list[str]:
+    def tick(self, now: datetime) -> list[MonitorLease]:
         return self.runtime.claim_due(worker_id=self.worker_id, now=now)

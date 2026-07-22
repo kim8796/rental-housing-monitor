@@ -15,6 +15,7 @@ from personal_monitor.domain.observation import (
 from personal_monitor.domain.spec import MonitorSpec, MonitorStatus
 from personal_monitor.storage import (
     DeliveryCandidate,
+    MonitorLease,
     RegistryRepository,
     RuntimeRepository,
     open_database,
@@ -77,7 +78,9 @@ def test_claim_due_leases_only_active_due_monitors(
         ((now - timedelta(seconds=1)).isoformat(), MonitorStatus.PAUSED_USER.value, paused),
     )
 
-    assert runtime.claim_due(worker_id="worker-1", now=now, lease_seconds=30) == [due]
+    assert runtime.claim_due(worker_id="worker-1", now=now, lease_seconds=30) == [
+        MonitorLease(due, 1)
+    ]
     assert runtime.claim_due(worker_id="worker-2", now=now, lease_seconds=30) == []
     lease = connection.execute(
         "SELECT lease_owner, lease_expires_at FROM monitors WHERE id = ?", (due,)
@@ -97,7 +100,7 @@ def test_expired_lease_can_be_reclaimed(
         ((now - timedelta(minutes=1)).isoformat(), "dead-worker", now.isoformat(), monitor_id),
     )
 
-    assert runtime.claim_due(worker_id="worker-2", now=now) == [monitor_id]
+    assert runtime.claim_due(worker_id="worker-2", now=now) == [MonitorLease(monitor_id, 1)]
 
 
 def test_release_lease_requires_its_owner_and_normalizes_next_run(
@@ -109,15 +112,13 @@ def test_release_lease_requires_its_owner_and_normalizes_next_run(
     connection.execute(
         "UPDATE monitors SET next_run_at = ? WHERE id = ?", (now.isoformat(), monitor_id)
     )
-    runtime.claim_due(worker_id="worker-1", now=now)
+    lease = runtime.claim_due(worker_id="worker-1", now=now)[0]
 
-    with pytest.raises(ValueError, match="lease owner"):
-        runtime.release_lease(
-            monitor_id, worker_id="worker-2", next_run_at=now + timedelta(hours=1)
-        )
+    with pytest.raises(ValueError, match="lease generation"):
+        runtime.release_lease(lease, worker_id="worker-2", next_run_at=now + timedelta(hours=1))
 
     korea_time = datetime(2026, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=9)))
-    runtime.release_lease(monitor_id, worker_id="worker-1", next_run_at=korea_time)
+    runtime.release_lease(lease, worker_id="worker-1", next_run_at=korea_time)
     row = connection.execute(
         "SELECT next_run_at, lease_owner, lease_expires_at FROM monitors WHERE id = ?",
         (monitor_id,),
@@ -134,7 +135,11 @@ def test_lease_datetimes_must_be_aware(
     with pytest.raises(ValueError, match="timezone-aware"):
         runtime.claim_due(worker_id="worker-1", now=datetime(2026, 1, 1))
     with pytest.raises(ValueError, match="timezone-aware"):
-        runtime.release_lease(monitor_id, worker_id="worker-1", next_run_at=datetime(2026, 1, 1))
+        runtime.release_lease(
+            MonitorLease(monitor_id, 1),
+            worker_id="worker-1",
+            next_run_at=datetime(2026, 1, 1),
+        )
 
 
 def test_run_lifecycle_normalizes_start_and_stores_safe_error_code(
@@ -144,10 +149,23 @@ def test_run_lifecycle_normalizes_start_and_stores_safe_error_code(
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
     version_id = registry.get_active_monitor(monitor_id).version_id
     started_at = datetime(2026, 1, 1, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+    connection.execute(
+        "UPDATE monitors SET next_run_at = ? WHERE id = ?",
+        (started_at.astimezone(UTC).isoformat(), monitor_id),
+    )
+    lease = runtime.claim_due(worker_id="worker-1", now=started_at)[0]
 
-    run_id = runtime.start_run(monitor_id, version_id, started_at=started_at)
+    run_id = runtime.start_run(
+        lease,
+        version_id,
+        worker_id="worker-1",
+        fetch_strategy="auto",
+        started_at=started_at,
+    )
     runtime.finish_run(
         run_id,
+        lease=lease,
+        worker_id="worker-1",
         status="failed",
         stage="validate",
         error_class="ValidationError",
@@ -160,6 +178,7 @@ def test_run_lifecycle_normalizes_start_and_stores_safe_error_code(
     assert row["started_at"] == "2026-01-01T00:00:00+00:00"
     assert row["status"] == "failed"
     assert row["stage"] == "validate"
+    assert row["fetch_strategy"] == "auto"
     assert row["finished_at"] is not None
     assert row["error_class"] == "ValidationError"
     assert row["error_detail"] == "required_field_missing"
@@ -173,7 +192,13 @@ def test_run_start_requires_an_aware_datetime(
     version_id = registry.get_active_monitor(monitor_id).version_id
 
     with pytest.raises(ValueError, match="timezone-aware"):
-        runtime.start_run(monitor_id, version_id, started_at=datetime(2026, 1, 1))
+        runtime.start_run(
+            MonitorLease(monitor_id, 1),
+            version_id,
+            worker_id="worker-1",
+            fetch_strategy="auto",
+            started_at=datetime(2026, 1, 1),
+        )
 
 
 @pytest.mark.parametrize(
@@ -198,10 +223,29 @@ def test_finish_run_rejects_non_code_error_detail(
     registry, runtime = repositories
     monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
     version_id = registry.get_active_monitor(monitor_id).version_id
-    run_id = runtime.start_run(monitor_id, version_id, started_at=datetime(2026, 1, 1, tzinfo=UTC))
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    runtime.connection.execute(
+        "UPDATE monitors SET next_run_at = ? WHERE id = ?",
+        (started_at.isoformat(), monitor_id),
+    )
+    lease = runtime.claim_due(worker_id="worker-1", now=started_at)[0]
+    run_id = runtime.start_run(
+        lease,
+        version_id,
+        worker_id="worker-1",
+        fetch_strategy="auto",
+        started_at=started_at,
+    )
 
     with pytest.raises(ValueError, match="diagnostic code"):
-        runtime.finish_run(run_id, status="failed", stage="fetch", error_detail=detail)
+        runtime.finish_run(
+            run_id,
+            lease=lease,
+            worker_id="worker-1",
+            status="failed",
+            stage="fetch",
+            error_detail=detail,
+        )
 
 
 def observation_batch(
@@ -338,9 +382,16 @@ def test_snapshot_and_all_delivery_candidates_commit_or_rollback_as_one_unit(
         "CREATE TRIGGER reject_injected_delivery BEFORE INSERT ON outbox "
         "WHEN NEW.dedupe_key = 'fail' BEGIN SELECT RAISE(ABORT, 'injected enqueue'); END"
     )
+    connection.execute(
+        "UPDATE monitors SET next_run_at = ? WHERE id = ?",
+        (new_batch.observed_at.isoformat(), monitor_id),
+    )
+    lease = runtime.claim_due(worker_id="worker-1", now=new_batch.observed_at)[0]
 
     with pytest.raises(sqlite3.IntegrityError, match="injected enqueue"):
-        runtime.apply_snapshot_and_deliveries(new_batch, candidates)
+        runtime.apply_snapshot_and_deliveries(
+            new_batch, candidates, lease=lease, worker_id="worker-1"
+        )
 
     assert runtime.load_items(monitor_id) == list(old_batch.items)
     assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
@@ -348,7 +399,9 @@ def test_snapshot_and_all_delivery_candidates_commit_or_rollback_as_one_unit(
     assert retry_changes[0].changed_fields["price"] == (100, 90)
 
     connection.execute("DROP TRIGGER reject_injected_delivery")
-    outbox_ids = runtime.apply_snapshot_and_deliveries(new_batch, candidates)
+    outbox_ids = runtime.apply_snapshot_and_deliveries(
+        new_batch, candidates, lease=lease, worker_id="worker-1"
+    )
 
     assert len(outbox_ids) == 2
     assert runtime.load_items(monitor_id) == list(new_batch.items)
@@ -416,14 +469,10 @@ def test_claim_due_outbox_orders_retries_and_delivery_removes_item_from_due_work
     assert rows[0].target_id == "target-1"
     assert rows[0].payload == {"text": "first"}
     assert rows[0].attempt_count == 1
-    runtime.mark_delivered(
-        first, worker_id="worker-1", message_id="telegram-42", delivered_at=base
-    )
+    runtime.mark_delivered(first, worker_id="worker-1", message_id="telegram-42", delivered_at=base)
     assert [
         row.id
-        for row in runtime.claim_due_outbox(
-            worker_id="worker-1", now=base + timedelta(minutes=1)
-        )
+        for row in runtime.claim_due_outbox(worker_id="worker-1", now=base + timedelta(minutes=1))
     ] == [later]
     delivery = connection.execute(
         "SELECT * FROM deliveries WHERE outbox_id = ?", (first,)
@@ -450,10 +499,7 @@ def test_two_workers_cannot_claim_the_same_unexpired_outbox_lease(
     connection.execute("UPDATE outbox SET available_at = ?", (now.isoformat(),))
 
     assert [
-        row.id
-        for row in runtime.claim_due_outbox(
-            worker_id="worker-1", now=now, lease_seconds=30
-        )
+        row.id for row in runtime.claim_due_outbox(worker_id="worker-1", now=now, lease_seconds=30)
     ] == [outbox_id]
     assert runtime.claim_due_outbox(worker_id="worker-2", now=now, lease_seconds=30) == []
     row = connection.execute(
@@ -477,9 +523,12 @@ def test_expired_outbox_lease_is_recoverable_by_another_worker(
     connection.execute("UPDATE outbox SET available_at = ?", (now.isoformat(),))
     runtime.claim_due_outbox(worker_id="worker-1", now=now, lease_seconds=30)
 
-    assert runtime.claim_due_outbox(
-        worker_id="worker-2", now=now + timedelta(seconds=29), lease_seconds=30
-    ) == []
+    assert (
+        runtime.claim_due_outbox(
+            worker_id="worker-2", now=now + timedelta(seconds=29), lease_seconds=30
+        )
+        == []
+    )
     recovered = runtime.claim_due_outbox(
         worker_id="worker-2", now=now + timedelta(seconds=30), lease_seconds=30
     )

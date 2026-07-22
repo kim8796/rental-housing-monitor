@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 
 import pytest
@@ -80,6 +81,12 @@ def test_monitor_spec_rejects_a_later_too_frequent_schedule_gap() -> None:
         MonitorSpec.model_validate(payload)
 
 
+def test_monitor_spec_accepts_daily_fold_schedule_by_comparing_real_instants() -> None:
+    payload = valid_spec() | {"schedule": "30 1 * * *", "timezone": "America/New_York"}
+
+    assert MonitorSpec.model_validate(payload).schedule == "30 1 * * *"
+
+
 def test_monitor_spec_rejects_unknown_fields() -> None:
     payload = valid_spec() | {"python_code": "print('unsafe')"}
     with pytest.raises(ValidationError, match="extra_forbidden"):
@@ -120,7 +127,7 @@ def test_extract_spec_rejects_a_non_declarative_item_scope() -> None:
 )
 def test_validator_spec_normalizes_hosts_and_rejects_non_hosts(domains: list[str]) -> None:
     if domains == ["Example.COM.", "example.com"]:
-        assert ValidatorSpec(allowed_link_domains=domains).allowed_link_domains == ["example.com"]
+        assert ValidatorSpec(allowed_link_domains=domains).allowed_link_domains == ("example.com",)
     else:
         with pytest.raises(ValidationError):
             ValidatorSpec(allowed_link_domains=domains)
@@ -224,3 +231,43 @@ def test_monitor_spec_is_frozen_and_exports_json_schema() -> None:
     with pytest.raises(ValidationError):
         spec.name = "수정"  # type: ignore[misc]
     assert MonitorSpec.model_json_schema()["title"] == "MonitorSpec"
+
+
+def test_monitor_spec_is_strict_but_keeps_json_enum_round_trips() -> None:
+    payload = valid_spec()
+    payload["notify_on_no_change"] = 1
+    with pytest.raises(ValidationError):
+        MonitorSpec.model_validate(payload)
+
+    spec = MonitorSpec.model_validate_json(json.dumps(valid_spec()))
+    assert spec.source_adapter.value == "scrapling"
+    assert spec.model_dump(mode="json", exclude_unset=True) == valid_spec()
+
+
+def test_monitor_spec_nested_collections_are_read_only() -> None:
+    spec = MonitorSpec.model_validate(valid_spec())
+
+    with pytest.raises(TypeError):
+        spec.extract.fields["price"] = FieldSpec(selector=".other", type="krw")  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        spec.rules.append(RuleSpec(kind="new_item"))  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        spec.validators.allowed_link_domains.append("other.example")  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        spec.rules[0].keywords.append("sale")  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_numeric_threshold_rejects_non_finite_values(value: float) -> None:
+    payload = valid_spec()
+    payload["rules"] = [
+        {
+            "kind": "numeric_threshold",
+            "field": "price",
+            "operator": "lte",
+            "value": value,
+        }
+    ]
+
+    with pytest.raises(ValidationError, match="finite"):
+        MonitorSpec.model_validate(payload)

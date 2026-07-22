@@ -8,7 +8,7 @@ from pathlib import Path
 
 from personal_monitor.domain.spec import MonitorSpec
 from personal_monitor.maintenance import Maintenance
-from personal_monitor.storage import open_database
+from personal_monitor.storage import open_database, open_existing_database
 from personal_monitor.storage.schema import canonical_json, utc_now
 
 
@@ -50,9 +50,10 @@ def _validate_spec(path: Path) -> int:
 def _database(action: str, path: Path) -> int:
     connection: sqlite3.Connection | None = None
     try:
-        connection = open_database(path)
         if action == "init":
+            connection = open_database(path)
             return 0
+        connection = open_existing_database(path)
         if action == "integrity-check":
             rows = list(connection.execute("PRAGMA integrity_check"))
             if len(rows) == 1 and rows[0][0] == "ok":
@@ -61,7 +62,7 @@ def _database(action: str, path: Path) -> int:
             return 1
         connection.execute("VACUUM")
         return 0
-    except (OSError, sqlite3.Error, ValueError):
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
         print("database command failed", file=sys.stderr)
         return 1
     finally:
@@ -72,10 +73,10 @@ def _database(action: str, path: Path) -> int:
 def _maintenance(path: Path) -> int:
     connection: sqlite3.Connection | None = None
     try:
-        connection = open_database(path)
+        connection = open_existing_database(path)
         Maintenance(connection).run(now=utc_now())
         return 0
-    except (OSError, sqlite3.Error, ValueError):
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
         print("maintenance command failed", file=sys.stderr)
         return 1
     finally:
