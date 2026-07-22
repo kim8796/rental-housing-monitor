@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import logging
 import signal
 import threading
@@ -145,21 +146,49 @@ class FakeProfileProcess:
         self._events.append("process.close")
 
 
-def fake_profile_supervisor(
+def install_fake_profile_session(
     process: FakeProfileProcess,
     connection: FakeProfileConnection,
     calls: list[tuple[FetchStrategy, str, dict[str, object]]] | None = None,
-):
-    def factory(
-        strategy: FetchStrategy,
-        url: str,
-        kwargs: dict[str, object],
-    ) -> tuple[FakeProfileProcess, FakeProfileConnection]:
-        if calls is not None:
-            calls.append((strategy, url, kwargs))
-        return process, connection
+) -> None:
+    if _active_monkeypatch is None:
+        raise AssertionError("test construction seam is unavailable")
 
-    return backend_module._ProfiledBrowserSupervisor._for_test(factory)
+    class Sender:
+        def close(self) -> None:
+            return None
+
+    class FakeSpawnContext:
+        def Pipe(self, *, duplex: bool):
+            assert duplex is False
+            return connection, Sender()
+
+        def Process(
+            self,
+            *,
+            target: object,
+            args: tuple[object, ...],
+            daemon: bool,
+        ) -> FakeProfileProcess:
+            assert target is backend_module._profiled_browser_child
+            assert daemon is False
+            strategy_value, url, kwargs, _sender = args
+            if calls is not None:
+                assert isinstance(strategy_value, str)
+                assert isinstance(url, str)
+                assert isinstance(kwargs, dict)
+                calls.append((FetchStrategy(strategy_value), url, kwargs))
+            return process
+
+    def missing_process_group(_process_group: int, _sent_signal: int) -> None:
+        raise ProcessLookupError
+
+    _active_monkeypatch.setattr(backend_module.os, "killpg", missing_process_group)
+    _active_monkeypatch.setattr(
+        backend_module.multiprocessing,
+        "get_context",
+        lambda method: FakeSpawnContext() if method == "spawn" else None,
+    )
 
 
 def test_production_profile_boundary_signals_entire_process_group(
@@ -184,6 +213,16 @@ def test_production_profile_boundary_signals_entire_process_group(
         (process.pid, signal.SIGKILL),
     ]
     assert events == ["start"]
+
+
+def test_profiled_supervisor_construction_has_no_internal_injection_parameters() -> None:
+    assert tuple(inspect.signature(backend_module._ProfiledBrowserSupervisor).parameters) == (
+        "factory",
+    )
+    assert tuple(
+        inspect.signature(backend_module._ProfiledBrowserSupervisor._trusted_factory).parameters
+    ) == ("self",)
+    assert "profile_supervisor" not in inspect.signature(ScraplingBackend).parameters
 
 
 def test_production_profile_session_pickles_strategy_instead_of_fetcher(
@@ -1142,10 +1181,10 @@ def test_browser_fetch_uses_profile_and_bounded_fetcher_kwargs(
         backend_module._serialize_profile_response(FakeResponse()),
         events,
     )
+    install_fake_profile_session(process, connection, calls)
 
     backend = make_test_backend(
         egress_proxy_url="http://proxy.internal:8080",
-        profile_supervisor=fake_profile_supervisor(process, connection, calls),
     )
 
     document = asyncio.run(getattr(backend, method_name)(target(), profile=tmp_path))
@@ -1371,11 +1410,11 @@ def test_profiled_exit_stops_worker_and_cleans_before_context_return(
         resists_terminate=True,
     )
     connection = FakeProfileConnection(None, events)
+    install_fake_profile_session(process, connection)
 
     backend = make_test_backend(
         browser_gate=gate,
         browser_timeout_seconds=0.03,
-        profile_supervisor=fake_profile_supervisor(process, connection),
     )
 
     async def scenario() -> None:
@@ -1419,9 +1458,8 @@ def test_profiled_normal_response_uses_primitive_wire(tmp_path: Path) -> None:
     process = FakeProfileProcess(events, exits_on_join=True)
     wire = backend_module._serialize_profile_response(FakeResponse())
     connection = FakeProfileConnection(wire, events)
-    backend = make_test_backend(
-        profile_supervisor=fake_profile_supervisor(process, connection),
-    )
+    install_fake_profile_session(process, connection)
+    backend = make_test_backend()
 
     document = asyncio.run(backend.fetch_dynamic(target(), profile=tmp_path))
 
@@ -1450,9 +1488,8 @@ def test_profiled_response_still_terminates_hung_child_before_return(
         backend_module._serialize_profile_response(FakeResponse()),
         events,
     )
-    backend = make_test_backend(
-        profile_supervisor=fake_profile_supervisor(process, connection),
-    )
+    install_fake_profile_session(process, connection)
+    backend = make_test_backend()
 
     document = asyncio.run(backend.fetch_dynamic(target(), profile=tmp_path))
 
@@ -1478,9 +1515,9 @@ def test_profiled_start_failure_closes_process_connection_and_gate(tmp_path: Pat
         raises_on_start=True,
     )
     connection = FakeProfileConnection(None, events)
+    install_fake_profile_session(process, connection)
     backend = make_test_backend(
         browser_gate=gate,
-        profile_supervisor=fake_profile_supervisor(process, connection),
     )
 
     with pytest.raises(MonitorError, match="fetch failed") as caught:
@@ -1519,9 +1556,8 @@ def test_profiled_error_and_status_wires_are_reconstructed_safely(
     events: list[str] = []
     process = FakeProfileProcess(events, exits_on_join=True)
     connection = FakeProfileConnection(wire, events)
-    backend = make_test_backend(
-        profile_supervisor=fake_profile_supervisor(process, connection),
-    )
+    install_fake_profile_session(process, connection)
+    backend = make_test_backend()
 
     with pytest.raises(expected_type) as caught:
         asyncio.run(backend.fetch_dynamic(target(), profile=tmp_path))

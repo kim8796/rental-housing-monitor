@@ -296,7 +296,7 @@ def _production_profile_session(
 class _ProfiledBrowserSupervisor:
     __slots__ = ("_factory", "_sealed", "__weakref__")
 
-    def __init__(
+    def _initialize_unsealed(
         self,
         factory: Callable[..., tuple[object, ...]],
         _is_original_type: Callable[[object], bool] = _is_exact_supervisor,
@@ -310,16 +310,12 @@ class _ProfiledBrowserSupervisor:
         self._sealed = True
         _pin(self, factory)
 
-    @classmethod
-    def _for_test(cls, factory: Callable[..., tuple[object, ...]]):
-        return cls(factory)
-
     def __setattr__(self, name: str, value: object) -> None:
         if getattr(self, "_sealed", False):
             raise AttributeError("profiled browser supervisor is sealed")
         object.__setattr__(self, name, value)
 
-    def _trusted_factory(
+    def _trusted_factory_unsealed(
         self,
         _acquire: Callable[[object], object | None] = _acquire_supervisor,
         _is_original_type: Callable[[object], bool] = _is_exact_supervisor,
@@ -422,6 +418,31 @@ class _ProfiledBrowserSupervisor:
                 gate.release()
 
 
+def _seal_profiled_supervisor_methods():
+    initialize = _ProfiledBrowserSupervisor._initialize_unsealed
+    trusted_factory = _ProfiledBrowserSupervisor._trusted_factory_unsealed
+
+    def __init__(
+        self: _ProfiledBrowserSupervisor,
+        factory: Callable[..., tuple[object, ...]],
+    ) -> None:
+        initialize(self, factory)
+
+    def _trusted_factory(
+        self: _ProfiledBrowserSupervisor,
+    ) -> Callable[..., tuple[object, ...]]:
+        return trusted_factory(self)
+
+    return __init__, _trusted_factory
+
+
+(
+    _ProfiledBrowserSupervisor.__init__,
+    _ProfiledBrowserSupervisor._trusted_factory,
+) = _seal_profiled_supervisor_methods()
+delattr(_ProfiledBrowserSupervisor, "_initialize_unsealed")
+delattr(_ProfiledBrowserSupervisor, "_trusted_factory_unsealed")
+del _seal_profiled_supervisor_methods
 _bind_supervisor_type(_ProfiledBrowserSupervisor)
 _DEFAULT_PROFILE_SUPERVISOR = _ProfiledBrowserSupervisor(_production_profile_session)
 
@@ -551,45 +572,7 @@ class ScraplingBackend:
     _background_calls: set[asyncio.Task[object]] = field(repr=False)
     _profile_supervisor: _ProfiledBrowserSupervisor = field(repr=False)
 
-    def __init__(
-        self,
-        *,
-        egress_proxy_url: str | None,
-        http_timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
-        browser_timeout_seconds: float = BROWSER_TIMEOUT_SECONDS,
-        block_page_detector: BlockPageDetector | None = None,
-        clock: Clock = lambda: datetime.now(UTC),
-        profile_supervisor: _ProfiledBrowserSupervisor = _DEFAULT_PROFILE_SUPERVISOR,
-    ) -> None:
-        self._initialize(
-            EgressProxyPolicy.from_url(egress_proxy_url),
-            http_timeout_seconds=http_timeout_seconds,
-            browser_timeout_seconds=browser_timeout_seconds,
-            block_page_detector=block_page_detector,
-            clock=clock,
-            profile_supervisor=profile_supervisor,
-        )
-
-    @classmethod
-    def _from_egress_policy(
-        cls,
-        policy: EgressProxyPolicy,
-        *,
-        clock: Clock,
-        profile_supervisor: _ProfiledBrowserSupervisor = _DEFAULT_PROFILE_SUPERVISOR,
-    ) -> ScraplingBackend:
-        instance = cls.__new__(cls)
-        instance._initialize(
-            policy,
-            http_timeout_seconds=HTTP_TIMEOUT_SECONDS,
-            browser_timeout_seconds=BROWSER_TIMEOUT_SECONDS,
-            block_page_detector=None,
-            clock=clock,
-            profile_supervisor=profile_supervisor,
-        )
-        return instance
-
-    def _initialize(
+    def _initialize_unsealed(
         self,
         policy: EgressProxyPolicy,
         *,
@@ -661,7 +644,7 @@ class ScraplingBackend:
             and self._has_pinned_profile_supervisor()
         )
 
-    def _has_pinned_profile_supervisor(
+    def _has_pinned_profile_supervisor_unsealed(
         self,
         _matches: Callable[[object, object], bool] = _matches_backend_supervisor,
         _is_original_supervisor: Callable[[object], bool] = _is_exact_supervisor,
@@ -880,6 +863,64 @@ class ScraplingBackend:
         self._background_calls.discard(task)
         if not task.cancelled():
             task.exception()
+
+
+def _seal_backend_construction():
+    initialize = ScraplingBackend._initialize_unsealed
+    has_pinned_supervisor = ScraplingBackend._has_pinned_profile_supervisor_unsealed
+    profile_supervisor = _DEFAULT_PROFILE_SUPERVISOR
+
+    def __init__(
+        self: ScraplingBackend,
+        *,
+        egress_proxy_url: str | None,
+        http_timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
+        browser_timeout_seconds: float = BROWSER_TIMEOUT_SECONDS,
+        block_page_detector: BlockPageDetector | None = None,
+        clock: Clock = lambda: datetime.now(UTC),
+    ) -> None:
+        initialize(
+            self,
+            EgressProxyPolicy.from_url(egress_proxy_url),
+            http_timeout_seconds=http_timeout_seconds,
+            browser_timeout_seconds=browser_timeout_seconds,
+            block_page_detector=block_page_detector,
+            clock=clock,
+            profile_supervisor=profile_supervisor,
+        )
+
+    def _from_egress_policy(
+        cls: type[ScraplingBackend],
+        policy: EgressProxyPolicy,
+        *,
+        clock: Clock,
+    ) -> ScraplingBackend:
+        instance = cls.__new__(cls)
+        initialize(
+            instance,
+            policy,
+            http_timeout_seconds=HTTP_TIMEOUT_SECONDS,
+            browser_timeout_seconds=BROWSER_TIMEOUT_SECONDS,
+            block_page_detector=None,
+            clock=clock,
+            profile_supervisor=profile_supervisor,
+        )
+        return instance
+
+    def _has_pinned_profile_supervisor(self: ScraplingBackend) -> bool:
+        return has_pinned_supervisor(self)
+
+    return __init__, classmethod(_from_egress_policy), _has_pinned_profile_supervisor
+
+
+(
+    ScraplingBackend.__init__,
+    ScraplingBackend._from_egress_policy,
+    ScraplingBackend._has_pinned_profile_supervisor,
+) = _seal_backend_construction()
+delattr(ScraplingBackend, "_initialize_unsealed")
+delattr(ScraplingBackend, "_has_pinned_profile_supervisor_unsealed")
+del _seal_backend_construction
 
 
 async def _acquire_gate(gate: threading.BoundedSemaphore) -> None:

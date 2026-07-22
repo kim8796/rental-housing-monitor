@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import shutil
@@ -867,3 +868,25 @@ def test_profile_accessor_symbol_replacement_before_construction_is_ignored(
 
     store.close()
     assert calls == []
+
+
+def test_profile_public_api_has_no_internal_dependency_injection_parameters() -> None:
+    BrowserProfileStore, _, bootstrap_profile = profile_types()
+
+    assert tuple(inspect.signature(BrowserProfileStore).parameters) == (
+        "vault",
+        "materialization_root",
+        "require_memory_backed",
+        "expected_uid",
+    )
+    assert tuple(inspect.signature(BrowserProfileStore.close).parameters) == ("self",)
+    assert tuple(inspect.signature(BrowserProfileStore._trusted_snapshot).parameters) == ("self",)
+    assert tuple(inspect.signature(bootstrap_profile).parameters) == (
+        "store",
+        "profile_id",
+        "target",
+        "runner",
+        "egress_proxy_url",
+        "page_action",
+        "operator_timeout_seconds",
+    )

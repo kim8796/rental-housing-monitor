@@ -138,7 +138,7 @@ class CredentialVault:
         "__weakref__",
     )
 
-    def __init__(
+    def _initialize_unsealed(
         self,
         root: Path,
         *,
@@ -204,7 +204,7 @@ class CredentialVault:
         _cipher, _dir_fd, _uid, identity, _lock = self._trusted_snapshot()
         return identity
 
-    def close(
+    def _close_unsealed(
         self,
         _release: Callable[[object], tuple[object, ...] | None] = _release_vault,
     ) -> None:
@@ -398,7 +398,7 @@ class CredentialVault:
         ):
             raise VaultError
 
-    def _trusted_snapshot(
+    def _trusted_snapshot_unsealed(
         self,
         _acquire: Callable[[object], tuple[object, ...]] = _acquire_vault,
         _is_original_type: Callable[[object], bool] = _is_exact_vault,
@@ -432,6 +432,45 @@ class CredentialVault:
         return cipher, directory_fd, uid, identity, lock  # type: ignore[return-value]
 
 
+def _seal_vault_methods():
+    initialize = CredentialVault._initialize_unsealed
+    close_vault = CredentialVault._close_unsealed
+    trusted_snapshot = CredentialVault._trusted_snapshot_unsealed
+
+    def __init__(
+        self: CredentialVault,
+        root: Path,
+        *,
+        key: bytes | None = None,
+        key_path: Path | None = None,
+        expected_uid: int | None = None,
+    ) -> None:
+        initialize(
+            self,
+            root,
+            key=key,
+            key_path=key_path,
+            expected_uid=expected_uid,
+        )
+
+    def close(self: CredentialVault) -> None:
+        close_vault(self)
+
+    def _trusted_snapshot(
+        self: CredentialVault,
+    ) -> tuple[AesGcmCipher, int, int, tuple[int, int], threading.RLock]:
+        return trusted_snapshot(self)
+
+    return __init__, close, _trusted_snapshot
+
+
+CredentialVault.__init__, CredentialVault.close, CredentialVault._trusted_snapshot = (
+    _seal_vault_methods()
+)
+delattr(CredentialVault, "_initialize_unsealed")
+delattr(CredentialVault, "_close_unsealed")
+delattr(CredentialVault, "_trusted_snapshot_unsealed")
+del _seal_vault_methods
 _bind_vault_type(CredentialVault)
 
 

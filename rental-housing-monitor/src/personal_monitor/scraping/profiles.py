@@ -123,7 +123,7 @@ class BrowserProfileStore:
         "__weakref__",
     )
 
-    def __init__(
+    def _initialize_unsealed(
         self,
         vault: CredentialVault,
         *,
@@ -188,7 +188,7 @@ class BrowserProfileStore:
             raise AttributeError("browser profile store is sealed")
         object.__setattr__(self, name, value)
 
-    def close(
+    def _close_unsealed(
         self,
         _release: Callable[[object], tuple[object, ...] | None] = _release_profile_store,
     ) -> None:
@@ -327,7 +327,7 @@ class BrowserProfileStore:
         except Exception:
             raise ProfileUnavailableError from None
 
-    def _trusted_snapshot(
+    def _trusted_snapshot_unsealed(
         self,
         _acquire: Callable[[object], tuple[object, ...]] = _acquire_profile_store,
         _is_original_store: Callable[[object], bool] = _is_exact_profile_store,
@@ -372,6 +372,45 @@ class BrowserProfileStore:
         )
 
 
+def _seal_profile_store_methods():
+    initialize = BrowserProfileStore._initialize_unsealed
+    close_store = BrowserProfileStore._close_unsealed
+    trusted_snapshot = BrowserProfileStore._trusted_snapshot_unsealed
+
+    def __init__(
+        self: BrowserProfileStore,
+        vault: CredentialVault,
+        *,
+        materialization_root: Path,
+        require_memory_backed: bool = False,
+        expected_uid: int | None = None,
+    ) -> None:
+        initialize(
+            self,
+            vault,
+            materialization_root=materialization_root,
+            require_memory_backed=require_memory_backed,
+            expected_uid=expected_uid,
+        )
+
+    def close(self: BrowserProfileStore) -> None:
+        close_store(self)
+
+    def _trusted_snapshot(self: BrowserProfileStore) -> ProfileStoreSnapshot:
+        return trusted_snapshot(self)
+
+    return __init__, close, _trusted_snapshot
+
+
+(
+    BrowserProfileStore.__init__,
+    BrowserProfileStore.close,
+    BrowserProfileStore._trusted_snapshot,
+) = _seal_profile_store_methods()
+delattr(BrowserProfileStore, "_initialize_unsealed")
+delattr(BrowserProfileStore, "_close_unsealed")
+delattr(BrowserProfileStore, "_trusted_snapshot_unsealed")
+del _seal_profile_store_methods
 _bind_profile_store_type(BrowserProfileStore)
 
 
@@ -513,7 +552,7 @@ class _MaterializedProfile:
         return False
 
 
-def bootstrap_profile(
+def _bootstrap_profile_unsealed(
     store: BrowserProfileStore,
     profile_id: str,
     target: ResolvedTarget,
@@ -622,6 +661,39 @@ def bootstrap_profile(
             failure = ProfileUnavailableError()
             failure.add_note("browser profile cleanup failed")
             raise failure from None
+
+
+def _seal_bootstrap_profile():
+    run_bootstrap = _bootstrap_profile_unsealed
+
+    def sealed_bootstrap_profile(
+        store: BrowserProfileStore,
+        profile_id: str,
+        target: ResolvedTarget,
+        *,
+        runner: BootstrapRunner,
+        egress_proxy_url: str,
+        page_action: PageAction,
+        operator_timeout_seconds: float = _BOOTSTRAP_TIMEOUT_SECONDS,
+    ) -> None:
+        run_bootstrap(
+            store,
+            profile_id,
+            target,
+            runner=runner,
+            egress_proxy_url=egress_proxy_url,
+            page_action=page_action,
+            operator_timeout_seconds=operator_timeout_seconds,
+        )
+
+    sealed_bootstrap_profile.__name__ = "bootstrap_profile"
+    sealed_bootstrap_profile.__qualname__ = "bootstrap_profile"
+    return sealed_bootstrap_profile
+
+
+bootstrap_profile = _seal_bootstrap_profile()
+del _seal_bootstrap_profile
+globals().pop("_bootstrap_profile_unsealed")
 
 
 def _encode_profile_archive(root: Path, *, expected_uid: int | None = None) -> bytes:

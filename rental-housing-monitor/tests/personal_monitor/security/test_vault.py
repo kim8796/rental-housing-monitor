@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -492,3 +493,36 @@ def test_vault_accessor_symbol_replacement_before_construction_is_ignored(
 
     vault.close()
     assert calls == []
+
+
+def test_vault_public_api_has_no_internal_dependency_injection_parameters() -> None:
+    CredentialVault, _, _ = vault_types()
+
+    assert tuple(inspect.signature(CredentialVault).parameters) == (
+        "root",
+        "key",
+        "key_path",
+        "expected_uid",
+    )
+    assert tuple(inspect.signature(CredentialVault.close).parameters) == ("self",)
+    assert tuple(inspect.signature(CredentialVault._trusted_snapshot).parameters) == ("self",)
+
+
+def test_vault_rejects_cipher_factory_callback_before_it_can_observe_key(
+    tmp_path: Path,
+) -> None:
+    CredentialVault, _, _ = vault_types()
+    captured: list[bytes] = []
+
+    def capture_key(key: bytes):
+        captured.append(bytes(key))
+        raise AssertionError("cipher factory executed")
+
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        CredentialVault(
+            tmp_path / "vault",
+            key=b"k" * 32,
+            _new_cipher=capture_key,
+        )
+
+    assert captured == []
