@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -13,6 +14,7 @@ from personal_monitor.adapters._policy import (
     PolicyHttpResponse,
 )
 from personal_monitor.adapters.official_api import (
+    _max_delay,
     _origin,
     _require_aware,
     _robots_url,
@@ -72,37 +74,6 @@ class ScraplingSourceAdapter:
             profile_provider=profile_provider,
         )
 
-    @classmethod
-    def for_test(
-        cls,
-        *,
-        url_policy: UrlPolicy,
-        rate_limiter: HostRateLimiter,
-        http_client: BoundedPolicyHttpClient,
-        backend: ScraplingBackend,
-        extractor: DeclarativeExtractor | None = None,
-        validator: ObservationValidator | None = None,
-        clock: Clock = lambda: datetime.now(UTC),
-        sleeper: Sleeper = asyncio.sleep,
-        js_shell_detector: ShellDetector | None = None,
-        profile_provider: ProfileProvider | None = None,
-    ) -> ScraplingSourceAdapter:
-        """Build with a fake backend while retaining all adapter policy orchestration."""
-        instance = cls.__new__(cls)
-        instance._initialize(
-            url_policy=url_policy,
-            rate_limiter=rate_limiter,
-            http_client=http_client,
-            backend=backend,
-            extractor=extractor,
-            validator=validator,
-            clock=clock,
-            sleeper=sleeper,
-            js_shell_detector=js_shell_detector,
-            profile_provider=profile_provider,
-        )
-        return instance
-
     def _initialize(
         self,
         *,
@@ -117,8 +88,10 @@ class ScraplingSourceAdapter:
         js_shell_detector: ShellDetector | None,
         profile_provider: ProfileProvider | None,
     ) -> None:
-        if not isinstance(http_client, BoundedPolicyHttpClient):
+        if type(http_client) is not BoundedPolicyHttpClient:
             raise TypeError("http_client must preserve the bounded proxy policy")
+        if not backend.proxy_identity.matches(http_client.proxy_identity):
+            raise TypeError("backend and policy client must use the same egress proxy")
         self._url_policy = url_policy
         self._rate_limiter = rate_limiter
         self._http_client = http_client
@@ -268,14 +241,30 @@ class ScraplingSourceAdapter:
             except Exception:
                 raise _profile_error() from None
             try:
-                return await method(target, profile=_profile_path(profile))
-            finally:
+                result = await method(target, profile=_profile_path(profile))
+            except asyncio.CancelledError as cancellation:
+                exception = sys.exc_info()
                 try:
-                    await async_exit(None, None, None)
+                    await async_exit(*exception)
+                except BaseException:
+                    raise cancellation from None
+                raise
+            except Exception:
+                exception = sys.exc_info()
+                try:
+                    await async_exit(*exception)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     raise _profile_error() from None
+                raise
+            try:
+                await async_exit(None, None, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise _profile_error() from None
+            return result
 
         enter = getattr(context, "__enter__", None)
         exit_context = getattr(context, "__exit__", None)
@@ -288,12 +277,30 @@ class ScraplingSourceAdapter:
         except Exception:
             raise _profile_error() from None
         try:
-            return await method(target, profile=_profile_path(profile))
-        finally:
+            result = await method(target, profile=_profile_path(profile))
+        except asyncio.CancelledError as cancellation:
+            exception = sys.exc_info()
             try:
-                exit_context(None, None, None)
+                exit_context(*exception)
+            except BaseException:
+                raise cancellation from None
+            raise
+        except Exception:
+            exception = sys.exc_info()
+            try:
+                exit_context(*exception)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 raise _profile_error() from None
+            raise
+        try:
+            exit_context(None, None, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise _profile_error() from None
+        return result
 
     def _build_batch(
         self,
@@ -347,9 +354,9 @@ class ScraplingSourceAdapter:
         retry_after: float | None,
     ) -> float | None:
         await self._rate_limiter.acquire(target.hostname, retry_after)
-        decision = await self._robots_decision(target)
+        decision, robots_retry_after = await self._robots_decision(target)
         decision.require_allowed()
-        return decision.crawl_delay_seconds
+        return _max_delay(decision.crawl_delay_seconds, robots_retry_after)
 
     async def _robots_decision(self, target: ResolvedTarget):
         robots_url = _robots_url(target.normalized_url)
@@ -364,7 +371,10 @@ class ScraplingSourceAdapter:
                 if error.error_class is not ErrorClass.TRANSIENT_NETWORK:
                     raise
                 policy = RobotsPolicy.from_fetch_failure(robots_url, checked_at=self._clock())
-                return policy.check(MONITOR_USER_AGENT, target.normalized_url)
+                return (
+                    policy.check(MONITOR_USER_AGENT, target.normalized_url),
+                    _safe_retry_after(error),
+                )
 
             await self._validate_policy_response(response, requested=robots_target)
             if response.status in _REDIRECT_STATUSES:
@@ -388,15 +398,26 @@ class ScraplingSourceAdapter:
                 await self._rate_limiter.acquire(robots_target.hostname)
                 continue
 
-            if response.status != 200:
-                policy = RobotsPolicy.from_fetch_failure(robots_url, checked_at=self._clock())
-            else:
+            if response.status == 200:
                 policy = RobotsPolicy.from_text(
                     response.body.decode("utf-8", errors="replace"),
                     robots_url,
                     checked_at=self._clock(),
                 )
-            return policy.check(MONITOR_USER_AGENT, target.normalized_url)
+                retry_after = None
+            elif response.status in {404, 410}:
+                policy = RobotsPolicy.from_fetch_failure(robots_url, checked_at=self._clock())
+                retry_after = None
+            elif response.status == 429 or 500 <= response.status <= 599:
+                policy = RobotsPolicy.from_fetch_failure(robots_url, checked_at=self._clock())
+                retry_after = response.retry_after_seconds
+            else:
+                raise MonitorError(
+                    ErrorClass.POLICY,
+                    "robots",
+                    "robots response returned an invalid status",
+                )
+            return policy.check(MONITOR_USER_AGENT, target.normalized_url), retry_after
 
     async def _validate_policy_response(
         self,
@@ -407,8 +428,6 @@ class ScraplingSourceAdapter:
         final_target = await self._url_policy.validate(response.final_url)
         if final_target.normalized_url != requested.normalized_url:
             raise MonitorError(ErrorClass.POLICY, "redirect", "unapproved final URL")
-        if response.peer_ip is not None:
-            self._url_policy.validate_peer(final_target, response.peer_ip)
 
     async def _validate_document(
         self,
@@ -416,6 +435,15 @@ class ScraplingSourceAdapter:
         *,
         requested: ResolvedTarget,
     ) -> None:
+        if (
+            document.strategy in {FetchStrategy.DYNAMIC, FetchStrategy.STEALTHY}
+            and document.redirect_urls
+        ):
+            raise MonitorError(
+                ErrorClass.POLICY,
+                "redirect",
+                "browser redirect history cannot be safely preflighted",
+            )
         approved_chain: list[str] = []
         for redirect_count, redirect_url in enumerate(document.redirect_urls, start=1):
             history_target = await self._url_policy.validate_redirect(
@@ -436,8 +464,6 @@ class ScraplingSourceAdapter:
             raise MonitorError(ErrorClass.POLICY, "redirect", "redirect loop detected")
         if not approved_chain and final_target.normalized_url != requested.normalized_url:
             raise MonitorError(ErrorClass.POLICY, "redirect", "unapproved final URL")
-        if document.peer_ip is not None:
-            self._url_policy.validate_peer(final_target, document.peer_ip)
 
 
 def _profile_path(value: object) -> Path:

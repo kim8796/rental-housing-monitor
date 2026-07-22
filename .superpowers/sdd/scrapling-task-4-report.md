@@ -1,6 +1,6 @@
 # Scrapling Phase 2 Task 4 Report
 
-Base commit: `c33d27c43e0dc355cdcc4f0d35d0cf074dabcacd`
+Task 4 implementation commit: `72c0ac9ecd9b69d8d6713a86ea581a9bccc4b7ea`
 
 ## Result
 
@@ -10,68 +10,78 @@ credential storage, or browser-profile storage from Tasks 5-7.
 
 ## TDD evidence
 
-- Initial adapter collection RED: three planned modules failed with three expected
-  `ModuleNotFoundError: personal_monitor.adapters` errors.
-- Import skeleton GREEN: 3 tests passed.
-- Registry RED: 2 failures because the registry had no constructor; GREEN: 2 passed.
-- Official adapter RED: missing bounded client/public constants; GREEN: 8 passed before
-  later redirect/retry coverage was added.
-- Scrapling adapter RED: 20 behavioral failures because the adapter had no constructor;
-  GREEN: 20 passed.
-- Peer metadata RED: normalized documents dropped `primary_ip`; GREEN: 1 passed.
-- Completion-review RED: three focused failures proved unsealed backend injection,
-  proxy-peer misclassification, and unanchored browser history; GREEN: 3 passed.
-- Final focused adapter suite: 46 passed.
+- Initial Task 4 RED/GREEN work covered registry closure, the official adapter, Scrapling
+  strategy selection, redirects, robots, retries, profiles, and normalization.
+- Review-boundary RED: 6 focused failures proved the public test factories, subclass
+  acceptance, proxy mismatch, unsafe browser history, and reliance on untrusted peer
+  metadata. GREEN: 6 passed.
+- Streaming-bound RED: 4 of 5 focused cases failed because the curl callback collector and
+  body handoff were absent (the official gzip case was already bounded). GREEN: 5 passed.
+- Shared-gate RED: policy-only and mixed policy/Scrapling runs both peaked at 8 requests.
+  GREEN: 2 passed with both peaks capped at 4.
+- Profile RED: 4 failures showed sync/async exits received no exception triple and cleanup
+  could mask cancellation. GREEN: 4 passed.
+- Official strictness RED: 13 failures covered invalid terminal statuses, malformed JSON
+  media types, and date-form Retry-After. GREEN: 13 passed.
+- Robots status RED: 17 failures showed missing retry propagation and fail-open treatment of
+  malformed/policy statuses. GREEN: 21 passed across both adapters.
+- Final focused adapter/backend suite: 170 passed.
 
 ## Policy closure
 
-- Every strategy attempt validates URL/DNS, acquires the host limiter, validates and
-  fetches same-origin robots through the required proxy, rate-limits the source request,
-  validates redirect/history/final destinations and trustworthy origin peer metadata,
-  then extracts and independently validates observations.
-- Scrapling production construction accepts only the sealed default backend with its
-  proxy-preserving fetchers and process-wide gates. Tests use the explicit `for_test`
-  construction path.
-- Robots redirects are manual, validated before request, same-origin, loop/cap checked,
-  and rate-limited. Genuine robots fetch failures use
-  `RobotsPolicy.from_fetch_failure()`; explicit Disallow remains a policy error.
-- HTTP redirects are manual, relative locations are resolved by the bounded normalizer,
-  loops and the sixth redirect are rejected before fetching another destination, and the
-  full URL/rate/robots chain is rerun for each accepted destination.
-- Browser histories must start at the approved request, contain unique validated entries,
-  and terminate in a separately validated final URL. Scrapling `primary_ip` is retained
-  for origin-peer validation. httpx `network_stream.server_addr` is deliberately ignored
-  because it identifies the mandatory proxy socket rather than an attested origin peer.
+- Production adapters accept only the exact concrete bounded client/backend types. There is
+  no public test transport factory or production transport bypass; tests install
+  `httpx.MockTransport` and fake backend delegation only through test-local monkeypatching.
+- The Scrapling backend and policy client prove that they use the same validated proxy with
+  a process-keyed HMAC identity whose representation never exposes the proxy or credentials.
+- The mandatory proxy is the origin-egress enforcement boundary. Untrusted Scrapling
+  `primary_ip` and httpx proxy-socket peer metadata are ignored rather than treated as
+  origin attestation.
+- Every HTTP request, including official/robots httpx traffic and Scrapling curl traffic,
+  shares one process-global four-slot gate. Async acquisition does not block the event loop,
+  cancellation releases acquired policy-client slots, and Scrapling executor slots remain
+  held until orphaned worker calls actually finish.
+- Official decoded bodies are checked before each accumulator extension. Scrapling curl
+  uses a bounded `content_callback` that rejects the first excess chunk before retaining it,
+  carries collected bytes into normalization, and maps direct or wrapped callback overflow
+  to a safe POLICY error. Browser bodies remain bounded after rendering.
+- HTTP redirects remain manual and are fully preflighted before every destination request.
+  Dynamic and stealthy responses with any redirect history are rejected because the
+  browser backend cannot preflight each hop; a changed final URL without history is also
+  rejected.
+- Robots navigation redirects are manual, same-origin, loop/cap checked, and rate-limited.
+  A 404/410 is modeled as absence/fetch failure. A 429/5xx is also fail-open, but its bounded
+  Retry-After deadline is passed to the source limiter. Other terminal statuses fail closed.
 - Auto escalation is typed: only `FailureCode.REQUIRED_CONTENT_ABSENT` advances HTTP to
-  dynamic; detector exceptions/non-booleans close as internal failures; only
-  `FetchError.detected_interstitial` advances dynamic to stealthy. Explicit strategies
-  never escalate.
-- Only transient network failures retry, with at most three total attempts and exact
-  1/4-second inter-attempt sleeps. Cancellation is preserved, no final sleep occurs, and
-  finite non-negative Retry-After is passed to the host limiter.
-- Browser profile materialization supports synchronous and asynchronous context managers,
-  is used only on browser paths, and maps missing/materialization failures to safe
-  authentication errors without exposing references or paths.
-- Official JSON uses a required-proxy concrete client, GET only, fixed User-Agent,
-  `Accept: application/json`, and `Accept-Encoding: identity`; it enforces 10-second
-  connect/30-second total bounds, manual five-redirect policy, 10 MiB decompressed-body
-  limit, JSON media/status rules, robots/rate/URL policy, and imports no Scrapling runtime.
-- Registry resolution is exact for Scrapling, `official_api/json_get`, and copied explicit
-  Python-plugin allowlists. Rejected references are not included in errors.
+  dynamic, and only `FetchError.detected_interstitial` advances dynamic to stealthy.
+  Explicit strategies never escalate.
+- Browser profile materialization is browser-only and supports synchronous and asynchronous
+  context managers. Exit receives the real exception triple, cleanup always runs, failures
+  map safely, and cleanup cannot replace an original `CancelledError`.
+- Official JSON accepts only navigation redirects or 2xx finals, validates JSON media types
+  with RFC token grammar (including non-empty structured `+json` suffixes), and computes
+  both delta and HTTP-date Retry-After values from an injected timezone-aware clock.
+- Registry resolution remains exact for Scrapling, `official_api/json_get`, and copied
+  explicit Python-plugin allowlists. Rejected references are not included in errors.
 
-All adapter tests use injected DNS plus `httpx.MockTransport`; no test reaches a public
+All adapter tests use injected DNS and test-local transports; no test reaches a public
 network.
+
+## Task-plan dependency exception
+
+`personal_monitor.scraping.extractor` still imports `scrapling.Selector`. Task 3 explicitly
+required that selector implementation, so removing the runtime dependency in this Task 4
+review would contradict the accepted plan and expand scope. The official adapter itself
+does not import Scrapling directly; replacing the shared extractor dependency belongs to a
+later plan item.
 
 ## Final verification
 
 Executed from `rental-housing-monitor` with the repository virtual environment:
 
-- `python -m pytest tests/personal_monitor/adapters -q` — 46 passed in 0.55s.
-- `python -m pytest -q` — 590 passed in 4.12s.
-- `python -m ruff check .` — all checks passed.
-- `python -m ruff format --check .` — 89 files already formatted.
-- `python -m compileall -q src` — exit 0.
+- focused adapter/backend tests — 170 passed in 1.53s;
+- full `pytest -q` — 641 passed in 4.17s;
+- `ruff check src tests` — all checks passed;
+- `ruff format --check src tests` — 93 files already formatted;
+- `compileall -q src` — exit 0;
 - `git diff --check` — exit 0.
-
-The completion review's mandatory-proxy, proxy-peer, browser-chain, and acceptance-test
-findings were resolved before these gates.

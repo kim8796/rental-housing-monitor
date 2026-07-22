@@ -15,6 +15,10 @@ from personal_monitor.engine.errors import ErrorClass, FetchError, MonitorError
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.scrapling_backend import ScraplingBackend
 from personal_monitor.security.url_policy import UrlPolicy
+from tests.personal_monitor.adapters._helpers import (
+    make_policy_client,
+    make_scrapling_backend,
+)
 
 NOW = datetime(2026, 7, 23, 3, 0, tzinfo=UTC)
 pytestmark = pytest.mark.filterwarnings(
@@ -108,29 +112,20 @@ def document(
 
 
 def policy_client(handler=None) -> BoundedPolicyHttpClient:
-    def default_handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "text/plain"},
-            text="User-agent: *\nAllow: /\n",
-        )
-
-    return BoundedPolicyHttpClient.for_test(
-        egress_proxy_url="http://proxy.internal:8080",
-        transport=httpx.MockTransport(handler or default_handler),
-    )
+    return make_policy_client(handler)
 
 
 def adapter(backend: FakeBackend, **overrides: object) -> ScraplingSourceAdapter:
     arguments: dict[str, object] = {
         "url_policy": UrlPolicy(Resolver()),
         "rate_limiter": RecordingRateLimiter(),
-        "http_client": policy_client(),
-        "backend": backend,
+        "backend": make_scrapling_backend(backend),
         "clock": lambda: NOW,
     }
     arguments.update(overrides)
-    return ScraplingSourceAdapter.for_test(**arguments)  # type: ignore[arg-type]
+    if "http_client" not in arguments:
+        arguments["http_client"] = policy_client()
+    return ScraplingSourceAdapter(**arguments)  # type: ignore[arg-type]
 
 
 def strategies(backend: FakeBackend) -> list[str]:
@@ -168,6 +163,39 @@ def test_production_constructor_rejects_an_unsealed_backend() -> None:
                 backend=backend,  # type: ignore[arg-type]
                 clock=lambda: NOW,
             )
+
+
+def test_production_constructor_rejects_a_sealed_backend_subclass() -> None:
+    class SubclassedBackend(ScraplingBackend):
+        pass
+
+    with pytest.raises(TypeError, match="backend"):
+        ScraplingSourceAdapter(
+            url_policy=UrlPolicy(Resolver()),
+            rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+            http_client=policy_client(),
+            backend=SubclassedBackend(
+                egress_proxy_url="http://proxy.internal:8080",
+            ),
+            clock=lambda: NOW,
+        )
+
+
+def test_production_adapter_has_no_public_test_backend_factory() -> None:
+    assert not hasattr(ScraplingSourceAdapter, "for_test")
+
+
+def test_production_adapter_rejects_mismatched_policy_proxies() -> None:
+    with pytest.raises(TypeError, match="proxy"):
+        ScraplingSourceAdapter(
+            url_policy=UrlPolicy(Resolver()),
+            rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+            http_client=BoundedPolicyHttpClient(
+                egress_proxy_url="http://policy-proxy.internal:8080"
+            ),
+            backend=ScraplingBackend(egress_proxy_url="http://scrapling-proxy.internal:8080"),
+            clock=lambda: NOW,
+        )
 
 
 def test_auto_uses_dynamic_only_for_required_content_absence() -> None:
@@ -345,6 +373,96 @@ def test_profile_materialization_is_browser_only_and_context_managed(tmp_path: P
     assert http.calls[0][2] is None
 
 
+def test_sync_profile_context_receives_the_real_fetch_exception(tmp_path: Path) -> None:
+    failure = MonitorError(ErrorClass.POLICY, "fetch", "safe failure")
+    exits: list[tuple[object, object, object]] = []
+
+    class Context:
+        def __enter__(self):
+            return tmp_path
+
+        def __exit__(self, exc_type, exc, traceback):
+            exits.append((exc_type, exc, traceback))
+
+    class Profiles:
+        def materialize(self, _reference: str):
+            return Context()
+
+    backend = FakeBackend(dynamic=failure)
+
+    with pytest.raises(MonitorError) as caught:
+        asyncio.run(
+            adapter(backend, profile_provider=Profiles()).fetch(
+                "m", spec(fetch_strategy="dynamic", auth_profile_ref="profile-1")
+            )
+        )
+
+    assert caught.value is failure
+    assert exits[0][0] is MonitorError
+    assert exits[0][1] is failure
+    assert exits[0][2] is not None
+
+
+def test_async_profile_context_receives_the_real_fetch_exception(tmp_path: Path) -> None:
+    failure = MonitorError(ErrorClass.POLICY, "fetch", "safe failure")
+    exits: list[tuple[object, object, object]] = []
+
+    class Context:
+        async def __aenter__(self):
+            return tmp_path
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            exits.append((exc_type, exc, traceback))
+
+    class Profiles:
+        def materialize(self, _reference: str):
+            return Context()
+
+    with pytest.raises(MonitorError) as caught:
+        asyncio.run(
+            adapter(FakeBackend(dynamic=failure), profile_provider=Profiles()).fetch(
+                "m", spec(fetch_strategy="dynamic", auth_profile_ref="profile-1")
+            )
+        )
+
+    assert caught.value is failure
+    assert exits[0][0] is MonitorError
+    assert exits[0][1] is failure
+    assert exits[0][2] is not None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_profile_cleanup_cannot_mask_cancellation(tmp_path: Path, asynchronous: bool) -> None:
+    cancellation = asyncio.CancelledError()
+
+    class SyncContext:
+        def __enter__(self):
+            return tmp_path
+
+        def __exit__(self, *_args):
+            raise RuntimeError("secret cleanup detail")
+
+    class AsyncContext:
+        async def __aenter__(self):
+            return tmp_path
+
+        async def __aexit__(self, *_args):
+            raise RuntimeError("secret cleanup detail")
+
+    class Profiles:
+        def materialize(self, _reference: str):
+            return AsyncContext() if asynchronous else SyncContext()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(
+            adapter(FakeBackend(dynamic=cancellation), profile_provider=Profiles()).fetch(
+                "m", spec(fetch_strategy="dynamic", auth_profile_ref="profile-1")
+            )
+        )
+
+    assert caught.value is cancellation
+
+
 def test_missing_profile_is_safe_authentication_failure() -> None:
     backend = FakeBackend(dynamic=document(strategy=FetchStrategy.DYNAMIC))
 
@@ -446,20 +564,31 @@ def test_browser_history_must_start_at_the_approved_request() -> None:
     assert caught.value.stage == "redirect"
 
 
-def test_browser_final_peer_is_revalidated_after_ordered_history() -> None:
+def test_browser_redirect_history_is_rejected_until_preflight_is_available() -> None:
     backend = FakeBackend(
         dynamic=document(
             strategy=FetchStrategy.DYNAMIC,
-            final_url="https://other.example/final",
+            final_url="https://other.example/private",
             redirect_urls=("https://example.com/products",),
+        )
+    )
+
+    with pytest.raises(MonitorError, match="browser redirect"):
+        asyncio.run(adapter(backend).fetch("m", spec(fetch_strategy="dynamic")))
+
+
+def test_untrusted_browser_peer_metadata_is_ignored_for_same_final_url() -> None:
+    backend = FakeBackend(
+        dynamic=document(
+            strategy=FetchStrategy.DYNAMIC,
+            final_url="https://example.com/products",
             peer_ip="10.0.0.7",
         )
     )
 
-    with pytest.raises(MonitorError, match="peer") as caught:
-        asyncio.run(adapter(backend).fetch("m", spec(fetch_strategy="dynamic")))
+    batch = asyncio.run(adapter(backend).fetch("m", spec(fetch_strategy="dynamic")))
 
-    assert caught.value.error_class is ErrorClass.POLICY
+    assert batch.items
 
 
 def test_robots_disallow_prevents_source_fetch() -> None:
@@ -495,6 +624,52 @@ def test_genuine_robots_fetch_failure_does_not_claim_permission_or_block_fetch()
 
     assert batch.monitor_id == "m"
     assert strategies(backend) == ["http"]
+
+
+def test_scrapling_robots_transient_status_passes_retry_deadline_to_source() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, headers={"Retry-After": "41"})
+
+    rate = RecordingRateLimiter()
+    backend = FakeBackend(http=document())
+
+    asyncio.run(
+        adapter(backend, http_client=policy_client(handler), rate_limiter=rate).fetch(
+            "m", spec(fetch_strategy="http")
+        )
+    )
+
+    assert ("example.com", 41.0) in rate.calls
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_scrapling_robots_absence_allows_source(status: int) -> None:
+    backend = FakeBackend(http=document())
+
+    asyncio.run(
+        adapter(
+            backend,
+            http_client=policy_client(lambda _request: httpx.Response(status)),
+        ).fetch("m", spec(fetch_strategy="http"))
+    )
+
+    assert strategies(backend) == ["http"]
+
+
+@pytest.mark.parametrize("status", [100, 300, 400, 401, 403, 418])
+def test_scrapling_robots_other_statuses_fail_closed(status: int) -> None:
+    backend = FakeBackend(http=document())
+
+    with pytest.raises(MonitorError) as caught:
+        asyncio.run(
+            adapter(
+                backend,
+                http_client=policy_client(lambda _request: httpx.Response(status)),
+            ).fetch("m", spec(fetch_strategy="http"))
+        )
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert backend.calls == []
 
 
 def test_same_origin_robots_redirect_is_validated_before_request() -> None:

@@ -18,6 +18,11 @@ from scrapling.fetchers import DynamicFetcher, Fetcher, StealthyFetcher
 from personal_monitor.domain.spec import FetchStrategy
 from personal_monitor.engine.errors import ErrorClass, FetchError, MonitorError
 from personal_monitor.scraping.document import SourceDocument
+from personal_monitor.security.egress import (
+    HTTP_EGRESS_GATE,
+    EgressProxyIdentity,
+    require_egress_proxy,
+)
 from personal_monitor.security.url_policy import (
     MAX_REDIRECTS,
     ResolvedTarget,
@@ -53,7 +58,6 @@ _DEFAULT_HTTP_FETCHER = Fetcher.get
 _DEFAULT_DYNAMIC_FETCHER = DynamicFetcher.fetch
 _DEFAULT_STEALTHY_FETCHER = StealthyFetcher.fetch
 
-_HTTP_GATE = threading.BoundedSemaphore(HTTP_CONCURRENCY)
 _BROWSER_GATE = threading.BoundedSemaphore(BROWSER_CONCURRENCY)
 
 _QUIET_LOGGER = logging.getLogger("personal_monitor.scrapling.quiet")
@@ -63,19 +67,46 @@ _QUIET_LOGGER.propagate = False
 _QUIET_LOGGER.setLevel(logging.CRITICAL + 1)
 
 
+class _BodyLimitExceeded(RuntimeError):
+    pass
+
+
+class _BoundedBodyCollector:
+    def __init__(self, *, max_bytes: int = MAX_RESPONSE_BYTES) -> None:
+        self._max_bytes = max_bytes
+        self._body = bytearray()
+        self.saw_chunk = False
+        self.exceeded = False
+
+    @property
+    def retained_bytes(self) -> int:
+        return len(self._body)
+
+    @property
+    def body(self) -> bytes:
+        return bytes(self._body)
+
+    def __call__(self, chunk: bytes) -> None:
+        self.saw_chunk = True
+        if len(chunk) > self._max_bytes - len(self._body):
+            self.exceeded = True
+            raise _BodyLimitExceeded("response size limit exceeded")
+        self._body.extend(chunk)
+
+
 def normalize_response(
     response: object,
     *,
     strategy: FetchStrategy,
     block_page_detector: BlockPageDetector | None = None,
     clock: Clock = lambda: datetime.now(UTC),
+    body_override: bytes | None = None,
 ) -> SourceDocument:
     status = _read_status(response)
     final_url = _read_final_url(response)
     redirect_urls = _read_redirect_urls(response)
-    peer_ip = _read_peer_ip(response)
     headers, header_values = _copy_safe_headers(response)
-    body = _read_body(response)
+    body = _read_body(response, body_override=body_override)
     content_type = _normalize_content_type(header_values.get("content-type", ()))
     detected_interstitial = _detect_interstitial(
         block_page_detector,
@@ -108,7 +139,7 @@ def normalize_response(
         strategy=strategy,
         redirect_urls=redirect_urls,
         redirect_location=redirect_location,
-        peer_ip=peer_ip,
+        peer_ip=None,
     )
 
 
@@ -136,15 +167,14 @@ class ScraplingBackend:
         block_page_detector: BlockPageDetector | None = None,
         clock: Clock = lambda: datetime.now(UTC),
     ) -> None:
-        proxy = _validate_proxy_url(egress_proxy_url)
-        if not proxy:
-            raise ValueError("an egress proxy is required for every backend")
+        proxy, proxy_identity = require_egress_proxy(egress_proxy_url)
 
         self._egress_proxy_url = proxy
+        self._proxy_identity = proxy_identity
         self._http_fetcher = http_fetcher
         self._dynamic_fetcher = dynamic_fetcher
         self._stealthy_fetcher = stealthy_fetcher
-        self._http_gate = http_gate or _HTTP_GATE
+        self._http_gate = http_gate or HTTP_EGRESS_GATE
         self._browser_gate = browser_gate or _BROWSER_GATE
         self._http_timeout_seconds = _bounded_timeout(
             http_timeout_seconds,
@@ -172,7 +202,12 @@ class ScraplingBackend:
         """Whether production fetchers and process-wide concurrency gates are intact."""
         return self._policy_sealed
 
+    @property
+    def proxy_identity(self) -> EgressProxyIdentity:
+        return self._proxy_identity
+
     async def fetch_http(self, target: ResolvedTarget) -> SourceDocument:
+        body_collector = _BoundedBodyCollector()
         return await self._fetch(
             target,
             strategy=FetchStrategy.HTTP,
@@ -189,8 +224,11 @@ class ScraplingBackend:
                 "retries": 1,
                 "proxy": self._egress_proxy_url,
                 "headers": {"Accept-Encoding": "identity"},
+                "accept_encoding": "identity",
+                "content_callback": body_collector,
                 "selector_config": dict(_SELECTOR_CONFIG),
             },
+            body_collector=body_collector,
         )
 
     async def fetch_dynamic(
@@ -257,6 +295,7 @@ class ScraplingBackend:
         gate: threading.BoundedSemaphore,
         outer_timeout_seconds: float,
         kwargs: dict[str, object],
+        body_collector: _BoundedBodyCollector | None = None,
     ) -> SourceDocument:
         if not isinstance(target, ResolvedTarget):
             raise TypeError("target must be an approved ResolvedTarget")
@@ -282,16 +321,27 @@ class ScraplingBackend:
         except TimeoutError:
             if not started.is_set():
                 worker.cancel()
+            if body_collector is not None and body_collector.exceeded:
+                raise _response_size_error() from None
             raise MonitorError(ErrorClass.TRANSIENT_NETWORK, "fetch", "fetch timed out") from None
         except MonitorError:
             raise
         except Exception:
+            if body_collector is not None and body_collector.exceeded:
+                raise _response_size_error() from None
             raise MonitorError(ErrorClass.TRANSIENT_NETWORK, "fetch", "fetch failed") from None
+        if body_collector is not None and body_collector.exceeded:
+            raise _response_size_error()
         return normalize_response(
             response,
             strategy=strategy,
             block_page_detector=self._block_page_detector,
             clock=self._clock,
+            body_override=(
+                body_collector.body
+                if body_collector is not None and body_collector.saw_chunk
+                else None
+            ),
         )
 
     @staticmethod
@@ -343,34 +393,6 @@ def _invoke_quietly(
         return fetcher(url, **kwargs)
     finally:
         reset_logger(token)
-
-
-def _validate_proxy_url(value: str | None) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError("egress proxy URL is invalid")
-    normalized = value.strip()
-    if not normalized:
-        return None
-    if normalized != value or has_unsafe_url_characters(value):
-        raise ValueError("egress proxy URL is invalid")
-    try:
-        parts = urlsplit(normalized)
-        port = parts.port
-    except ValueError:
-        raise ValueError("egress proxy URL is invalid") from None
-    if (
-        parts.scheme.casefold() not in {"http", "https"}
-        or not parts.hostname
-        or (parts.path not in {"", "/"})
-        or parts.query
-        or parts.fragment
-        or port is not None
-        and not 1 <= port <= 65535
-    ):
-        raise ValueError("egress proxy URL is invalid")
-    return normalized
 
 
 def _bounded_timeout(value: float, *, maximum: float, label: str) -> float:
@@ -477,18 +499,6 @@ def _read_redirect_urls(response: object) -> tuple[str, ...]:
             _validate_absolute_http_url(value, detail="response redirect history is invalid")
         )
     return tuple(urls)
-
-
-def _read_peer_ip(response: object) -> str | None:
-    try:
-        value = getattr(response, "primary_ip", None)
-    except Exception:
-        raise _policy_error("response peer metadata is invalid") from None
-    if value in {None, ""}:
-        return None
-    if not isinstance(value, str):
-        raise _policy_error("response peer metadata is invalid")
-    return value
 
 
 def _validate_absolute_http_url(value: object, *, detail: str) -> str:
@@ -610,7 +620,9 @@ def _parse_retry_after(values: tuple[str, ...], *, clock: Clock) -> float | None
     return max(0.0, (retry_at.astimezone(UTC) - now.astimezone(UTC)).total_seconds())
 
 
-def _read_body(response: object) -> bytes:
+def _read_body(response: object, *, body_override: bytes | None = None) -> bytes:
+    if body_override is not None:
+        return body_override
     try:
         body = response.body
     except Exception:
@@ -625,3 +637,7 @@ def _read_body(response: object) -> bytes:
 
 def _policy_error(detail: str) -> MonitorError:
     return MonitorError(ErrorClass.POLICY, "fetch", detail)
+
+
+def _response_size_error() -> MonitorError:
+    return _policy_error("response exceeds the 10 MiB decompressed size limit")

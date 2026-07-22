@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from types import MappingProxyType
 from urllib.parse import urljoin, urlsplit
@@ -9,6 +12,11 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from personal_monitor.engine.errors import ErrorClass, FetchError, MonitorError
+from personal_monitor.security.egress import (
+    EgressProxyIdentity,
+    hold_http_egress_slot,
+    require_egress_proxy,
+)
 from personal_monitor.security.url_policy import ResolvedTarget, has_unsafe_url_characters
 
 MONITOR_USER_AGENT = "personal-monitor/0.1"
@@ -24,6 +32,9 @@ _ROBOTS_HEADERS = {
     "Accept-Encoding": "identity",
 }
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MEDIA_TOKEN = r"[!#$%&'*+\-.^_`|~0-9a-z]+"
+_MEDIA_TYPE = re.compile(rf"^({_MEDIA_TOKEN})/({_MEDIA_TOKEN})$")
+Clock = Callable[[], datetime]
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,27 +45,42 @@ class PolicyHttpResponse:
     body: bytes = field(repr=False)
     redirect_location: str | None = field(default=None, repr=False)
     peer_ip: str | None = field(default=None, repr=False)
+    retry_after_seconds: float | None = field(default=None, repr=False)
+
+
+class _BoundedBodyAccumulator:
+    def __init__(self, *, max_bytes: int = MAX_RESPONSE_BYTES) -> None:
+        self._max_bytes = max_bytes
+        self._body = bytearray()
+
+    @property
+    def retained_bytes(self) -> int:
+        return len(self._body)
+
+    def extend(self, chunk: bytes) -> None:
+        if len(chunk) > self._max_bytes - len(self._body):
+            raise _policy_error("response exceeds the 10 MiB decompressed size limit")
+        self._body.extend(chunk)
+
+    def to_bytes(self) -> bytes:
+        return bytes(self._body)
 
 
 class BoundedPolicyHttpClient:
     """A proxy-required, GET-only HTTP client with two fixed request shapes."""
 
-    def __init__(self, *, egress_proxy_url: str | None) -> None:
-        self._proxy_url = _required_proxy(egress_proxy_url)
-        self._test_transport: httpx.AsyncBaseTransport | None = None
-
-    @classmethod
-    def for_test(
-        cls,
+    def __init__(
+        self,
         *,
-        egress_proxy_url: str,
-        transport: httpx.AsyncBaseTransport,
-    ) -> BoundedPolicyHttpClient:
-        if not isinstance(transport, httpx.AsyncBaseTransport):
-            raise TypeError("test transport must be an httpx async transport")
-        instance = cls(egress_proxy_url=egress_proxy_url)
-        instance._test_transport = transport
-        return instance
+        egress_proxy_url: str | None,
+        clock: Clock = lambda: datetime.now(UTC),
+    ) -> None:
+        self._proxy_url, self._proxy_identity = require_egress_proxy(egress_proxy_url)
+        self._clock = clock
+
+    @property
+    def proxy_identity(self) -> EgressProxyIdentity:
+        return self._proxy_identity
 
     async def get_json(self, target: ResolvedTarget) -> PolicyHttpResponse:
         return await self._get(target, headers=_JSON_HEADERS, require_json=True)
@@ -75,13 +101,13 @@ class BoundedPolicyHttpClient:
         kwargs: dict[str, object] = {
             "timeout": timeout,
             "follow_redirects": False,
+            "proxy": self._proxy_url,
         }
-        if self._test_transport is None:
-            kwargs["proxy"] = self._proxy_url
-        else:
-            kwargs["transport"] = self._test_transport
         try:
-            async with httpx.AsyncClient(**kwargs) as client:  # type: ignore[arg-type]
+            async with (
+                hold_http_egress_slot(),
+                httpx.AsyncClient(**kwargs) as client,  # type: ignore[arg-type]
+            ):
                 request = httpx.Request(
                     "GET",
                     target.normalized_url,
@@ -98,7 +124,11 @@ class BoundedPolicyHttpClient:
                 async with asyncio.timeout(30.0):
                     response = await client.send(request, stream=True, follow_redirects=False)
                     try:
-                        return await _read_response(response, require_json=require_json)
+                        return await _read_response(
+                            response,
+                            require_json=require_json,
+                            clock=self._clock,
+                        )
                     finally:
                         await response.aclose()
         except FetchError:
@@ -129,12 +159,11 @@ async def _read_response(
     response: httpx.Response,
     *,
     require_json: bool,
+    clock: Clock,
 ) -> PolicyHttpResponse:
-    body = bytearray()
+    body = _BoundedBodyAccumulator()
     async for chunk in response.aiter_bytes():
         body.extend(chunk)
-        if len(body) > MAX_RESPONSE_BYTES:
-            raise _policy_error("response exceeds the 10 MiB decompressed size limit")
 
     status = response.status_code
     if isinstance(status, bool) or not 100 <= status <= 599:
@@ -142,7 +171,7 @@ async def _read_response(
     final_url = _safe_absolute_url(str(response.url), "response final URL is invalid")
     content_types = response.headers.get_list("content-type")
     locations = response.headers.get_list("location")
-    retry_after = _retry_after(response.headers.get_list("retry-after"))
+    retry_after = _retry_after(response.headers.get_list("retry-after"), clock=clock)
     retained: dict[str, str] = {}
     for name, values in (
         ("content-type", content_types),
@@ -165,11 +194,17 @@ async def _read_response(
         )
     elif require_json:
         _raise_for_status(status, retry_after)
+        if not 200 <= status <= 299:
+            raise _policy_error("official endpoint returned an invalid terminal status")
         if len(content_types) != 1 or "," in content_types[0]:
             raise _policy_error("response Content-Type is missing or duplicated")
         media_type = content_types[0].split(";", 1)[0].strip().casefold()
-        if media_type != "application/json" and not (
-            media_type.startswith("application/") and media_type.endswith("+json")
+        match = _MEDIA_TYPE.fullmatch(media_type)
+        if match is None:
+            raise _policy_error("official endpoint did not return JSON")
+        main_type, subtype = match.groups()
+        if main_type != "application" or not (
+            subtype == "json" or (subtype.endswith("+json") and subtype != "+json")
         ):
             raise _policy_error("official endpoint did not return JSON")
 
@@ -177,11 +212,12 @@ async def _read_response(
         final_url=final_url,
         status=status,
         headers=MappingProxyType(retained),
-        body=bytes(body),
+        body=body.to_bytes(),
         redirect_location=redirect_location,
         # httpx exposes the connected proxy socket here, not an origin peer
         # attested by the policy proxy. Treat it as unavailable.
         peer_ip=None,
+        retry_after_seconds=retry_after,
     )
 
 
@@ -209,7 +245,7 @@ def _raise_for_status(status: int, retry_after: float | None) -> None:
         )
 
 
-def _retry_after(values: list[str]) -> float | None:
+def _retry_after(values: list[str], *, clock: Clock) -> float | None:
     if len(values) != 1:
         return None
     raw = values[0].strip()
@@ -221,32 +257,10 @@ def _retry_after(values: list[str]) -> float | None:
         return None
     if value.tzinfo is None:
         return None
-    # Date-form Retry-After is intentionally not accepted here: the adapter has
-    # no wall clock at this transport boundary, so it cannot calculate safely.
-    return None
-
-
-def _required_proxy(value: str | None) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise ValueError("an egress proxy is required")
-    if has_unsafe_url_characters(value):
-        raise ValueError("egress proxy URL is invalid")
-    try:
-        parts = urlsplit(value)
-        port = parts.port
-    except ValueError:
-        raise ValueError("egress proxy URL is invalid") from None
-    if (
-        parts.scheme.casefold() not in {"http", "https"}
-        or not parts.hostname
-        or parts.path not in {"", "/"}
-        or parts.query
-        or parts.fragment
-        or port is not None
-        and not 1 <= port <= 65535
-    ):
-        raise ValueError("egress proxy URL is invalid")
-    return value
+    now = clock()
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise MonitorError(ErrorClass.INTERNAL, "clock", "clock returned an invalid timestamp")
+    return max(0.0, (value - now).total_seconds())
 
 
 def _safe_absolute_url(value: str, detail: str) -> str:

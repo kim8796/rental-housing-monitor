@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from time import sleep
 
+import httpx
 import pytest
 from curl_cffi.const import CurlOpt
 from curl_cffi.requests.utils import set_curl_options
@@ -17,6 +18,9 @@ from scrapling.engines._browsers._stealth import StealthySession
 from scrapling.engines.static import FetcherSession
 from scrapling.engines.toolbelt.custom import Response as ScraplingResponse
 
+import personal_monitor.adapters._policy as policy_module
+import personal_monitor.scraping.scrapling_backend as backend_module
+from personal_monitor.adapters.official_api import BoundedPolicyHttpClient
 from personal_monitor.domain.spec import FetchStrategy
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.scraping.scrapling_backend import (
@@ -123,13 +127,13 @@ def test_response_is_bounded_normalized_and_immutable() -> None:
     assert "headers" not in representation
 
 
-def test_trustworthy_peer_metadata_is_preserved_for_policy_revalidation() -> None:
+def test_proxy_primary_ip_is_not_treated_as_an_attested_origin_peer() -> None:
     response = FakeResponse()
     response.primary_ip = "93.184.216.34"
 
     document = normalize_response(response, strategy=FetchStrategy.HTTP)
 
-    assert document.peer_ip == "93.184.216.34"
+    assert document.peer_ip is None
     assert "93.184.216.34" not in repr(document)
 
 
@@ -317,6 +321,130 @@ def test_decompressed_response_size_boundary_is_enforced() -> None:
         )
 
     assert caught.value.error_class is ErrorClass.POLICY
+
+
+def test_http_callback_rejects_huge_chunk_before_retaining_it() -> None:
+    collector = backend_module._BoundedBodyCollector(max_bytes=3)
+
+    with pytest.raises(Exception, match="size limit"):
+        collector(b"xxxx")
+
+    assert collector.retained_bytes == 0
+
+
+def test_http_callback_body_is_carried_into_normalization() -> None:
+    def fetcher(_url: str, **kwargs: object) -> FakeResponse:
+        callback = kwargs["content_callback"]
+        assert callable(callback)
+        callback(b"streamed-body")
+        return FakeResponse(body=b"")
+
+    backend = make_test_backend(http_fetcher=fetcher)
+
+    result = asyncio.run(backend.fetch_http(target()))
+
+    assert result.body == b"streamed-body"
+
+
+def test_http_callback_size_abort_is_policy_not_transient() -> None:
+    def fetcher(_url: str, **kwargs: object) -> FakeResponse:
+        callback = kwargs["content_callback"]
+        assert callable(callback)
+        callback(b"x" * (MAX_RESPONSE_BYTES + 1))
+        raise AssertionError("callback must abort first")
+
+    backend = make_test_backend(http_fetcher=fetcher)
+
+    with pytest.raises(MonitorError, match="10 MiB") as caught:
+        asyncio.run(backend.fetch_http(target()))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+
+
+def test_policy_http_requests_share_global_four_request_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_async_client = httpx.AsyncClient
+    active = 0
+    peak = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return httpx.Response(200, headers={"Content-Type": "application/json"}, json={})
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        kwargs.pop("proxy")
+        return real_async_client(
+            **kwargs,  # type: ignore[arg-type]
+            transport=httpx.MockTransport(handler),
+        )
+
+    monkeypatch.setattr(policy_module.httpx, "AsyncClient", client_factory)
+    client = BoundedPolicyHttpClient(egress_proxy_url="http://proxy.internal:8080")
+
+    async def scenario() -> None:
+        await asyncio.gather(*(client.get_json(target()) for _ in range(8)))
+
+    asyncio.run(scenario())
+
+    assert peak == 4
+
+
+def test_scrapling_and_policy_http_share_one_global_four_request_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_async_client = httpx.AsyncClient
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def enter() -> None:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+
+    def leave() -> None:
+        nonlocal active
+        with lock:
+            active -= 1
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        enter()
+        await asyncio.sleep(0.03)
+        leave()
+        return httpx.Response(200, headers={"Content-Type": "application/json"}, json={})
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        kwargs.pop("proxy")
+        return real_async_client(
+            **kwargs,  # type: ignore[arg-type]
+            transport=httpx.MockTransport(handler),
+        )
+
+    def fetcher(_url: str, **_kwargs: object) -> FakeResponse:
+        enter()
+        sleep(0.03)
+        leave()
+        return FakeResponse()
+
+    monkeypatch.setattr(policy_module.httpx, "AsyncClient", client_factory)
+    client = BoundedPolicyHttpClient(egress_proxy_url="http://proxy.internal:8080")
+    backend = make_test_backend(http_fetcher=fetcher)
+
+    async def scenario() -> None:
+        await asyncio.gather(
+            *(client.get_json(target()) for _ in range(4)),
+            *(backend.fetch_http(target()) for _ in range(4)),
+        )
+
+    asyncio.run(scenario())
+
+    assert peak == 4
 
 
 def test_error_response_is_size_bounded_before_status_classification() -> None:
@@ -511,6 +639,8 @@ def test_http_fetch_uses_approved_url_and_bounded_fetcher_kwargs() -> None:
     document = asyncio.run(backend.fetch_http(target()))
 
     assert document.strategy is FetchStrategy.HTTP
+    callback = calls[0][1].pop("content_callback")
+    assert callable(callback)
     assert calls == [
         (
             "https://example.com/source",
@@ -521,6 +651,7 @@ def test_http_fetch_uses_approved_url_and_bounded_fetcher_kwargs() -> None:
                 "retries": 1,
                 "proxy": "http://proxy.internal:8080",
                 "headers": {"Accept-Encoding": "identity"},
+                "accept_encoding": "identity",
                 "selector_config": {
                     "adaptive": True,
                     "keep_comments": False,

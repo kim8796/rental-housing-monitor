@@ -42,7 +42,7 @@ class OfficialJsonAdapter:
         clock: Clock = lambda: datetime.now(UTC),
         sleeper: Sleeper = asyncio.sleep,
     ) -> None:
-        if not isinstance(http_client, BoundedPolicyHttpClient):
+        if type(http_client) is not BoundedPolicyHttpClient:
             raise TypeError("http_client must preserve the bounded proxy policy")
         self._url_policy = url_policy
         self._rate_limiter = rate_limiter
@@ -149,9 +149,9 @@ class OfficialJsonAdapter:
         retry_after: float | None,
     ) -> float | None:
         await self._rate_limiter.acquire(target.hostname, retry_after)
-        decision = await self._robots_decision(target)
+        decision, robots_retry_after = await self._robots_decision(target)
         decision.require_allowed()
-        return decision.crawl_delay_seconds
+        return _max_delay(decision.crawl_delay_seconds, robots_retry_after)
 
     async def _robots_decision(self, target: ResolvedTarget):
         robots_url = _robots_url(target.normalized_url)
@@ -166,7 +166,10 @@ class OfficialJsonAdapter:
                 if error.error_class is not ErrorClass.TRANSIENT_NETWORK:
                     raise
                 policy = RobotsPolicy.from_fetch_failure(robots_url, checked_at=self._clock())
-                return policy.check(MONITOR_USER_AGENT, target.normalized_url)
+                return (
+                    policy.check(MONITOR_USER_AGENT, target.normalized_url),
+                    _safe_retry_after(error),
+                )
 
             await self._validate_response_destination(response, requested=robots_target)
             if response.status in _REDIRECT_STATUSES:
@@ -194,15 +197,26 @@ class OfficialJsonAdapter:
                 await self._rate_limiter.acquire(robots_target.hostname)
                 continue
 
-            if response.status != 200:
-                policy = RobotsPolicy.from_fetch_failure(robots_url, checked_at=self._clock())
-            else:
+            if response.status == 200:
                 policy = RobotsPolicy.from_text(
                     response.body.decode("utf-8", errors="replace"),
                     robots_url,
                     checked_at=self._clock(),
                 )
-            return policy.check(MONITOR_USER_AGENT, target.normalized_url)
+                retry_after = None
+            elif response.status in {404, 410}:
+                policy = RobotsPolicy.from_fetch_failure(robots_url, checked_at=self._clock())
+                retry_after = None
+            elif response.status == 429 or 500 <= response.status <= 599:
+                policy = RobotsPolicy.from_fetch_failure(robots_url, checked_at=self._clock())
+                retry_after = response.retry_after_seconds
+            else:
+                raise MonitorError(
+                    ErrorClass.POLICY,
+                    "robots",
+                    "robots response returned an invalid status",
+                )
+            return policy.check(MONITOR_USER_AGENT, target.normalized_url), retry_after
 
     async def _validate_response_destination(
         self,
@@ -213,8 +227,6 @@ class OfficialJsonAdapter:
         final_target = await self._url_policy.validate(response.final_url)
         if final_target.normalized_url != requested.normalized_url:
             raise MonitorError(ErrorClass.POLICY, "redirect", "unapproved final URL")
-        if response.peer_ip is not None:
-            self._url_policy.validate_peer(final_target, response.peer_ip)
 
 
 def _content_type(response: PolicyHttpResponse) -> str:
@@ -243,6 +255,11 @@ def _safe_retry_after(error: MonitorError) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) and result >= 0 else None
+
+
+def _max_delay(first: float | None, second: float | None) -> float | None:
+    values = [value for value in (first, second) if value is not None]
+    return max(values) if values else None
 
 
 def _require_aware(value: datetime) -> None:
