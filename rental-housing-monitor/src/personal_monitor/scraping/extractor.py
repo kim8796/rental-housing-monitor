@@ -19,10 +19,12 @@ _JSON_INDEX = re.compile(r"0|[1-9][0-9]*")
 _HIDDEN_STYLE = re.compile(
     r"(?:^|;)(?:display:none|visibility:(?:hidden|collapse))(?:!important)?(?:;|$)"
 )
-_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.DOTALL)
 _MAX_INLINE_STYLE_LENGTH = 4096
 _MAX_JSON_DEPTH = 100
 _MAX_JSON_NODES = 100_000
+_XPATH_WORD_OPERATORS = frozenset({"and", "div", "mod", "or"})
+_XPATH_SYMBOL_OPERATORS = frozenset({"(", "[", "|", ",", "=", "!", "<", ">", "+", "-"})
 
 
 class DeclarativeExtractor:
@@ -131,7 +133,7 @@ def _scope_xpath(selector: str) -> str:
     result: list[str] = []
     quote: str | None = None
     previous_significant: str | None = None
-    for character in selector:
+    for index, character in enumerate(selector):
         if quote is not None:
             result.append(character)
             if character == quote:
@@ -142,12 +144,34 @@ def _scope_xpath(selector: str) -> str:
             result.append(character)
             previous_significant = character
             continue
-        if character == "/" and previous_significant in {None, "(", "|", "[", ",", "="}:
+        if character == "/" and _starts_xpath_operand(
+            result,
+            previous_significant,
+            preceded_by_whitespace=index > 0 and selector[index - 1].isspace(),
+        ):
             result.append(".")
         result.append(character)
         if not character.isspace():
             previous_significant = character
     return "".join(result)
+
+
+def _starts_xpath_operand(
+    prefix: list[str],
+    previous_significant: str | None,
+    *,
+    preceded_by_whitespace: bool,
+) -> bool:
+    if previous_significant is None or previous_significant in _XPATH_SYMBOL_OPERATORS:
+        return True
+    compact_prefix = "".join(prefix).rstrip()
+    if previous_significant == "*":
+        before_star = compact_prefix[:-1].rstrip()
+        return not before_star.endswith(("/", ":"))
+    if not preceded_by_whitespace:
+        return False
+    word = re.search(r"([a-z]+)$", compact_prefix, re.IGNORECASE)
+    return word is not None and word.group(1).casefold() in _XPATH_WORD_OPERATORS
 
 
 def _visible_text(match: Selector) -> str:

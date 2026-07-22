@@ -91,12 +91,17 @@ def test_observation_value_mappings_are_defensively_immutable() -> None:
 def test_source_derived_item_and_change_values_are_redacted_from_repr() -> None:
     source_id = "source-id-session-secret"
     source_value = "field-value-session-secret"
+    status_value = "status-html-<secret>"
+    warning_value = "warning-cookie=session-secret"
     item = ObservedItem(source_id, {"title": source_value})
+    warning = SourceWarning(source="source-a", stage="extract", detail=warning_value)
     batch = ObservationBatch(
         monitor_id="monitor-1",
         items=(item,),
         observed_at=datetime(2026, 7, 23, tzinfo=UTC),
         source_hash="safe-hash",
+        source_status={"source-a": status_value},
+        warnings=(warning,),
     )
     change = Change(
         item_id=source_id,
@@ -105,7 +110,9 @@ def test_source_derived_item_and_change_values_are_redacted_from_repr() -> None:
         changed_fields={"title": ("old-session-secret", source_value)},
     )
 
-    for representation in (repr(item), repr(batch), repr(change)):
+    for representation in (repr(item), repr(warning), repr(batch), repr(change)):
         assert source_id not in representation
         assert source_value not in representation
+        assert status_value not in representation
+        assert warning_value not in representation
         assert "old-session-secret" not in representation

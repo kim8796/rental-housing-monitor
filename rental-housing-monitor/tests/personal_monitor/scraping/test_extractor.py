@@ -135,6 +135,71 @@ def test_compound_field_xpath_cannot_escape_to_sibling_items() -> None:
     assert [row.fields["title"] for row in rows] == ["A", "B"]
 
 
+@pytest.mark.parametrize(
+    ("selector", "body"),
+    [
+        ("(/h1[./x or /y])[1]", b"<main><h1>A<y/></h1></main>"),
+        ("(/h1[./x and /y])[1]", b"<main><h1>A<x/><y/></h1></main>"),
+    ],
+)
+def test_absolute_xpath_operands_after_boolean_operators_are_item_scoped(
+    selector: str, body: bytes
+) -> None:
+    rows = DeclarativeExtractor().extract(
+        document(body),
+        extract_spec(
+            {
+                "item_scope": "main",
+                "fields": {"title": {"selector": selector, "type": "text"}},
+            }
+        ),
+    )
+
+    assert rows[0].fields["title"] == "A"
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "(/h1[10 div /value = 5])[1]",
+        "(/h1[5 mod /value = 1])[1]",
+    ],
+)
+def test_absolute_xpath_operands_after_numeric_word_operators_are_item_scoped(
+    selector: str,
+) -> None:
+    rows = DeclarativeExtractor().extract(
+        document(b"<main><h1>A<value>2</value></h1></main>"),
+        extract_spec(
+            {
+                "item_scope": "main",
+                "fields": {"title": {"selector": selector, "type": "text"}},
+            }
+        ),
+    )
+
+    assert rows[0].fields["title"] == "A 2"
+
+
+def test_xpath_slashes_inside_quoted_literals_are_preserved() -> None:
+    rows = DeclarativeExtractor().extract(
+        document(b'<main><a href="https://example.com/p">Link</a></main>'),
+        extract_spec(
+            {
+                "item_scope": "main",
+                "fields": {
+                    "title": {
+                        "selector": "(./a[@href='https://example.com/p'])[1]",
+                        "type": "text",
+                    }
+                },
+            }
+        ),
+    )
+
+    assert rows[0].fields["title"] == "Link"
+
+
 def test_visible_text_excludes_explicitly_hidden_descendants() -> None:
     body = b"""<main><h1>Shown
       <span hidden>hidden-secret</span>
@@ -165,6 +230,7 @@ def test_visible_text_excludes_explicitly_hidden_descendants() -> None:
         "<template>template<span hidden>nested</span></template>",
         '<span style="display:/**/none">comment-hidden<i hidden>nested</i></span>',
         '<span style="visibility:/**/hidden">comment-hidden<template>nested</template></span>',
+        '<span style="display:none/*">unterminated-comment-hidden</span>',
     ],
 )
 def test_nested_hidden_descendants_are_removed_without_destroyed_tag_errors(

@@ -32,17 +32,17 @@ class ObservedItem:
 class SourceWarning:
     source: str
     stage: str
-    detail: str
+    detail: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
 class ObservationBatch:
     monitor_id: str
-    items: tuple[ObservedItem, ...]
+    items: tuple[ObservedItem, ...] = field(repr=False)
     observed_at: datetime
     source_hash: str
-    source_status: Mapping[str, str] = field(default_factory=dict)
-    warnings: tuple[SourceWarning, ...] = ()
+    source_status: Mapping[str, str] = field(default_factory=dict, repr=False)
+    warnings: tuple[SourceWarning, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "items", tuple(self.items))
