@@ -19,6 +19,7 @@ from scrapling.fetchers import DynamicFetcher, Fetcher, StealthyFetcher
 from personal_monitor.domain.spec import FetchStrategy
 from personal_monitor.engine.errors import ErrorClass, FetchError, MonitorError
 from personal_monitor.scraping.document import SourceDocument
+from personal_monitor.scraping.profiles import attach_profile_worker
 from personal_monitor.security.egress import (
     HTTP_EGRESS_GATE,
     EgressProxyIdentity,
@@ -365,6 +366,7 @@ class ScraplingBackend:
             gate=self._browser_gate,
             outer_timeout_seconds=self._browser_timeout_seconds,
             kwargs=kwargs,
+            profile_lease=profile,
         )
 
     async def _fetch(
@@ -377,6 +379,7 @@ class ScraplingBackend:
         outer_timeout_seconds: float,
         kwargs: dict[str, object],
         body_collector: _BoundedBodyCollector | None = None,
+        profile_lease: Path | None = None,
     ) -> SourceDocument:
         if not isinstance(target, ResolvedTarget):
             raise TypeError("target must be an approved ResolvedTarget")
@@ -392,6 +395,8 @@ class ScraplingBackend:
         )
         self._background_calls.add(worker)
         worker.add_done_callback(self._discard_background_call)
+        if profile_lease is not None:
+            attach_profile_worker(profile_lease, worker)
         try:
             async with asyncio.timeout(outer_timeout_seconds):
                 response = await asyncio.shield(worker)

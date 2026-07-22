@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import math
 import os
-import shutil
 import stat
 import tempfile
 import threading
 import unicodedata
+import weakref
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
@@ -26,12 +28,106 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_PATH_BYTES = 512
 MAX_PATH_DEPTH = 32
 _ERROR = "browser profile is unavailable"
+_BOOTSTRAP_TIMEOUT_SECONDS = 900.0
 
 _LOCKS_GUARD = threading.Lock()
-_LOCKS: dict[tuple[tuple[int, int], str], threading.RLock] = {}
+_LOCKS: dict[tuple[tuple[int, int], str], threading.Lock] = {}
+_DEFERRED_FINALIZERS: set[asyncio.Task[None]] = set()
 
 BootstrapRunner = Callable[..., object]
 PageAction = Callable[[object], object]
+ProfileStoreSnapshot = tuple[
+    CredentialVault,
+    int,
+    int,
+    tuple[int, int],
+    Path,
+    tuple[int, int],
+]
+
+
+def _private_profile_store_pins():
+    pins: weakref.WeakKeyDictionary[object, tuple[object, ...]] = weakref.WeakKeyDictionary()
+    lock = threading.RLock()
+
+    def pin(owner: object, values: tuple[object, ...]) -> None:
+        with lock:
+            if owner in pins:
+                raise ProfileUnavailableError
+            pins[owner] = values
+
+    def acquire(owner: object) -> tuple[object, ...]:
+        with lock:
+            values = pins.get(owner)
+        if values is None:
+            raise ProfileUnavailableError
+        return values
+
+    def release(owner: object) -> tuple[object, ...] | None:
+        with lock:
+            return pins.pop(owner, None)
+
+    return pin, acquire, release
+
+
+_pin_profile_store, _acquire_profile_store, _release_profile_store = _private_profile_store_pins()
+
+
+def _profile_lease_registry():
+    leases: dict[tuple[int, int], _PinnedWorkspace] = {}
+    lock = threading.RLock()
+
+    def register(workspace: _PinnedWorkspace) -> None:
+        with lock:
+            if workspace.identity in leases:
+                raise ProfileUnavailableError
+            leases[workspace.identity] = workspace
+
+    def attach(path: Path, worker: asyncio.Task[object]) -> None:
+        fd = -1
+        try:
+            fd = os.open(
+                path,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+            )
+            metadata = os.fstat(fd)
+            identity = (metadata.st_dev, metadata.st_ino)
+        except Exception:
+            return
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        with lock:
+            workspace = leases.get(identity)
+            if workspace is not None:
+                workspace.workers.add(worker)
+
+    def pending(workspace: _PinnedWorkspace) -> tuple[asyncio.Task[object], ...]:
+        with lock:
+            return tuple(worker for worker in workspace.workers if not worker.done())
+
+    def unregister(workspace: _PinnedWorkspace) -> None:
+        with lock:
+            if leases.get(workspace.identity) is workspace:
+                del leases[workspace.identity]
+
+    return register, attach, pending, unregister
+
+
+(
+    _register_profile_lease,
+    attach_profile_worker,
+    _pending_profile_workers,
+    _unregister_profile_lease,
+) = _profile_lease_registry()
+
+
+async def _acquire_lock_async(lock: threading.Lock) -> None:
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(0.01)
 
 
 class ProfileUnavailableError(RuntimeError):
@@ -44,7 +140,16 @@ class ProfileUnavailableError(RuntimeError):
 class BrowserProfileStore:
     """Encrypted browser archives materialized only in isolated workspaces."""
 
-    __slots__ = ("_expected_uid", "_root_identity", "_vault", "_workspace_root")
+    __slots__ = (
+        "_composition",
+        "_expected_uid",
+        "_root_fd",
+        "_root_identity",
+        "_sealed",
+        "_vault",
+        "_workspace_root",
+        "__weakref__",
+    )
 
     def __init__(
         self,
@@ -54,15 +159,24 @@ class BrowserProfileStore:
         require_memory_backed: bool = False,
         expected_uid: int | None = None,
     ) -> None:
-        if not isinstance(vault, CredentialVault):
+        if type(vault) is not CredentialVault:
             raise TypeError("vault must be a CredentialVault")
+        vault_identity = vault._lock_identity
         self._vault = vault
         self._expected_uid = os.geteuid() if expected_uid is None else expected_uid
         self._workspace_root = Path(materialization_root)
+        self._root_fd = -1
         try:
             with suppress(FileExistsError):
                 os.mkdir(self._workspace_root, 0o700)
-            metadata = os.stat(self._workspace_root, follow_symlinks=False)
+            self._root_fd = os.open(
+                self._workspace_root,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+            )
+            metadata = os.fstat(self._root_fd)
             if (
                 not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != self._expected_uid
@@ -72,24 +186,57 @@ class BrowserProfileStore:
             ):
                 raise ProfileUnavailableError
             self._root_identity = (metadata.st_dev, metadata.st_ino)
+            self._composition = (
+                self._vault,
+                self._expected_uid,
+                self._root_fd,
+                self._root_identity,
+                self._workspace_root,
+                vault_identity,
+            )
+            self._sealed = True
+            _pin_profile_store(self, self._composition)
         except ProfileUnavailableError:
+            self.close()
             raise
         except Exception:
+            self.close()
             raise ProfileUnavailableError from None
 
     def __repr__(self) -> str:
         return "<BrowserProfileStore>"
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("browser profile store is sealed")
+        object.__setattr__(self, name, value)
+
+    def close(self) -> None:
+        pinned = _release_profile_store(self)
+        fd = pinned[2] if pinned is not None else getattr(self, "_root_fd", -1)
+        if fd >= 0:
+            os.close(fd)  # type: ignore[arg-type]
+        object.__setattr__(self, "_root_fd", -1)
+
+    def __del__(self) -> None:
+        with suppress(Exception):
+            self.close()
+
     def path_for(self, profile_id: str) -> Path:
         profile = validate_logical_key(profile_id)
-        return self._workspace_root / profile
+        _vault, _uid, _root_fd, _root_identity, workspace_root, _vault_identity = (
+            self._trusted_snapshot()
+        )
+        return workspace_root / profile
 
     def archive(self, profile_id: str, source: Path) -> None:
         profile = validate_logical_key(profile_id)
         try:
-            with self._lock_for(profile):
-                archive = _encode_profile_archive(Path(source), expected_uid=self._expected_uid)
-                self._vault.put(profile, archive)
+            snapshot = self._trusted_snapshot()
+            vault, uid, _root_fd, _root_identity, _workspace_root, _vault_identity = snapshot
+            with self._lock_for(profile, snapshot):
+                archive = _encode_profile_archive(Path(source), expected_uid=uid)
+                vault.put(profile, archive)
         except ProfileUnavailableError:
             raise
         except Exception:
@@ -97,70 +244,210 @@ class BrowserProfileStore:
 
     def materialize(self, profile_id: str) -> _MaterializedProfile:
         profile = validate_logical_key(profile_id)
-        return _MaterializedProfile(self, profile, self._lock_for(profile))
+        snapshot = self._trusted_snapshot()
+        return _MaterializedProfile(self, profile, self._lock_for(profile, snapshot), snapshot)
 
-    def _lock_for(self, profile_id: str) -> threading.RLock:
-        identity = (self._vault._lock_identity, profile_id)
+    def _lock_for(
+        self,
+        profile_id: str,
+        snapshot: ProfileStoreSnapshot | None = None,
+    ) -> threading.Lock:
+        trusted = self._trusted_snapshot() if snapshot is None else snapshot
+        identity = (trusted[5], profile_id)
         with _LOCKS_GUARD:
-            return _LOCKS.setdefault(identity, threading.RLock())
+            return _LOCKS.setdefault(identity, threading.Lock())
 
-    def _new_workspace(self) -> Path:
-        self._require_root()
+    def _new_workspace(
+        self,
+        snapshot: ProfileStoreSnapshot,
+    ) -> _PinnedWorkspace:
+        _vault, expected_uid, root_fd, _root_identity, workspace_root, _vault_identity = snapshot
+        self._require_root(snapshot)
+        name = f".profile-{next(tempfile._get_candidate_names())}"
+        workspace_fd = -1
+        created = False
+        identity: tuple[int, int] | None = None
         try:
-            workspace = Path(tempfile.mkdtemp(prefix=".profile-", dir=self._workspace_root))
-            workspace.chmod(0o700)
-            metadata = workspace.stat(follow_symlinks=False)
+            os.mkdir(name, 0o700, dir_fd=root_fd)
+            created = True
+            workspace_fd = os.open(
+                name,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=root_fd,
+            )
+            metadata = os.fstat(workspace_fd)
+            identity = (metadata.st_dev, metadata.st_ino)
             if (
                 not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != self._expected_uid
+                or metadata.st_uid != expected_uid
                 or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
                 raise ProfileUnavailableError
+            workspace = _PinnedWorkspace(
+                path=workspace_root / name,
+                name=name,
+                fd=workspace_fd,
+                identity=identity,
+                root_fd=root_fd,
+                expected_uid=expected_uid,
+            )
+            _register_profile_lease(workspace)
             return workspace
-        except ProfileUnavailableError:
-            raise
-        except Exception:
-            raise ProfileUnavailableError from None
+        except BaseException as error:
+            cleanup_error: BaseException | None = None
+            if workspace_fd >= 0:
+                try:
+                    _clear_directory_fd(workspace_fd)
+                except BaseException as cleanup:
+                    cleanup_error = cleanup
+                try:
+                    os.close(workspace_fd)
+                except BaseException as cleanup:
+                    cleanup_error = cleanup_error or cleanup
+            if created:
+                try:
+                    named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                    if identity is None or (named.st_dev, named.st_ino) == identity:
+                        os.rmdir(name, dir_fd=root_fd)
+                except FileNotFoundError:
+                    pass
+                except BaseException as cleanup:
+                    cleanup_error = cleanup_error or cleanup
+            if not isinstance(error, Exception):
+                if cleanup_error is not None:
+                    error.add_note("browser profile cleanup failed")
+                raise
+            if cleanup_error is not None and not isinstance(cleanup_error, Exception):
+                raise cleanup_error from error
+            failure = ProfileUnavailableError()
+            if cleanup_error is not None:
+                failure.add_note("browser profile cleanup failed")
+            raise failure from None
 
-    def _require_root(self) -> None:
+    def _require_root(
+        self,
+        snapshot: ProfileStoreSnapshot,
+    ) -> None:
+        _vault, expected_uid, root_fd, root_identity, workspace_root, _vault_identity = snapshot
         try:
-            metadata = os.stat(self._workspace_root, follow_symlinks=False)
+            metadata = os.stat(workspace_root, follow_symlinks=False)
+            pinned = os.fstat(root_fd)
             if (
                 not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != self._expected_uid
+                or metadata.st_uid != expected_uid
                 or stat.S_IMODE(metadata.st_mode) != 0o700
-                or (metadata.st_dev, metadata.st_ino) != self._root_identity
+                or (metadata.st_dev, metadata.st_ino) != root_identity
+                or (pinned.st_dev, pinned.st_ino) != root_identity
             ):
                 raise ProfileUnavailableError
         except ProfileUnavailableError:
             raise
         except Exception:
             raise ProfileUnavailableError from None
+
+    def _trusted_snapshot(
+        self,
+        _acquire: Callable[[object], tuple[object, ...]] = _acquire_profile_store,
+    ) -> ProfileStoreSnapshot:
+        try:
+            pinned = _acquire(self)
+            vault, uid, root_fd, root_identity, workspace_root, vault_identity = pinned
+            vault_snapshot = vault._trusted_snapshot()
+            metadata = os.fstat(root_fd)
+            valid = (
+                type(self) is BrowserProfileStore
+                and type(vault) is CredentialVault
+                and type(uid) is int
+                and type(root_fd) is int
+                and isinstance(root_identity, tuple)
+                and isinstance(workspace_root, Path)
+                and isinstance(vault_identity, tuple)
+                and self._vault is vault
+                and self._expected_uid == uid
+                and self._root_fd == root_fd
+                and self._root_identity == root_identity
+                and self._workspace_root == workspace_root
+                and self._composition is pinned
+                and vault_snapshot[3] == vault_identity
+                and stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == uid
+                and stat.S_IMODE(metadata.st_mode) == 0o700
+                and (metadata.st_dev, metadata.st_ino) == root_identity
+            )
+        except Exception:
+            valid = False
+        if not valid:
+            raise ProfileUnavailableError
+        return (  # type: ignore[return-value]
+            vault,
+            uid,
+            root_fd,
+            root_identity,
+            workspace_root,
+            vault_identity,
+        )
+
+
+class _PinnedWorkspace:
+    __slots__ = ("expected_uid", "fd", "identity", "name", "path", "root_fd", "workers")
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        name: str,
+        fd: int,
+        identity: tuple[int, int],
+        root_fd: int,
+        expected_uid: int,
+    ) -> None:
+        self.path = path
+        self.name = name
+        self.fd = fd
+        self.identity = identity
+        self.root_fd = root_fd
+        self.expected_uid = expected_uid
+        self.workers: set[asyncio.Task[object]] = set()
+
+    def __repr__(self) -> str:
+        return "<_PinnedWorkspace>"
 
 
 class _MaterializedProfile:
-    __slots__ = ("_lock", "_profile", "_store", "_workspace")
+    __slots__ = ("_lock", "_profile", "_snapshot", "_store", "_workspace")
 
     def __init__(
         self,
         store: BrowserProfileStore,
         profile: str,
-        lock: threading.RLock,
+        lock: threading.Lock,
+        snapshot: ProfileStoreSnapshot,
     ) -> None:
         self._store = store
         self._profile = profile
         self._lock = lock
-        self._workspace: Path | None = None
+        self._snapshot = snapshot
+        self._workspace: _PinnedWorkspace | None = None
 
     def __enter__(self) -> Path:
         self._lock.acquire()
-        workspace: Path | None = None
+        return self._enter_after_lock()
+
+    async def __aenter__(self) -> Path:
+        await _acquire_lock_async(self._lock)
+        return self._enter_after_lock()
+
+    def _enter_after_lock(self) -> Path:
+        workspace: _PinnedWorkspace | None = None
         try:
-            workspace = self._store._new_workspace()
-            archive = self._store._vault.get(self._profile)
-            _extract_profile_archive(archive, workspace)
+            workspace = self._store._new_workspace(self._snapshot)
+            archive = self._snapshot[0].get(self._profile)
+            _extract_profile_archive_fd(archive, workspace.fd, workspace.expected_uid)
             self._workspace = workspace
-            return workspace
+            return workspace.path
         except BaseException as error:
             cleanup_error: BaseException | None = None
             if workspace is not None:
@@ -181,6 +468,29 @@ class _MaterializedProfile:
             raise failure from None
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
+        return self._exit_after_lock(exc)
+
+    async def __aexit__(self, exc_type, exc, traceback) -> bool:
+        workspace = self._workspace
+        if workspace is not None:
+            pending = _pending_profile_workers(workspace)
+            if pending:
+                self._workspace = None
+                finalizer = asyncio.create_task(
+                    _finalize_after_workers(
+                        pending,
+                        vault=self._snapshot[0],
+                        profile=self._profile,
+                        workspace=workspace,
+                        profile_lock=self._lock,
+                    )
+                )
+                _DEFERRED_FINALIZERS.add(finalizer)
+                finalizer.add_done_callback(_finish_deferred_finalizer)
+                return False
+        return self._exit_after_lock(exc)
+
+    def _exit_after_lock(self, exc: BaseException | None) -> bool:
         workspace = self._workspace
         persistence_error: BaseException | None = None
         cleanup_error: BaseException | None = None
@@ -189,11 +499,11 @@ class _MaterializedProfile:
                 persistence_error = ProfileUnavailableError()
             else:
                 try:
-                    archive = _encode_profile_archive(
-                        workspace,
-                        expected_uid=self._store._expected_uid,
+                    archive = _encode_profile_archive_fd(
+                        workspace.fd,
+                        expected_uid=workspace.expected_uid,
                     )
-                    self._store._vault.put(self._profile, archive)
+                    self._snapshot[0].put(self._profile, archive)
                 except BaseException as error:
                     persistence_error = error
                 try:
@@ -237,6 +547,85 @@ class _MaterializedProfile:
         return False
 
 
+async def _finalize_after_workers(
+    workers: tuple[asyncio.Task[object], ...],
+    *,
+    vault: CredentialVault,
+    profile: str,
+    workspace: _PinnedWorkspace,
+    profile_lock: threading.Lock,
+) -> None:
+    cancelled = False
+    for worker in workers:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+            except BaseException:
+                break
+        if worker.done() and not worker.cancelled():
+            with suppress(BaseException):
+                worker.exception()
+    try:
+        await asyncio.to_thread(_finalize_deferred_workspace, vault, profile, workspace)
+    finally:
+        profile_lock.release()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def _finalize_deferred_workspace(
+    vault: CredentialVault,
+    profile: str,
+    workspace: _PinnedWorkspace,
+) -> None:
+    persistence_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    try:
+        archive = _encode_profile_archive_fd(
+            workspace.fd,
+            expected_uid=workspace.expected_uid,
+        )
+        vault.put(profile, archive)
+    except BaseException as error:
+        persistence_error = error
+    try:
+        _remove_workspace(workspace)
+    except BaseException as error:
+        cleanup_error = error
+    if persistence_error is not None and not isinstance(persistence_error, Exception):
+        if cleanup_error is not None:
+            persistence_error.add_note("browser profile cleanup failed")
+        raise persistence_error
+    if cleanup_error is not None and not isinstance(cleanup_error, Exception):
+        raise cleanup_error
+    if persistence_error is not None or cleanup_error is not None:
+        failure = ProfileUnavailableError()
+        if persistence_error is not None:
+            failure.add_note("browser profile persistence failed")
+        if cleanup_error is not None:
+            failure.add_note("browser profile cleanup failed")
+        raise failure
+
+
+def _finish_deferred_finalizer(task: asyncio.Task[None]) -> None:
+    _DEFERRED_FINALIZERS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except BaseException:
+        return
+    if error is not None:
+        task.get_loop().call_exception_handler(
+            {
+                "message": "browser profile deferred cleanup failed",
+                "exception": ProfileUnavailableError(),
+            }
+        )
+
+
 def bootstrap_profile(
     store: BrowserProfileStore,
     profile_id: str,
@@ -245,39 +634,67 @@ def bootstrap_profile(
     runner: BootstrapRunner,
     egress_proxy_url: str,
     page_action: PageAction,
+    operator_timeout_seconds: float = _BOOTSTRAP_TIMEOUT_SECONDS,
 ) -> None:
     """Run one real headful Scrapling session and archive it only on success."""
 
-    if not isinstance(store, BrowserProfileStore) or not isinstance(target, ResolvedTarget):
+    if type(store) is not BrowserProfileStore or not isinstance(target, ResolvedTarget):
         raise ProfileUnavailableError
     profile = validate_logical_key(profile_id)
-    if not callable(runner) or not callable(page_action):
+    if (
+        not callable(runner)
+        or not callable(page_action)
+        or isinstance(operator_timeout_seconds, bool)
+        or not isinstance(operator_timeout_seconds, (int, float))
+        or not math.isfinite(operator_timeout_seconds)
+        or operator_timeout_seconds <= 0
+        or operator_timeout_seconds > _BOOTSTRAP_TIMEOUT_SECONDS
+    ):
         raise ProfileUnavailableError
     try:
         proxy = EgressProxyPolicy.from_url(egress_proxy_url).url
+        snapshot = store._trusted_snapshot()
     except Exception:
         raise ProfileUnavailableError from None
 
-    lock = store._lock_for(profile)
+    vault, _uid, _root_fd, _root_identity, _workspace_root, _vault_identity = snapshot
+    lock = store._lock_for(profile, snapshot)
     with lock:
-        workspace: Path | None = None
+        workspace: _PinnedWorkspace | None = None
         active: BaseException | None = None
         action_completed = False
 
         def verified_page_action(page: object) -> object:
             nonlocal action_completed
-            result = page_action(page)
-            if inspect.isawaitable(result):
-                raise TypeError("bootstrap page action must be synchronous")
+            completed = threading.Event()
+            results: list[object] = []
+            errors: list[BaseException] = []
+
+            def invoke_action() -> None:
+                try:
+                    result = page_action(page)
+                    if inspect.isawaitable(result):
+                        raise TypeError("bootstrap page action must be synchronous")
+                    results.append(result)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    completed.set()
+
+            threading.Thread(target=invoke_action, daemon=True).start()
+            if not completed.wait(timeout=float(operator_timeout_seconds)):
+                raise ProfileUnavailableError
+            if errors:
+                raise errors[0]
             action_completed = True
-            return result
+            return results[0]
 
         try:
-            workspace = store._new_workspace()
+            workspace = store._new_workspace(snapshot)
             runner(
                 target.normalized_url,
                 headless=False,
-                user_data_dir=str(workspace),
+                user_data_dir=str(workspace.path),
                 timeout=900_000,
                 page_action=verified_page_action,
                 proxy=proxy,
@@ -287,8 +704,11 @@ def bootstrap_profile(
             )
             if not action_completed:
                 raise ProfileUnavailableError
-            archive = _encode_profile_archive(workspace, expected_uid=store._expected_uid)
-            store._vault.put(profile, archive)
+            archive = _encode_profile_archive_fd(
+                workspace.fd,
+                expected_uid=workspace.expected_uid,
+            )
+            vault.put(profile, archive)
         except BaseException as error:
             active = error
         cleanup_error: BaseException | None = None
@@ -304,11 +724,16 @@ def bootstrap_profile(
                 raise active
             if cleanup_error is not None and not isinstance(cleanup_error, Exception):
                 raise cleanup_error
-            raise ProfileUnavailableError from None
+            failure = ProfileUnavailableError()
+            if cleanup_error is not None:
+                failure.add_note("browser profile cleanup failed")
+            raise failure from None
         if cleanup_error is not None:
             if not isinstance(cleanup_error, Exception):
                 raise cleanup_error
-            raise ProfileUnavailableError from None
+            failure = ProfileUnavailableError()
+            failure.add_note("browser profile cleanup failed")
+            raise failure from None
 
 
 def _encode_profile_archive(root: Path, *, expected_uid: int | None = None) -> bytes:
@@ -322,21 +747,7 @@ def _encode_profile_archive(root: Path, *, expected_uid: int | None = None) -> b
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_DIRECTORY", 0),
         )
-        root_before = os.fstat(root_fd)
-        if (
-            not stat.S_ISDIR(root_before.st_mode)
-            or root_before.st_uid != uid
-            or stat.S_IMODE(root_before.st_mode) != 0o700
-        ):
-            raise ProfileUnavailableError
-        entries: list[tuple[str, str, bytes]] = []
-        seen_inodes: set[tuple[int, int]] = set()
-        _scan_directory(root_fd, PurePosixPath(), entries, seen_inodes, uid)
-        root_after = os.fstat(root_fd)
-        if not _same_directory_snapshot(root_before, root_after):
-            raise ProfileUnavailableError
-        entries.sort(key=lambda item: item[0].encode("utf-8"))
-        return _build_archive(entries)
+        return _encode_profile_archive_fd(root_fd, expected_uid=uid)
     except ProfileUnavailableError:
         raise
     except Exception:
@@ -344,6 +755,24 @@ def _encode_profile_archive(root: Path, *, expected_uid: int | None = None) -> b
     finally:
         if root_fd >= 0:
             os.close(root_fd)
+
+
+def _encode_profile_archive_fd(root_fd: int, *, expected_uid: int) -> bytes:
+    root_before = os.fstat(root_fd)
+    if (
+        not stat.S_ISDIR(root_before.st_mode)
+        or root_before.st_uid != expected_uid
+        or stat.S_IMODE(root_before.st_mode) != 0o700
+    ):
+        raise ProfileUnavailableError
+    entries: list[tuple[str, str, bytes]] = []
+    seen_inodes: set[tuple[int, int]] = set()
+    _scan_directory(root_fd, PurePosixPath(), entries, seen_inodes, expected_uid)
+    root_after = os.fstat(root_fd)
+    if not _same_directory_snapshot(root_before, root_after):
+        raise ProfileUnavailableError
+    entries.sort(key=lambda item: item[0].encode("utf-8"))
+    return _build_archive(entries)
 
 
 def _scan_directory(
@@ -434,9 +863,7 @@ def _scan_directory(
 def _build_archive(entries: list[tuple[str, str, bytes]]) -> bytes:
     if len(entries) > MAX_ENTRIES:
         raise ProfileUnavailableError
-    total = sum(len(content) for _, kind, content in entries if kind == "f")
-    if total > MAX_TOTAL_UNPACKED_BYTES:
-        raise ProfileUnavailableError
+    _validate_archive_entries(entries)
     manifest = [
         {"kind": kind, "path": path, "size": len(content)} for path, kind, content in entries
     ]
@@ -457,6 +884,39 @@ def _build_archive(entries: list[tuple[str, str, bytes]]) -> bytes:
     if len(archive) > MAX_ARCHIVE_BYTES:
         raise ProfileUnavailableError
     return archive
+
+
+def _validate_archive_entries(entries: list[tuple[str, str, bytes]]) -> None:
+    total = 0
+    seen: set[str] = set()
+    types: dict[str, str] = {}
+    previous: bytes | None = None
+    for entry in entries:
+        if not isinstance(entry, tuple) or len(entry) != 3:
+            raise ProfileUnavailableError
+        raw_path, kind, content = entry
+        path = _validate_archive_path(raw_path)
+        if kind not in {"d", "f"} or not isinstance(content, bytes):
+            raise ProfileUnavailableError
+        order_key = path.encode("utf-8")
+        collision = unicodedata.normalize("NFC", path).casefold()
+        if collision in seen or previous is not None and order_key <= previous:
+            raise ProfileUnavailableError
+        seen.add(collision)
+        previous = order_key
+        parent = PurePosixPath(path).parent
+        if parent != PurePosixPath(".") and types.get(parent.as_posix()) != "d":
+            raise ProfileUnavailableError
+        if kind == "d":
+            if content:
+                raise ProfileUnavailableError
+        else:
+            if len(content) > MAX_FILE_BYTES:
+                raise ProfileUnavailableError
+            total += len(content)
+            if total > MAX_TOTAL_UNPACKED_BYTES:
+                raise ProfileUnavailableError
+        types[path] = kind
 
 
 def _decode_profile_archive(archive: bytes) -> list[tuple[str, str, bytes]]:
@@ -525,30 +985,100 @@ def _decode_profile_archive(archive: bytes) -> list[tuple[str, str, bytes]]:
 
 
 def _extract_profile_archive(archive: bytes, workspace: Path) -> None:
-    entries = _decode_profile_archive(archive)
+    workspace_fd = -1
     try:
-        metadata = os.stat(workspace, follow_symlinks=False)
-        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700:
-            raise ProfileUnavailableError
-        for path, kind, content in entries:
-            destination = workspace.joinpath(*PurePosixPath(path).parts)
-            if kind == "d":
-                os.mkdir(destination, 0o700)
-                continue
-            fd = os.open(
-                destination,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            try:
-                _write_all(fd, content)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+        workspace_fd = os.open(
+            workspace,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        metadata = os.fstat(workspace_fd)
+        _extract_profile_archive_fd(archive, workspace_fd, metadata.st_uid)
     except ProfileUnavailableError:
         raise
     except Exception:
         raise ProfileUnavailableError from None
+    finally:
+        if workspace_fd >= 0:
+            os.close(workspace_fd)
+
+
+def _extract_profile_archive_fd(archive: bytes, workspace_fd: int, expected_uid: int) -> None:
+    entries = _decode_profile_archive(archive)
+    root = os.fstat(workspace_fd)
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != expected_uid
+        or stat.S_IMODE(root.st_mode) != 0o700
+    ):
+        raise ProfileUnavailableError
+    directories: dict[str, tuple[int, tuple[int, int], str, int]] = {
+        ".": (os.dup(workspace_fd), (root.st_dev, root.st_ino), "", -1)
+    }
+    try:
+        for path, kind, content in entries:
+            parsed = PurePosixPath(path)
+            parent_key = parsed.parent.as_posix()
+            parent_fd = directories[parent_key][0]
+            name = parsed.name
+            if kind == "d":
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_DIRECTORY", 0),
+                    dir_fd=parent_fd,
+                )
+                metadata = os.fstat(child_fd)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != expected_uid
+                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                ):
+                    os.close(child_fd)
+                    raise ProfileUnavailableError
+                directories[path] = (
+                    child_fd,
+                    (metadata.st_dev, metadata.st_ino),
+                    name,
+                    parent_fd,
+                )
+                continue
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                _write_all(fd, content)
+                os.fsync(fd)
+                metadata = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != expected_uid
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                ):
+                    raise ProfileUnavailableError
+            finally:
+                os.close(fd)
+        for key, (_directory_fd, identity, name, parent_fd) in directories.items():
+            if key == ".":
+                continue
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(named.st_mode) or (named.st_dev, named.st_ino) != identity:
+                raise ProfileUnavailableError
+    except BaseException:
+        with suppress(BaseException):
+            _clear_directory_fd(workspace_fd)
+        raise
+    finally:
+        for directory_fd, _identity, _name, _parent_fd in directories.values():
+            os.close(directory_fd)
 
 
 def _validate_archive_path(value: object) -> str:
@@ -622,8 +1152,94 @@ def _same_directory_snapshot(first: os.stat_result, second: os.stat_result) -> b
     )
 
 
-def _remove_workspace(path: Path) -> None:
-    shutil.rmtree(path)
+def _remove_workspace(workspace: _PinnedWorkspace) -> None:
+    cleanup_error: BaseException | None = None
+    try:
+        metadata = os.fstat(workspace.fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != workspace.expected_uid
+            or (metadata.st_dev, metadata.st_ino) != workspace.identity
+        ):
+            raise ProfileUnavailableError
+        _clear_directory_fd(workspace.fd)
+        matching_names = []
+        for name in os.listdir(workspace.root_fd):
+            candidate = os.stat(name, dir_fd=workspace.root_fd, follow_symlinks=False)
+            if (candidate.st_dev, candidate.st_ino) == workspace.identity:
+                matching_names.append(name)
+        if len(matching_names) != 1:
+            raise ProfileUnavailableError
+        os.rmdir(matching_names[0], dir_fd=workspace.root_fd)
+        _remove_workspace_decoy(workspace)
+        os.fsync(workspace.root_fd)
+    except BaseException as error:
+        cleanup_error = error
+    finally:
+        _unregister_profile_lease(workspace)
+        os.close(workspace.fd)
+        workspace.fd = -1
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise ProfileUnavailableError from None
+
+
+def _remove_workspace_decoy(workspace: _PinnedWorkspace) -> None:
+    try:
+        metadata = os.stat(workspace.name, dir_fd=workspace.root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (metadata.st_dev, metadata.st_ino) == workspace.identity:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        if metadata.st_uid != workspace.expected_uid or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ProfileUnavailableError
+        fd = os.open(
+            workspace.name,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+            dir_fd=workspace.root_fd,
+        )
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise ProfileUnavailableError
+            _clear_directory_fd(fd)
+        finally:
+            os.close(fd)
+        os.rmdir(workspace.name, dir_fd=workspace.root_fd)
+        return
+    os.unlink(workspace.name, dir_fd=workspace.root_fd)
+
+
+def _clear_directory_fd(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = os.open(
+                name,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    raise ProfileUnavailableError
+                _clear_directory_fd(child_fd)
+                named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ProfileUnavailableError
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+            continue
+        os.unlink(name, dir_fd=directory_fd)
 
 
 def _is_memory_backed(path: Path) -> bool:

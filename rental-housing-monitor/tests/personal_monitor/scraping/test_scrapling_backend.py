@@ -26,6 +26,7 @@ import personal_monitor.security.egress as egress_module
 from personal_monitor.adapters.official_api import BoundedPolicyHttpClient
 from personal_monitor.domain.spec import FetchStrategy
 from personal_monitor.engine.errors import ErrorClass, MonitorError
+from personal_monitor.scraping.profiles import BrowserProfileStore
 from personal_monitor.scraping.scrapling_backend import (
     MAX_DETECTOR_BYTES,
     MAX_RESPONSE_BYTES,
@@ -34,6 +35,7 @@ from personal_monitor.scraping.scrapling_backend import (
     normalize_response,
 )
 from personal_monitor.security.url_policy import ResolvedTarget
+from personal_monitor.security.vault import CredentialVault
 
 
 class FakeHeaders(dict[str, str]):
@@ -1147,6 +1149,70 @@ def test_outer_cancellation_is_not_swallowed() -> None:
             release.set()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("exit_kind", ["timeout", "cancellation"])
+def test_profile_lease_waits_for_late_browser_worker_before_archive_and_cleanup(
+    tmp_path: Path, exit_kind: str
+) -> None:
+    source = tmp_path / "source-profile"
+    source.mkdir(mode=0o700)
+    (source / "Cookies").write_bytes(b"initial-cookie")
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    profiles = BrowserProfileStore(vault, materialization_root=tmp_path / "workspaces")
+    profiles.archive("profile", source)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def fetcher(_url: str, **kwargs: object) -> FakeResponse:
+        started.set()
+        release.wait(timeout=2)
+        workspace = Path(str(kwargs["user_data_dir"]))
+        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (workspace / "Cookies").write_bytes(b"late-private-cookie")
+        finished.set()
+        return FakeResponse()
+
+    backend = make_test_backend(
+        dynamic_fetcher=fetcher,
+        browser_gate=threading.BoundedSemaphore(1),
+        browser_timeout_seconds=0.03,
+    )
+
+    async def scenario() -> None:
+        workspace: Path | None = None
+        try:
+            async with profiles.materialize("profile") as active_workspace:
+                workspace = active_workspace
+                if exit_kind == "timeout":
+                    with pytest.raises(MonitorError, match="timed out"):
+                        await backend.fetch_dynamic(target(), profile=active_workspace)
+                else:
+                    task = asyncio.create_task(
+                        backend.fetch_dynamic(target(), profile=active_workspace)
+                    )
+                    assert await asyncio.to_thread(started.wait, 1)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+        finally:
+            assert workspace is not None
+        assert workspace.exists()
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 1)
+        for _ in range(100):
+            if not workspace.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert not workspace.exists()
+        async with profiles.materialize("profile") as restored:
+            assert (restored / "Cookies").read_bytes() == b"late-private-cookie"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize(

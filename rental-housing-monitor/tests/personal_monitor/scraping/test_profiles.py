@@ -6,7 +6,9 @@ import os
 import shutil
 import stat
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -139,6 +141,70 @@ def test_archive_directory_swap_cannot_redirect_scan_through_a_symlink(
         vault.get("profile")
 
 
+def test_materialize_pins_original_workspace_across_rename_and_decoy_replacement(
+    tmp_path: Path,
+) -> None:
+    store, _ = profile_store(tmp_path)
+    seed_profile(store, tmp_path, value=b"original-private-cookie")
+    moved: Path | None = None
+    decoy: Path | None = None
+
+    with store.materialize("profile-7") as workspace:
+        moved = workspace.with_name(f"{workspace.name}-moved")
+        decoy = workspace
+        workspace.rename(moved)
+        decoy.mkdir(mode=0o700)
+        (decoy / "Default").mkdir(mode=0o700)
+        (decoy / "Default" / "Cookies").write_bytes(b"decoy-private-cookie")
+        (moved / "Default" / "Cookies").write_bytes(b"updated-private-cookie")
+
+    assert moved is not None and not moved.exists()
+    assert decoy is not None and not decoy.exists()
+    with store.materialize("profile-7") as restored:
+        assert (restored / "Default" / "Cookies").read_bytes() == b"updated-private-cookie"
+
+
+def test_extract_intermediate_symlink_swap_never_writes_outside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from personal_monitor.scraping.profiles import (
+        ProfileUnavailableError,
+        _extract_profile_archive,
+    )
+
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    archive = raw_archive(
+        [
+            {"kind": "d", "path": "Default", "size": 0},
+            {"kind": "f", "path": "Default/Cookies", "size": 19},
+        ],
+        b"late-private-cookie",
+    )
+    import personal_monitor.scraping.profiles as profiles_module
+
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(path).name == "Cookies":
+            swapped = True
+            shutil.rmtree(workspace / "Default")
+            (workspace / "Default").symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(profiles_module.os, "open", swapping_open)
+
+    with pytest.raises(ProfileUnavailableError):
+        _extract_profile_archive(archive, workspace)
+
+    assert swapped
+    assert not (outside / "Cookies").exists()
+
+
 def raw_archive(manifest: list[dict[str, object]], payload: bytes = b"") -> bytes:
     encoded = json.dumps(
         manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -212,6 +278,22 @@ def test_decoder_rejects_noncanonical_and_bounded_archive_bombs(tmp_path: Path) 
         with pytest.raises(ProfileUnavailableError):
             _extract_profile_archive(archive, workspace)
         assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [("Case", "f", b"one"), ("case", "f", b"two")],
+        [("parent", "f", b"one"), ("parent/child", "f", b"two")],
+    ],
+)
+def test_encoder_rejects_archives_its_decoder_would_reject(
+    entries: list[tuple[str, str, bytes]],
+) -> None:
+    from personal_monitor.scraping.profiles import ProfileUnavailableError, _build_archive
+
+    with pytest.raises(ProfileUnavailableError):
+        _build_archive(entries)
 
 
 @pytest.mark.parametrize(
@@ -369,7 +451,7 @@ def test_persistence_system_exception_wins_over_ordinary_cleanup_failure(
     with pytest.raises(KeyboardInterrupt) as caught, store.materialize("profile-7"):
         monkeypatch.setattr(
             profiles_module,
-            "_encode_profile_archive",
+            "_encode_profile_archive_fd",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt("persist")),
         )
         monkeypatch.setattr(
@@ -406,6 +488,44 @@ def test_enter_cleanup_system_exception_does_not_leak_the_profile_lock(
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         assert executor.submit(lock_is_available_to_another_thread).result()
+
+
+def test_async_same_profile_sessions_serialize_by_task_without_blocking_loop(
+    tmp_path: Path,
+) -> None:
+    store, _ = profile_store(tmp_path)
+    seed_profile(store, tmp_path, value=b"initial")
+
+    async def scenario() -> None:
+        async with asyncio.timeout(1):
+            first_entered = asyncio.Event()
+            release_first = asyncio.Event()
+            second_entered = asyncio.Event()
+
+            async def first() -> None:
+                async with store.materialize("profile-7") as workspace:
+                    first_entered.set()
+                    await release_first.wait()
+                    (workspace / "Default" / "Cookies").write_bytes(b"first")
+
+            async def second() -> None:
+                await first_entered.wait()
+                async with store.materialize("profile-7") as workspace:
+                    second_entered.set()
+                    assert (workspace / "Default" / "Cookies").read_bytes() == b"first"
+                    (workspace / "Default" / "Cookies").write_bytes(b"second")
+
+            one = asyncio.create_task(first())
+            two = asyncio.create_task(second())
+            await first_entered.wait()
+            await asyncio.sleep(0.02)
+            assert not second_entered.is_set()
+            release_first.set()
+            await asyncio.gather(one, two)
+
+    asyncio.run(scenario())
+    with store.materialize("profile-7") as workspace:
+        assert (workspace / "Default" / "Cookies").read_bytes() == b"second"
 
 
 def test_bootstrap_runner_is_offline_injectable_headful_bounded_and_archived(
@@ -478,6 +598,75 @@ def test_bootstrap_fails_closed_if_scrapling_never_completes_page_action(tmp_pat
     assert list((tmp_path / "workspaces").iterdir()) == []
 
 
+def test_bootstrap_bounds_a_blocked_operator_action_and_cleans_workspace(tmp_path: Path) -> None:
+    store, _ = profile_store(tmp_path)
+    _, ProfileUnavailableError, bootstrap_profile = profile_types()
+    target = ResolvedTarget(
+        normalized_url="https://example.com/login",
+        hostname="example.com",
+        port=443,
+        addresses=frozenset({"93.184.216.34"}),
+    )
+    block_forever = threading.Event()
+
+    def runner(_url: str, **kwargs: object) -> object:
+        callback = kwargs["page_action"]
+        assert callable(callback)
+        with suppress(Exception):
+            callback(object())
+        return object()
+
+    started = time.monotonic()
+    with pytest.raises(ProfileUnavailableError):
+        bootstrap_profile(
+            store,
+            "profile-7",
+            target,
+            runner=runner,
+            egress_proxy_url="http://proxy.internal:8080",
+            page_action=lambda _page: block_forever.wait(),
+            operator_timeout_seconds=0.02,
+        )
+
+    assert time.monotonic() - started < 1
+    assert list((tmp_path / "workspaces").iterdir()) == []
+
+
+def test_bootstrap_reports_cleanup_failure_alongside_ordinary_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _ = profile_store(tmp_path)
+    _, ProfileUnavailableError, bootstrap_profile = profile_types()
+    import personal_monitor.scraping.profiles as profiles_module
+
+    target = ResolvedTarget(
+        normalized_url="https://example.com/login",
+        hostname="example.com",
+        port=443,
+        addresses=frozenset({"93.184.216.34"}),
+    )
+    monkeypatch.setattr(
+        profiles_module,
+        "_remove_workspace",
+        lambda _workspace: (_ for _ in ()).throw(RuntimeError("private cleanup detail")),
+    )
+
+    with pytest.raises(ProfileUnavailableError) as caught:
+        bootstrap_profile(
+            store,
+            "profile-7",
+            target,
+            runner=lambda _url, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("private runner detail")
+            ),
+            egress_proxy_url="http://proxy.internal:8080",
+            page_action=lambda _page: None,
+        )
+
+    assert getattr(caught.value, "__notes__", []) == ["browser profile cleanup failed"]
+    assert "private" not in repr(caught.value)
+
+
 def test_bootstrap_failure_never_archives_or_leaves_plaintext(tmp_path: Path) -> None:
     store, _ = profile_store(tmp_path)
     _, ProfileUnavailableError, bootstrap_profile = profile_types()
@@ -506,3 +695,95 @@ def test_bootstrap_failure_never_archives_or_leaves_plaintext(tmp_path: Path) ->
     assert list((tmp_path / "workspaces").iterdir()) == []
     with pytest.raises(ProfileUnavailableError), store.materialize("profile-7"):
         pass
+
+
+def test_profile_store_rejects_vault_subclasses(tmp_path: Path) -> None:
+    BrowserProfileStore, _, _ = profile_types()
+
+    class VaultSubclass(CredentialVault):
+        pass
+
+    vault = VaultSubclass(tmp_path / "vault", key=b"k" * 32)
+    with pytest.raises(TypeError):
+        BrowserProfileStore(vault, materialization_root=tmp_path / "workspaces")
+
+
+def test_profile_store_rejects_low_level_vault_swap_before_archive_dispatch(
+    tmp_path: Path,
+) -> None:
+    store, _ = profile_store(tmp_path)
+    _, ProfileUnavailableError, _ = profile_types()
+    source = tmp_path / "source"
+    source.mkdir(mode=0o700)
+    (source / "Cookies").write_bytes(b"private-cookie")
+    captured: list[bytes] = []
+
+    class CapturingVault:
+        _lock_identity = ((0, 0), "attacker")
+
+        def put(self, _key: str, value: bytes) -> None:
+            captured.append(value)
+
+    object.__setattr__(store, "_vault", CapturingVault())
+
+    with pytest.raises(ProfileUnavailableError):
+        store.archive("profile-7", source)
+
+    assert captured == []
+
+
+def test_materialization_uses_one_pinned_vault_snapshot_across_callbacks(tmp_path: Path) -> None:
+    store, vault = profile_store(tmp_path)
+    seed_profile(store, tmp_path, value=b"initial")
+    captured: list[bytes] = []
+
+    class CapturingVault:
+        def put(self, _key: str, value: bytes) -> None:
+            captured.append(value)
+
+    with store.materialize("profile-7") as workspace:
+        object.__setattr__(store, "_vault", CapturingVault())
+        (workspace / "Default" / "Cookies").write_bytes(b"changed")
+
+    assert captured == []
+    object.__setattr__(store, "_vault", vault)
+    with store.materialize("profile-7") as workspace:
+        assert (workspace / "Default" / "Cookies").read_bytes() == b"changed"
+
+
+def test_bootstrap_rejects_profile_store_subclasses_before_runner_dispatch(
+    tmp_path: Path,
+) -> None:
+    BrowserProfileStore, ProfileUnavailableError, bootstrap_profile = profile_types()
+
+    class StoreSubclass(BrowserProfileStore):
+        pass
+
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    store = StoreSubclass(vault, materialization_root=tmp_path / "workspaces")
+    target = ResolvedTarget(
+        normalized_url="https://example.com/login",
+        hostname="example.com",
+        port=443,
+        addresses=frozenset({"93.184.216.34"}),
+    )
+    calls: list[object] = []
+
+    with pytest.raises(ProfileUnavailableError):
+        bootstrap_profile(
+            store,
+            "profile-7",
+            target,
+            runner=lambda *_args, **_kwargs: calls.append(object()),
+            egress_proxy_url="http://proxy.internal:8080",
+            page_action=lambda _page: None,
+        )
+
+    assert calls == []
+
+
+def test_profile_store_is_sealed_after_construction(tmp_path: Path) -> None:
+    store, vault = profile_store(tmp_path)
+
+    with pytest.raises(AttributeError):
+        store._vault = vault  # type: ignore[misc]

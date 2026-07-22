@@ -5,6 +5,8 @@ import re
 import secrets
 import stat
 import threading
+import weakref
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 
@@ -22,6 +24,33 @@ _OPEN_DIRECTORY_FLAGS = _OPEN_FILE_FLAGS | getattr(os, "O_DIRECTORY", 0)
 
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[tuple[int, int], threading.RLock] = {}
+
+
+def _private_vault_pins():
+    pins: weakref.WeakKeyDictionary[object, tuple[object, ...]] = weakref.WeakKeyDictionary()
+    lock = threading.RLock()
+
+    def pin(owner: object, values: tuple[object, ...]) -> None:
+        with lock:
+            if owner in pins:
+                raise VaultError
+            pins[owner] = values
+
+    def acquire(owner: object) -> tuple[object, ...]:
+        with lock:
+            values = pins.get(owner)
+        if values is None:
+            raise VaultError
+        return values
+
+    def release(owner: object) -> tuple[object, ...] | None:
+        with lock:
+            return pins.pop(owner, None)
+
+    return pin, acquire, release
+
+
+_pin_vault, _acquire_vault, _release_vault = _private_vault_pins()
 
 
 class VaultError(RuntimeError):
@@ -69,7 +98,17 @@ def load_master_key(path: Path, *, expected_uid: int | None = None) -> bytes:
 class CredentialVault:
     """A descriptor-pinned directory of authenticated, atomically replaced records."""
 
-    __slots__ = ("_cipher", "_dir_fd", "_expected_uid", "_identity", "_lock", "_root")
+    __slots__ = (
+        "_cipher",
+        "_composition",
+        "_dir_fd",
+        "_expected_uid",
+        "_identity",
+        "_lock",
+        "_root",
+        "_sealed",
+        "__weakref__",
+    )
 
     def __init__(
         self,
@@ -102,6 +141,15 @@ class CredentialVault:
             self._identity = identity
             with _LOCKS_GUARD:
                 self._lock = _LOCKS.setdefault(identity, threading.RLock())
+            self._composition = (
+                self._cipher,
+                self._dir_fd,
+                self._expected_uid,
+                self._identity,
+                self._lock,
+            )
+            self._sealed = True
+            _pin_vault(self, self._composition)
         except VaultError:
             self.close()
             raise
@@ -112,15 +160,22 @@ class CredentialVault:
     def __repr__(self) -> str:
         return "<CredentialVault>"
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("credential vault is sealed")
+        object.__setattr__(self, name, value)
+
     @property
     def _lock_identity(self) -> tuple[int, int]:
-        return self._identity
+        _cipher, _dir_fd, _uid, identity, _lock = self._trusted_snapshot()
+        return identity
 
     def close(self) -> None:
-        fd = getattr(self, "_dir_fd", -1)
+        pinned = _release_vault(self)
+        fd = pinned[1] if pinned is not None else getattr(self, "_dir_fd", -1)
         if fd >= 0:
-            os.close(fd)
-            self._dir_fd = -1
+            os.close(fd)  # type: ignore[arg-type]
+        object.__setattr__(self, "_dir_fd", -1)
 
     def __del__(self) -> None:
         with suppress(Exception):
@@ -129,22 +184,27 @@ class CredentialVault:
     def put(self, logical_key: str, value: bytes | bytearray | memoryview) -> None:
         key = validate_logical_key(logical_key)
         try:
-            blob = self._cipher.encrypt(value, key.encode("ascii"))
+            cipher, directory_fd, uid, _identity, lock = self._trusted_snapshot()
+            blob = cipher.encrypt(value, key.encode("ascii"))
             record = _MAGIC + blob.nonce + blob.ciphertext
             if len(record) > MAX_VAULT_RECORD_BYTES:
                 raise VaultError
-            with self._lock:
-                self._write_record(_record_name(key), record)
+            with lock:
+                self._write_record(_record_name(key), record, directory_fd, uid)
         except VaultError:
             raise
-        except Exception:
-            raise VaultError from None
+        except Exception as error:
+            failure = VaultError()
+            if "credential vault cleanup required" in getattr(error, "__notes__", ()):
+                failure.add_note("credential vault cleanup required")
+            raise failure from None
 
     def get(self, logical_key: str) -> bytes:
         key = validate_logical_key(logical_key)
         try:
-            with self._lock:
-                record = self._read_record(_record_name(key))
+            cipher, directory_fd, uid, _identity, lock = self._trusted_snapshot()
+            with lock:
+                record = self._read_record(_record_name(key), directory_fd, uid)
             if len(record) < len(_MAGIC) + _NONCE_BYTES + _TAG_BYTES or not record.startswith(
                 _MAGIC
             ):
@@ -153,7 +213,7 @@ class CredentialVault:
                 nonce=record[len(_MAGIC) : len(_MAGIC) + _NONCE_BYTES],
                 ciphertext=record[len(_MAGIC) + _NONCE_BYTES :],
             )
-            return self._cipher.decrypt(blob, key.encode("ascii"))
+            return cipher.decrypt(blob, key.encode("ascii"))
         except VaultError:
             raise
         except Exception:
@@ -163,22 +223,23 @@ class CredentialVault:
         key = validate_logical_key(logical_key)
         name = _record_name(key)
         try:
-            with self._lock:
-                metadata = os.stat(name, dir_fd=self._dir_fd, follow_symlinks=False)
-                self._validate_record_metadata(metadata)
-                os.unlink(name, dir_fd=self._dir_fd)
-                os.fsync(self._dir_fd)
+            _cipher, directory_fd, uid, _identity, lock = self._trusted_snapshot()
+            with lock:
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                self._validate_record_metadata(metadata, uid)
+                os.unlink(name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
         except VaultError:
             raise
         except Exception:
             raise VaultError from None
 
-    def _read_record(self, name: str) -> bytes:
+    def _read_record(self, name: str, directory_fd: int, expected_uid: int) -> bytes:
         fd = -1
         try:
-            fd = os.open(name, _OPEN_FILE_FLAGS, dir_fd=self._dir_fd)
+            fd = os.open(name, _OPEN_FILE_FLAGS, dir_fd=directory_fd)
             before = os.fstat(fd)
-            self._validate_record_metadata(before)
+            self._validate_record_metadata(before, expected_uid)
             if before.st_size > MAX_VAULT_RECORD_BYTES:
                 raise VaultError
             value = _read_exact(fd, MAX_VAULT_RECORD_BYTES + 1)
@@ -190,83 +251,146 @@ class CredentialVault:
             if fd >= 0:
                 os.close(fd)
 
-    def _write_record(self, name: str, record: bytes) -> None:
+    def _write_record(
+        self,
+        name: str,
+        record: bytes,
+        directory_fd: int,
+        expected_uid: int,
+    ) -> None:
         token = secrets.token_hex(16)
         temporary = f".{token}.tmp"
         backup = f".{token}.bak"
         fd = -1
         backup_created = False
         replaced = False
+        committed = False
+        active: BaseException | None = None
+        cleanup_error: BaseException | None = None
         try:
             fd = os.open(
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
-                dir_fd=self._dir_fd,
+                dir_fd=directory_fd,
             )
             _write_all(fd, record)
             os.fsync(fd)
             written = os.fstat(fd)
-            self._validate_record_metadata(written)
+            self._validate_record_metadata(written, expected_uid)
             os.close(fd)
             fd = -1
 
             try:
-                current = os.stat(name, dir_fd=self._dir_fd, follow_symlinks=False)
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
                 current = None
             if current is not None:
-                self._validate_record_metadata(current)
+                self._validate_record_metadata(current, expected_uid)
                 os.link(
                     name,
                     backup,
-                    src_dir_fd=self._dir_fd,
-                    dst_dir_fd=self._dir_fd,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
                 backup_created = True
 
-            os.replace(temporary, name, src_dir_fd=self._dir_fd, dst_dir_fd=self._dir_fd)
+            os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
             replaced = True
-            os.fsync(self._dir_fd)
+            os.fsync(directory_fd)
+            committed = True
             if backup_created:
-                os.unlink(backup, dir_fd=self._dir_fd)
+                os.unlink(backup, dir_fd=directory_fd)
                 backup_created = False
-                os.fsync(self._dir_fd)
-        except BaseException:
+                os.fsync(directory_fd)
+        except BaseException as error:
+            active = error
             if fd >= 0:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except BaseException as cleanup:
+                    cleanup_error = cleanup
                 fd = -1
-            if replaced:
+            if replaced and not committed:
                 try:
                     if backup_created:
                         os.replace(
                             backup,
                             name,
-                            src_dir_fd=self._dir_fd,
-                            dst_dir_fd=self._dir_fd,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
                         )
                         backup_created = False
                     else:
-                        os.unlink(name, dir_fd=self._dir_fd)
-                    os.fsync(self._dir_fd)
-                except Exception:
-                    pass
-            raise
+                        os.unlink(name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                except BaseException as cleanup:
+                    cleanup_error = cleanup
         finally:
             if fd >= 0:
-                os.close(fd)
-            _unlink_if_present(self._dir_fd, temporary)
-            if backup_created:
-                _unlink_if_present(self._dir_fd, backup)
+                try:
+                    os.close(fd)
+                except BaseException as cleanup:
+                    cleanup_error = cleanup_error or cleanup
+            temporary_error = _unlink_error(directory_fd, temporary)
+            cleanup_error = cleanup_error or temporary_error
+            if backup_created and not (replaced and not committed and cleanup_error is not None):
+                backup_error = _unlink_error(directory_fd, backup)
+                cleanup_error = cleanup_error or backup_error
 
-    def _validate_record_metadata(self, metadata: os.stat_result) -> None:
+        if active is not None:
+            if cleanup_error is not None:
+                if isinstance(active, Exception) and not isinstance(cleanup_error, Exception):
+                    raise cleanup_error from active
+                active.add_note("credential vault cleanup required")
+            raise active
+        if cleanup_error is not None:
+            if not isinstance(cleanup_error, Exception):
+                raise cleanup_error
+            failure = VaultError()
+            failure.add_note("credential vault cleanup required")
+            raise failure
+
+    @staticmethod
+    def _validate_record_metadata(metadata: os.stat_result, expected_uid: int) -> None:
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != self._expected_uid
+            or metadata.st_uid != expected_uid
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
             raise VaultError
+
+    def _trusted_snapshot(
+        self,
+        _acquire: Callable[[object], tuple[object, ...]] = _acquire_vault,
+    ) -> tuple[AesGcmCipher, int, int, tuple[int, int], threading.RLock]:
+        try:
+            pinned = _acquire(self)
+            cipher, directory_fd, uid, identity, lock = pinned
+            metadata = os.fstat(directory_fd)
+            valid = (
+                type(self) is CredentialVault
+                and type(cipher) is AesGcmCipher
+                and type(directory_fd) is int
+                and type(uid) is int
+                and isinstance(identity, tuple)
+                and self._cipher is cipher
+                and self._dir_fd == directory_fd
+                and self._expected_uid == uid
+                and self._identity == identity
+                and self._lock is lock
+                and self._composition is pinned
+                and stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == uid
+                and stat.S_IMODE(metadata.st_mode) == 0o700
+                and (metadata.st_dev, metadata.st_ino) == identity
+            )
+        except Exception:
+            valid = False
+        if not valid:
+            raise VaultError
+        return cipher, directory_fd, uid, identity, lock  # type: ignore[return-value]
 
 
 def _record_name(logical_key: str) -> str:
@@ -314,10 +438,11 @@ def _same_file_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
     )
 
 
-def _unlink_if_present(directory_fd: int, name: str) -> None:
+def _unlink_error(directory_fd: int, name: str) -> BaseException | None:
     try:
         os.unlink(name, dir_fd=directory_fd)
     except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+        return None
+    except BaseException as error:
+        return error
+    return None

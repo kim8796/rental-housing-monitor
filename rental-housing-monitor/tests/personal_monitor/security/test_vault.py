@@ -191,6 +191,144 @@ def test_failed_atomic_put_preserves_old_record_and_cleans_temporary_files(
     assert sorted(path.name for path in (tmp_path / "vault").iterdir()) == ["profile.bin"]
 
 
+def test_put_keeps_committed_new_record_when_final_directory_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    CredentialVault, VaultError, _ = vault_types()
+    import personal_monitor.security.vault as vault_module
+
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    vault.put("profile", b"old-secret")
+    real_fsync = os.fsync
+    calls = 0
+
+    def fail_final_directory_fsync(fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("attacker-controlled final fsync detail")
+        real_fsync(fd)
+
+    monkeypatch.setattr(vault_module.os, "fsync", fail_final_directory_fsync)
+    with pytest.raises(VaultError) as caught:
+        vault.put("profile", b"new-secret")
+
+    monkeypatch.setattr(vault_module.os, "fsync", real_fsync)
+    assert vault.get("profile") == b"new-secret"
+    assert "attacker" not in str(caught.value)
+    assert sorted(path.name for path in (tmp_path / "vault").iterdir()) == ["profile.bin"]
+
+
+def test_put_keeps_committed_new_record_when_backup_unlink_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    CredentialVault, VaultError, _ = vault_types()
+    import personal_monitor.security.vault as vault_module
+
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    vault.put("profile", b"old-secret")
+    real_unlink = os.unlink
+
+    def fail_backup_unlink(path, *args, **kwargs):
+        if str(path).endswith(".bak"):
+            raise OSError("attacker-controlled unlink detail")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(vault_module.os, "unlink", fail_backup_unlink)
+    with pytest.raises(VaultError) as caught:
+        vault.put("profile", b"new-secret")
+
+    monkeypatch.setattr(vault_module.os, "unlink", real_unlink)
+    assert vault.get("profile") == b"new-secret"
+    assert "attacker" not in str(caught.value)
+    assert any(path.name.endswith(".bak") for path in (tmp_path / "vault").iterdir())
+
+
+def test_put_reports_failed_temporary_cleanup_without_losing_old_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    CredentialVault, VaultError, _ = vault_types()
+    import personal_monitor.security.vault as vault_module
+
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    vault.put("profile", b"old-secret")
+    real_unlink = os.unlink
+    real_replace = os.replace
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("attacker-controlled replace detail")
+
+    def fail_temporary_unlink(path, *args, **kwargs):
+        if str(path).endswith(".tmp"):
+            raise OSError("attacker-controlled unlink detail")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(vault_module.os, "replace", fail_replace)
+    monkeypatch.setattr(vault_module.os, "unlink", fail_temporary_unlink)
+    with pytest.raises(VaultError) as caught:
+        vault.put("profile", b"new-secret")
+
+    monkeypatch.setattr(vault_module.os, "unlink", real_unlink)
+    monkeypatch.setattr(vault_module.os, "replace", real_replace)
+    assert vault.get("profile") == b"old-secret"
+    assert getattr(caught.value, "__notes__", []) == ["credential vault cleanup required"]
+    assert any(path.name.endswith(".tmp") for path in (tmp_path / "vault").iterdir())
+
+
+def test_temporary_record_fsync_failure_preserves_old_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    CredentialVault, VaultError, _ = vault_types()
+    import personal_monitor.security.vault as vault_module
+
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    vault.put("profile", b"old-secret")
+    real_fsync = os.fsync
+    calls = 0
+
+    def fail_temporary_fsync(fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("attacker-controlled temporary fsync detail")
+        real_fsync(fd)
+
+    monkeypatch.setattr(vault_module.os, "fsync", fail_temporary_fsync)
+    with pytest.raises(VaultError):
+        vault.put("profile", b"new-secret")
+
+    monkeypatch.setattr(vault_module.os, "fsync", real_fsync)
+    assert vault.get("profile") == b"old-secret"
+    assert sorted(path.name for path in (tmp_path / "vault").iterdir()) == ["profile.bin"]
+
+
+def test_first_put_parent_fsync_failure_removes_uncommitted_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    CredentialVault, VaultError, _ = vault_types()
+    import personal_monitor.security.vault as vault_module
+
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    real_fsync = os.fsync
+    calls = 0
+
+    def fail_commit_fsync(fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("attacker-controlled commit fsync detail")
+        real_fsync(fd)
+
+    monkeypatch.setattr(vault_module.os, "fsync", fail_commit_fsync)
+    with pytest.raises(VaultError):
+        vault.put("profile", b"new-secret")
+
+    monkeypatch.setattr(vault_module.os, "fsync", real_fsync)
+    with pytest.raises(VaultError):
+        vault.get("profile")
+    assert list((tmp_path / "vault").iterdir()) == []
+
+
 def test_concurrent_get_and_put_observe_only_complete_authenticated_values(tmp_path: Path) -> None:
     CredentialVault, _, _ = vault_types()
     vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
@@ -276,3 +414,31 @@ def test_vault_rejects_untrusted_root_objects(tmp_path: Path) -> None:
         CredentialVault(symlink, key=b"k" * 32)
     with pytest.raises(VaultError):
         CredentialVault(open_root, key=b"k" * 32)
+
+
+def test_vault_rejects_low_level_cipher_replacement_before_plaintext_dispatch(
+    tmp_path: Path,
+) -> None:
+    CredentialVault, VaultError, _ = vault_types()
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+    captured: list[object] = []
+
+    class CapturingCipher:
+        def encrypt(self, value: object, _aad: object) -> object:
+            captured.append(value)
+            raise AssertionError("replacement cipher received plaintext")
+
+    object.__setattr__(vault, "_cipher", CapturingCipher())
+
+    with pytest.raises(VaultError):
+        vault.put("profile", b"private-plaintext")
+
+    assert captured == []
+
+
+def test_vault_is_sealed_after_construction(tmp_path: Path) -> None:
+    CredentialVault, _, _ = vault_types()
+    vault = CredentialVault(tmp_path / "vault", key=b"k" * 32)
+
+    with pytest.raises(AttributeError):
+        vault._expected_uid = os.geteuid()  # type: ignore[misc]
