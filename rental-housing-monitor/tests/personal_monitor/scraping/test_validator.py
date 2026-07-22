@@ -114,6 +114,9 @@ def test_validator_rejects_missing_required_and_every_undeclared_field() -> None
         ("url", "https://sub.example.com/item"),
         ("url", "https://user@example.com/item"),
         ("url", "https://example.com/item#fragment"),
+        ("url", "https://example.com:/item"),
+        ("url", "https://example.com/item%ZZ"),
+        ("url", "https://example.com/a b"),
     ],
 )
 def test_validator_independently_enforces_scalar_type_finite_temporal_and_url_constraints(

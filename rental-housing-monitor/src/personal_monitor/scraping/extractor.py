@@ -19,6 +19,8 @@ _JSON_INDEX = re.compile(r"0|[1-9][0-9]*")
 _HIDDEN_STYLE = re.compile(
     r"(?:^|;)(?:display:none|visibility:(?:hidden|collapse))(?:!important)?(?:;|$)"
 )
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_MAX_INLINE_STYLE_LENGTH = 4096
 _MAX_JSON_DEPTH = 100
 _MAX_JSON_NODES = 100_000
 
@@ -126,19 +128,32 @@ def _select(node: Selector, selector: str, *, scoped: bool) -> Sequence[Selector
 
 
 def _scope_xpath(selector: str) -> str:
-    if selector.startswith("//"):
-        return f".{selector}"
-    if selector.startswith("/"):
-        return f".{selector}"
-    if selector.startswith("(//"):
-        return f"(.{selector[1:]}"
-    return selector
+    result: list[str] = []
+    quote: str | None = None
+    previous_significant: str | None = None
+    for character in selector:
+        if quote is not None:
+            result.append(character)
+            if character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            result.append(character)
+            previous_significant = character
+            continue
+        if character == "/" and previous_significant in {None, "(", "|", "[", ",", "="}:
+            result.append(".")
+        result.append(character)
+        if not character.isspace():
+            previous_significant = character
+    return "".join(result)
 
 
 def _visible_text(match: Selector) -> str:
     try:
         soup = BeautifulSoup(str(match.html_content), "html.parser")
-        for tag in list(soup.find_all(True)):
+        for tag in reversed(soup.find_all(True)):
             if _is_hidden(tag):
                 tag.decompose()
         return soup.get_text(separator=" ", strip=True)
@@ -155,7 +170,10 @@ def _is_hidden(tag: Tag) -> bool:
     style = tag.attrs.get("style")
     if not isinstance(style, str):
         return False
-    compact = re.sub(r"\s+", "", style).casefold()
+    if len(style) > _MAX_INLINE_STYLE_LENGTH:
+        return True
+    without_comments = _CSS_COMMENT.sub("", style)
+    compact = re.sub(r"\s+", "", without_comments).casefold()
     return _HIDDEN_STYLE.search(compact) is not None
 
 

@@ -106,7 +106,7 @@ def test_multiple_item_roots_are_supported_but_a_field_must_be_unambiguous() -> 
     assert caught.value.error_class is ErrorClass.STRUCTURE
 
 
-@pytest.mark.parametrize("selector", ["//h1", ".//h1", "(//h1)[1]"])
+@pytest.mark.parametrize("selector", ["//h1", ".//h1", "(//h1)[1]", "(/h1)[1]"])
 def test_field_xpath_is_scoped_to_each_item_root(selector: str) -> None:
     rows = DeclarativeExtractor().extract(
         document(b"<main><h1>A</h1></main><main><h1>B</h1></main>"),
@@ -127,7 +127,7 @@ def test_compound_field_xpath_cannot_escape_to_sibling_items() -> None:
         extract_spec(
             {
                 "item_scope": "main",
-                "fields": {"title": {"selector": "(//h1 | //h2)[1]", "type": "text"}},
+                "fields": {"title": {"selector": "(/h1 | //h2)[1]", "type": "text"}},
             }
         ),
     )
@@ -155,6 +155,51 @@ def test_visible_text_excludes_explicitly_hidden_descendants() -> None:
     )
 
     assert rows[0].fields["title"] == "Shown Text"
+
+
+@pytest.mark.parametrize(
+    "hidden_fragment",
+    [
+        '<span hidden>hidden<i aria-hidden="true"><template>template</template></i></span>',
+        '<span aria-hidden="true">aria<template><b hidden>nested</b></template></span>',
+        "<template>template<span hidden>nested</span></template>",
+        '<span style="display:/**/none">comment-hidden<i hidden>nested</i></span>',
+        '<span style="visibility:/**/hidden">comment-hidden<template>nested</template></span>',
+    ],
+)
+def test_nested_hidden_descendants_are_removed_without_destroyed_tag_errors(
+    hidden_fragment: str,
+) -> None:
+    body = f"<main><h1>A {hidden_fragment}<strong>B</strong></h1></main>".encode()
+
+    rows = DeclarativeExtractor().extract(
+        document(body),
+        extract_spec(
+            {
+                "item_scope": "main",
+                "fields": {"title": {"selector": "h1", "type": "text"}},
+            }
+        ),
+    )
+
+    assert rows[0].fields["title"] == "A B"
+
+
+def test_overlong_inline_style_is_bounded_and_fails_closed() -> None:
+    style = "color:red;" * 500
+    body = f'<main><h1>A <span style="{style}">hidden</span><strong>B</strong></h1></main>'.encode()
+
+    rows = DeclarativeExtractor().extract(
+        document(body),
+        extract_spec(
+            {
+                "item_scope": "main",
+                "fields": {"title": {"selector": "h1", "type": "text"}},
+            }
+        ),
+    )
+
+    assert rows[0].fields["title"] == "A B"
 
 
 def test_hidden_optional_field_is_treated_as_absent() -> None:
@@ -398,6 +443,10 @@ def test_json_traversal_rejects_undocumented_or_ambiguous_paths(path: str) -> No
         "//user:password@example.com/p",
         "https://example.com/p?token=secret",
         "https://example.com:444/p",
+        "https://example.com:/p",
+        "https://example.com/p%ZZ",
+        "https://example.com/%2",
+        "https://example.com/a b",
         "https://[invalid/p",
     ],
 )
@@ -442,6 +491,10 @@ def test_url_normalization_reuses_strict_host_and_character_policy() -> None:
         "https://0x7f.0.0.1/path",
         "https://example.com\\@evil.example/path",
         "https://example.com/path\x00secret",
+        "https://example.com:/path",
+        "https://example.com/path%ZZ",
+        "https://example.com/%2",
+        "https://example.com/a b",
     ):
         with pytest.raises(MonitorError) as caught:
             normalize_url(unsafe)

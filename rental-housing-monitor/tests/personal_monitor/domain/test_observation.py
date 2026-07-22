@@ -86,3 +86,26 @@ def test_observation_value_mappings_are_defensively_immutable() -> None:
         batch.source_status["source-a"] = "failed"  # type: ignore[index]
     with pytest.raises(TypeError):
         change.changed_fields["price"] = (1, 2)  # type: ignore[index]
+
+
+def test_source_derived_item_and_change_values_are_redacted_from_repr() -> None:
+    source_id = "source-id-session-secret"
+    source_value = "field-value-session-secret"
+    item = ObservedItem(source_id, {"title": source_value})
+    batch = ObservationBatch(
+        monitor_id="monitor-1",
+        items=(item,),
+        observed_at=datetime(2026, 7, 23, tzinfo=UTC),
+        source_hash="safe-hash",
+    )
+    change = Change(
+        item_id=source_id,
+        is_new=False,
+        removed=False,
+        changed_fields={"title": ("old-session-secret", source_value)},
+    )
+
+    for representation in (repr(item), repr(batch), repr(change)):
+        assert source_id not in representation
+        assert source_value not in representation
+        assert "old-session-secret" not in representation

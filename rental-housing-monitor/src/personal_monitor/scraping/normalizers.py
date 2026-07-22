@@ -53,15 +53,15 @@ def normalize_url(value: str, base_url: str = "") -> str:
     if (
         not isinstance(value, str)
         or not isinstance(base_url, str)
-        or has_unsafe_url_characters(value)
-        or has_unsafe_url_characters(base_url)
+        or _has_unsafe_url_text(value)
+        or _has_unsafe_url_text(base_url)
     ):
         raise _normalization_error()
     try:
         candidate = urljoin(base_url, value)
     except (TypeError, ValueError):
         raise _normalization_error() from None
-    if has_unsafe_url_characters(candidate):
+    if _has_unsafe_url_text(candidate):
         raise _normalization_error()
     try:
         parts = urlsplit(candidate)
@@ -75,14 +75,13 @@ def normalize_url(value: str, base_url: str = "") -> str:
         or not parts.hostname
         or parts.username is not None
         or parts.password is not None
+        or parts.netloc.rsplit("@", 1)[-1].endswith(":")
         or port not in {None, 80, 443}
     ):
         raise _normalization_error()
 
     try:
         host = canonicalize_hostname(parts.hostname)
-        if re.search(r"%(?![0-9a-fA-F]{2})", parts.query):
-            raise ValueError("invalid percent escape")
         query = parse_qsl(
             parts.query,
             keep_blank_values=True,
@@ -113,6 +112,14 @@ def normalize_url(value: str, base_url: str = "") -> str:
 def _is_tracking_query_key(key: str) -> bool:
     normalized = key.casefold()
     return normalized.startswith("utm_") or normalized in _TRACKING_QUERY_KEYS
+
+
+def _has_unsafe_url_text(value: str) -> bool:
+    return (
+        has_unsafe_url_characters(value)
+        or any(character.isspace() for character in value)
+        or re.search(r"%(?![0-9a-fA-F]{2})", value) is not None
+    )
 
 
 def _normalize_text(value: str, _base_url: str) -> str:

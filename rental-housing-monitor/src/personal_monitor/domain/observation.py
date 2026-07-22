@@ -21,8 +21,8 @@ def _immutable_mapping(values: Mapping[str, Scalar]) -> Mapping[str, Scalar]:
 
 @dataclass(frozen=True, slots=True)
 class ObservedItem:
-    item_id: str
-    fields: Mapping[str, Scalar]
+    item_id: str = field(repr=False)
+    fields: Mapping[str, Scalar] = field(repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "fields", _immutable_mapping(self.fields))
@@ -52,10 +52,10 @@ class ObservationBatch:
 
 @dataclass(frozen=True, slots=True)
 class Change:
-    item_id: str
+    item_id: str = field(repr=False)
     is_new: bool
     removed: bool
-    changed_fields: Mapping[str, tuple[Scalar, Scalar]]
+    changed_fields: Mapping[str, tuple[Scalar, Scalar]] = field(repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "changed_fields", MappingProxyType(dict(self.changed_fields)))
