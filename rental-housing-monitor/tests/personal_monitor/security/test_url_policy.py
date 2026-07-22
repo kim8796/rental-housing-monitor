@@ -157,13 +157,35 @@ def test_url_policy_validates_public_ip_literal_without_trusting_dns() -> None:
         "2002:7f00:1::",  # 6to4 carrying loopback IPv4
         "2001:0000:4136:e378:8000:63bf:3fff:fdd2",  # Teredo transition space
         "3fff::1",  # documentation-only IPv6
+        "2000::1",  # reserved gap before the first allocated row
+        "2001:1000::1",  # gap between detailed 2001 allocations
+        "2d00::1",  # explicitly reserved by IANA
+        "3000::1",  # explicitly reserved by IANA
+        "3ffe::1",  # returned 6bone space
     ],
 )
 def test_non_global_addresses_are_never_public_targets(address: str) -> None:
     assert is_public_address(address) is False
 
 
-@pytest.mark.parametrize("address", ["93.184.216.34", "2606:4700:4700::1111"])
+@pytest.mark.parametrize(
+    "address",
+    [
+        "93.184.216.34",
+        "2001:4860:4860::8888",  # Google in an allocated 2001 row
+        "2003::1",
+        "2400::1",
+        "2410::1",
+        "2606:4700:4700::1111",  # Cloudflare in 2600::/12
+        "2610::1",
+        "2620::1",
+        "2630::1",
+        "2800::1",
+        "2a00::1",
+        "2a10::1",
+        "2c00::1",
+    ],
+)
 def test_representative_global_addresses_are_public_targets(address: str) -> None:
     assert is_public_address(address) is True
 

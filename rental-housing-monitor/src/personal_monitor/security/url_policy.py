@@ -64,7 +64,49 @@ _IPV6_DENY_NETWORKS = tuple(
         "ff00::/8",
     )
 )
-_IPV6_GLOBAL_UNICAST = ipaddress.ip_network("2000::/3")
+# ALLOCATED rows from the IANA IPv6 Global Unicast Address Space table (2025-10-10).
+# Reserved gaps inside 2000::/3 are intentionally absent.
+_IPV6_ALLOCATED_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "2001::/23",
+        "2001:200::/23",
+        "2001:400::/23",
+        "2001:600::/23",
+        "2001:800::/22",
+        "2001:c00::/23",
+        "2001:e00::/23",
+        "2001:1200::/23",
+        "2001:1400::/22",
+        "2001:1800::/23",
+        "2001:1a00::/23",
+        "2001:1c00::/22",
+        "2001:2000::/19",
+        "2001:4000::/23",
+        "2001:4200::/23",
+        "2001:4400::/23",
+        "2001:4600::/23",
+        "2001:4800::/23",
+        "2001:4a00::/23",
+        "2001:4c00::/23",
+        "2001:5000::/20",
+        "2001:8000::/19",
+        "2001:a000::/20",
+        "2001:b000::/20",
+        "2002::/16",
+        "2003::/18",
+        "2400::/12",
+        "2410::/12",
+        "2600::/12",
+        "2610::/23",
+        "2620::/23",
+        "2630::/12",
+        "2800::/12",
+        "2a00::/12",
+        "2a10::/12",
+        "2c00::/12",
+    )
+)
 
 
 class Resolver(Protocol):
@@ -90,7 +132,7 @@ def is_public_address(value: str) -> bool:
     address = _canonical_ip_address(_parse_address(value))
     if isinstance(address, ipaddress.IPv4Address):
         return not any(address in network for network in _IPV4_DENY_NETWORKS)
-    return address in _IPV6_GLOBAL_UNICAST and not any(
+    return any(address in network for network in _IPV6_ALLOCATED_NETWORKS) and not any(
         address in network for network in _IPV6_DENY_NETWORKS
     )
 
