@@ -244,6 +244,29 @@ def test_low_level_proxy_rebinding_cannot_forge_factory_provenance() -> None:
     assert caught.value.error_class is ErrorClass.POLICY
 
 
+def test_in_place_shared_policy_change_cannot_forge_factory_snapshot() -> None:
+    fake = FakeBackend(http=document())
+    make_scrapling_backend(fake)
+    source = ScraplingSourceAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),  # type: ignore[arg-type]
+        egress_proxy_url="http://proxy.internal:8080",
+        clock=lambda: NOW,
+    )
+    original_policy = source._http_client._egress_policy
+    other_policy = BoundedPolicyHttpClient(
+        egress_proxy_url="http://other-proxy.internal:8080"
+    )._egress_policy
+    object.__setattr__(original_policy, "_url", other_policy._url)
+    object.__setattr__(original_policy, "_digest", other_policy._digest)
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(source.fetch("m", spec(fetch_strategy="http")))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert fake.calls == []
+
+
 def test_factory_provenance_registry_is_not_exposed_as_module_global_state() -> None:
     assert not hasattr(scrapling_module, "_ADAPTER_EGRESS_PROVENANCE")
 
@@ -619,6 +642,92 @@ def test_profile_cleanup_cannot_mask_system_exceptions(
 
     assert caught.value is original
     assert exits[0][0] is exception_type
+    assert exits[0][1] is original
+    assert exits[0][2] is not None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "cleanup_type",
+    [RuntimeError, asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+)
+def test_profile_cleanup_precedence_after_ordinary_fetch_failure(
+    tmp_path: Path,
+    asynchronous: bool,
+    cleanup_type: type[BaseException],
+) -> None:
+    original = MonitorError(ErrorClass.POLICY, "fetch", "ordinary fetch failure")
+    cleanup = cleanup_type("cleanup control flow")
+    exits: list[tuple[object, object, object]] = []
+
+    class SyncContext:
+        def __enter__(self):
+            return tmp_path
+
+        def __exit__(self, *exception):
+            exits.append(exception)
+            raise cleanup
+
+    class AsyncContext:
+        async def __aenter__(self):
+            return tmp_path
+
+        async def __aexit__(self, *exception):
+            exits.append(exception)
+            raise cleanup
+
+    class Profiles:
+        def materialize(self, _reference: str):
+            return AsyncContext() if asynchronous else SyncContext()
+
+    expected = cleanup if not isinstance(cleanup, Exception) else original
+    with pytest.raises(type(expected)) as caught:
+        asyncio.run(
+            adapter(FakeBackend(dynamic=original), profile_provider=Profiles()).fetch(
+                "m", spec(fetch_strategy="dynamic", auth_profile_ref="profile-1")
+            )
+        )
+
+    assert caught.value is expected
+    assert exits[0][0] is MonitorError
+    assert exits[0][1] is original
+    assert exits[0][2] is not None
+
+
+def test_async_cancellation_during_profile_exit_wins_over_ordinary_fetch_failure(
+    tmp_path: Path,
+) -> None:
+    original = MonitorError(ErrorClass.POLICY, "fetch", "ordinary fetch failure")
+    exit_started = asyncio.Event()
+    exits: list[tuple[object, object, object]] = []
+
+    class Context:
+        async def __aenter__(self):
+            return tmp_path
+
+        async def __aexit__(self, *exception):
+            exits.append(exception)
+            exit_started.set()
+            await asyncio.Event().wait()
+
+    class Profiles:
+        def materialize(self, _reference: str):
+            return Context()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            adapter(FakeBackend(dynamic=original), profile_provider=Profiles()).fetch(
+                "m", spec(fetch_strategy="dynamic", auth_profile_ref="profile-1")
+            )
+        )
+        await exit_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert exits[0][0] is MonitorError
     assert exits[0][1] is original
     assert exits[0][2] is not None
 

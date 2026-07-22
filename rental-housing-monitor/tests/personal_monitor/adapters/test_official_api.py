@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import gzip
+import weakref
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
@@ -170,6 +172,71 @@ def test_policy_client_proxy_identity_cannot_be_replaced() -> None:
         client._proxy_identity = other.proxy_identity
     with pytest.raises((AttributeError, TypeError)):
         client._proxy_url = "http://other-proxy.internal:8080"
+
+
+@pytest.mark.parametrize("mutation", ["replace", "in_place", "malformed_digest"])
+def test_official_client_rejects_post_construction_proxy_policy_changes(
+    mutation: str,
+) -> None:
+    transport_calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal transport_calls
+        transport_calls += 1
+        return httpx.Response(500)
+
+    make_policy_client(handler)
+    client = BoundedPolicyHttpClient(egress_proxy_url="http://proxy-a.internal:8080")
+    policy_b = BoundedPolicyHttpClient(
+        egress_proxy_url="http://proxy-b.internal:8080"
+    )._egress_policy
+    if mutation == "replace":
+        object.__setattr__(client, "_egress_policy", policy_b)
+    elif mutation == "in_place":
+        object.__setattr__(client._egress_policy, "_url", policy_b._url)
+        object.__setattr__(client._egress_policy, "_digest", policy_b._digest)
+    else:
+        object.__setattr__(client._egress_policy, "_digest", "invalid")
+    adapter = OfficialJsonAdapter(
+        url_policy=UrlPolicy(Resolver()),
+        rate_limiter=RecordingRateLimiter(),
+        http_client=client,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(MonitorError, match="policy integrity") as caught:
+        asyncio.run(adapter.fetch("monitor-1", official_spec()))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert transport_calls == 0
+    assert "proxy-b" not in str(caught.value)
+    assert "proxy-b" not in repr(caught.value)
+
+
+def test_policy_client_snapshot_owners_use_identity_and_are_weakly_held() -> None:
+    def clock() -> datetime:
+        return NOW
+
+    first = BoundedPolicyHttpClient(egress_proxy_url="http://proxy.internal:8080", clock=clock)
+    second = BoundedPolicyHttpClient(egress_proxy_url="http://proxy.internal:8080", clock=clock)
+
+    assert first is not second
+    assert first != second
+    first_policy = first._egress_policy
+    assert first._uses_egress_policy(first_policy)
+    assert second._uses_egress_policy(second._egress_policy)
+    object.__setattr__(first_policy, "_url", "http://changed.internal:8080")
+    assert not first._uses_egress_policy(first_policy)
+    assert second._uses_egress_policy(second._egress_policy)
+    reference = weakref.ref(first)
+    del first
+    gc.collect()
+
+    assert reference() is None
+    third = BoundedPolicyHttpClient(egress_proxy_url="http://proxy.internal:8080", clock=clock)
+    assert third != second
+    assert third._uses_egress_policy(third._egress_policy)
+    assert second._uses_egress_policy(second._egress_policy)
 
 
 def test_official_constructor_rejects_policy_client_subclasses() -> None:

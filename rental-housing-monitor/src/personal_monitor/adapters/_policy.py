@@ -15,6 +15,8 @@ from personal_monitor.engine.errors import ErrorClass, FetchError, MonitorError
 from personal_monitor.security.egress import (
     EgressProxyIdentity,
     EgressProxyPolicy,
+    _bind_egress_snapshot,
+    _matches_egress_snapshot,
     hold_http_egress_slot,
 )
 from personal_monitor.security.url_policy import ResolvedTarget, has_unsafe_url_characters
@@ -67,7 +69,7 @@ class _BoundedBodyAccumulator:
         return bytes(self._body)
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True, init=False, eq=False, weakref_slot=True)
 class BoundedPolicyHttpClient:
     """A proxy-required, GET-only HTTP client with two fixed request shapes."""
 
@@ -82,6 +84,7 @@ class BoundedPolicyHttpClient:
     ) -> None:
         object.__setattr__(self, "_egress_policy", EgressProxyPolicy.from_url(egress_proxy_url))
         object.__setattr__(self, "_clock", clock)
+        _bind_egress_snapshot(self, self._egress_policy)
 
     @classmethod
     def _from_egress_policy(
@@ -93,19 +96,34 @@ class BoundedPolicyHttpClient:
         instance = cls.__new__(cls)
         object.__setattr__(instance, "_egress_policy", policy)
         object.__setattr__(instance, "_clock", clock)
+        _bind_egress_snapshot(instance, policy)
         return instance
 
     @property
     def proxy_identity(self) -> EgressProxyIdentity:
+        self._require_policy_seal()
         return self._egress_policy.identity
 
     def _uses_egress_policy(self, policy: EgressProxyPolicy) -> bool:
-        return self._egress_policy.has_same_provenance(policy)
+        return self._egress_policy is policy and _matches_egress_snapshot(self, policy)
+
+    def _require_policy_seal(self) -> None:
+        if (
+            not _matches_egress_snapshot(self, self._egress_policy)
+            or not self._egress_policy.is_valid
+        ):
+            raise MonitorError(
+                ErrorClass.POLICY,
+                "fetch",
+                "HTTP client policy integrity check failed",
+            )
 
     async def get_json(self, target: ResolvedTarget) -> PolicyHttpResponse:
+        self._require_policy_seal()
         return await self._get(target, headers=_JSON_HEADERS, require_json=True)
 
     async def get_robots(self, target: ResolvedTarget) -> PolicyHttpResponse:
+        self._require_policy_seal()
         return await self._get(target, headers=_ROBOTS_HEADERS, require_json=False)
 
     async def _get(
@@ -115,6 +133,7 @@ class BoundedPolicyHttpClient:
         headers: dict[str, str],
         require_json: bool,
     ) -> PolicyHttpResponse:
+        self._require_policy_seal()
         if not isinstance(target, ResolvedTarget):
             raise TypeError("target must be an approved ResolvedTarget")
         timeout = httpx.Timeout(30.0, connect=10.0)

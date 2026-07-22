@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import threading
+import weakref
 from contextlib import suppress
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
@@ -20,6 +22,7 @@ from scrapling.engines.toolbelt.custom import Response as ScraplingResponse
 
 import personal_monitor.adapters._policy as policy_module
 import personal_monitor.scraping.scrapling_backend as backend_module
+import personal_monitor.security.egress as egress_module
 from personal_monitor.adapters.official_api import BoundedPolicyHttpClient
 from personal_monitor.domain.spec import FetchStrategy
 from personal_monitor.engine.errors import ErrorClass, MonitorError
@@ -103,22 +106,38 @@ def noop_fetcher(_url: str, **_kwargs: object) -> FakeResponse:
     return FakeResponse()
 
 
+_ORIGINAL_HTTP_GATE = backend_module.HTTP_EGRESS_GATE
+_ORIGINAL_BROWSER_GATE = backend_module._BROWSER_GATE
+_active_monkeypatch: pytest.MonkeyPatch | None = None
+
+
+@pytest.fixture(autouse=True)
+def construction_seams(monkeypatch: pytest.MonkeyPatch):
+    global _active_monkeypatch
+    _active_monkeypatch = monkeypatch
+    yield
+    _active_monkeypatch = None
+
+
 def make_test_backend(**overrides: object) -> ScraplingBackend:
+    if _active_monkeypatch is None:
+        raise AssertionError("test construction seam is unavailable")
     arguments: dict[str, object] = {
         "egress_proxy_url": "http://proxy.test:8080",
     }
-    execution = {
-        "_http_fetcher": overrides.pop("http_fetcher", noop_fetcher),
-        "_dynamic_fetcher": overrides.pop("dynamic_fetcher", noop_fetcher),
-        "_stealthy_fetcher": overrides.pop("stealthy_fetcher", noop_fetcher),
-        "_http_gate": overrides.pop("http_gate", backend_module.HTTP_EGRESS_GATE),
-        "_browser_gate": overrides.pop("browser_gate", backend_module._BROWSER_GATE),
-    }
+    http_fetcher = overrides.pop("http_fetcher", noop_fetcher)
+    dynamic_fetcher = overrides.pop("dynamic_fetcher", noop_fetcher)
+    stealthy_fetcher = overrides.pop("stealthy_fetcher", noop_fetcher)
+    http_gate = overrides.pop("http_gate", _ORIGINAL_HTTP_GATE)
+    browser_gate = overrides.pop("browser_gate", _ORIGINAL_BROWSER_GATE)
+    _active_monkeypatch.setattr(backend_module, "_DEFAULT_HTTP_FETCHER", http_fetcher)
+    _active_monkeypatch.setattr(backend_module, "_DEFAULT_DYNAMIC_FETCHER", dynamic_fetcher)
+    _active_monkeypatch.setattr(backend_module, "_DEFAULT_STEALTHY_FETCHER", stealthy_fetcher)
+    _active_monkeypatch.setattr(backend_module, "HTTP_EGRESS_GATE", http_gate)
+    _active_monkeypatch.setattr(egress_module, "HTTP_EGRESS_GATE", http_gate)
+    _active_monkeypatch.setattr(backend_module, "_BROWSER_GATE", browser_gate)
     arguments.update(overrides)
-    backend = ScraplingBackend(**arguments)  # type: ignore[arg-type]
-    for name, value in execution.items():
-        object.__setattr__(backend, name, value)
-    return backend
+    return ScraplingBackend(**arguments)  # type: ignore[arg-type]
 
 
 def test_response_is_bounded_normalized_and_immutable() -> None:
@@ -698,6 +717,110 @@ def test_production_backend_execution_policy_cannot_be_replaced() -> None:
         backend._http_fetcher = lambda *_args, **_kwargs: FakeResponse()
     with pytest.raises(AttributeError):
         backend._http_gate = threading.BoundedSemaphore(1)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "fetcher_attribute"),
+    [
+        ("fetch_http", "_http_fetcher"),
+        ("fetch_dynamic", "_dynamic_fetcher"),
+        ("fetch_stealthy", "_stealthy_fetcher"),
+    ],
+)
+def test_direct_public_backend_rejects_mutated_fetcher_before_execution(
+    method_name: str,
+    fetcher_attribute: str,
+) -> None:
+    executed = False
+
+    def evil_fetcher(_url: str, **_kwargs: object) -> FakeResponse:
+        nonlocal executed
+        executed = True
+        return FakeResponse()
+
+    backend = ScraplingBackend(egress_proxy_url="http://proxy.test:8080")
+    object.__setattr__(backend, fetcher_attribute, evil_fetcher)
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(getattr(backend, method_name)(target()))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert executed is False
+
+
+def test_direct_public_backend_rejects_mutated_gate_before_execution() -> None:
+    executed = False
+
+    class ExplodingGate:
+        def acquire(self, *, blocking: bool) -> bool:
+            nonlocal executed
+            assert blocking is False
+            executed = True
+            raise AssertionError("mutated gate executed")
+
+        def release(self) -> None:
+            raise AssertionError("mutated gate released")
+
+    backend = ScraplingBackend(egress_proxy_url="http://proxy.test:8080")
+    object.__setattr__(backend, "_http_gate", ExplodingGate())
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(backend.fetch_http(target()))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert executed is False
+
+
+def test_direct_public_backend_rejects_mutated_timeout_before_execution() -> None:
+    backend = ScraplingBackend(egress_proxy_url="http://proxy.test:8080")
+    object.__setattr__(backend, "_http_timeout_seconds", -1.0)
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(backend.fetch_http(target()))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+
+
+def test_direct_public_backend_rejects_mutated_proxy_policy_before_execution() -> None:
+    secret = "proxy-password-secret"
+    backend = ScraplingBackend(egress_proxy_url="http://proxy.test:8080")
+    object.__setattr__(
+        backend._egress_policy,
+        "_url",
+        f"http://user:{secret}@changed-proxy.test:8080",
+    )
+
+    with pytest.raises(MonitorError, match="backend policy") as caught:
+        asyncio.run(backend.fetch_http(target()))
+
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+
+
+def test_backend_snapshot_owners_use_identity_and_are_weakly_held() -> None:
+    def clock() -> datetime:
+        return datetime.now(UTC)
+
+    first = ScraplingBackend(egress_proxy_url="http://proxy.test:8080", clock=clock)
+    second = ScraplingBackend(egress_proxy_url="http://proxy.test:8080", clock=clock)
+
+    assert first is not second
+    assert first != second
+    assert first.is_policy_sealed
+    assert second.is_policy_sealed
+    object.__setattr__(first._egress_policy, "_url", "http://changed.test:8080")
+    assert not first.is_policy_sealed
+    assert second.is_policy_sealed
+    reference = weakref.ref(first)
+    del first
+    gc.collect()
+
+    assert reference() is None
+    third = ScraplingBackend(egress_proxy_url="http://proxy.test:8080", clock=clock)
+    assert third != second
+    assert third.is_policy_sealed
+    assert second.is_policy_sealed
 
 
 @pytest.mark.parametrize(

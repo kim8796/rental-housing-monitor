@@ -23,6 +23,8 @@ from personal_monitor.security.egress import (
     HTTP_EGRESS_GATE,
     EgressProxyIdentity,
     EgressProxyPolicy,
+    _bind_egress_snapshot,
+    _matches_egress_snapshot,
 )
 from personal_monitor.security.url_policy import (
     MAX_REDIRECTS,
@@ -146,7 +148,7 @@ def normalize_response(
     )
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True, init=False, eq=False, weakref_slot=True)
 class ScraplingBackend:
     """A bounded async boundary around Scrapling's synchronous fetchers.
 
@@ -239,6 +241,7 @@ class ScraplingBackend:
         object.__setattr__(self, "_block_page_detector", block_page_detector)
         object.__setattr__(self, "_clock", clock)
         object.__setattr__(self, "_background_calls", set())
+        _bind_egress_snapshot(self, policy)
 
     @property
     def is_policy_sealed(self) -> bool:
@@ -257,7 +260,7 @@ class ScraplingBackend:
         except ValueError:
             return False
         return (
-            self._egress_policy.is_valid
+            _matches_egress_snapshot(self, self._egress_policy)
             and self._http_fetcher is _DEFAULT_HTTP_FETCHER
             and self._dynamic_fetcher is _DEFAULT_DYNAMIC_FETCHER
             and self._stealthy_fetcher is _DEFAULT_STEALTHY_FETCHER
@@ -267,12 +270,22 @@ class ScraplingBackend:
 
     @property
     def proxy_identity(self) -> EgressProxyIdentity:
+        self._require_policy_seal()
         return self._egress_policy.identity
 
     def _uses_egress_policy(self, policy: EgressProxyPolicy) -> bool:
-        return self._egress_policy.has_same_provenance(policy)
+        return self.is_policy_sealed and self._egress_policy is policy
+
+    def _require_policy_seal(self) -> None:
+        if not self.is_policy_sealed:
+            raise MonitorError(
+                ErrorClass.POLICY,
+                "fetch",
+                "backend policy integrity check failed",
+            )
 
     async def fetch_http(self, target: ResolvedTarget) -> SourceDocument:
+        self._require_policy_seal()
         body_collector = _BoundedBodyCollector()
         return await self._fetch(
             target,
@@ -300,6 +313,7 @@ class ScraplingBackend:
     async def fetch_dynamic(
         self, target: ResolvedTarget, *, profile: Path | None = None
     ) -> SourceDocument:
+        self._require_policy_seal()
         return await self._fetch_browser(
             target,
             profile=profile,
@@ -310,6 +324,7 @@ class ScraplingBackend:
     async def fetch_stealthy(
         self, target: ResolvedTarget, *, profile: Path | None = None
     ) -> SourceDocument:
+        self._require_policy_seal()
         return await self._fetch_browser(
             target,
             profile=profile,

@@ -8,12 +8,46 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from urllib.parse import urlsplit
+from weakref import WeakKeyDictionary
 
 from personal_monitor.security.url_policy import has_unsafe_url_characters
 
 HTTP_EGRESS_CONCURRENCY = 4
 HTTP_EGRESS_GATE = threading.BoundedSemaphore(HTTP_EGRESS_CONCURRENCY)
 _IDENTITY_KEY = secrets.token_bytes(32)
+
+
+def _snapshot_accessors():
+    registry: WeakKeyDictionary[object, tuple[EgressProxyPolicy, str, bytes]] = WeakKeyDictionary()
+
+    def bind(owner: object, policy: EgressProxyPolicy) -> None:
+        if owner in registry:
+            raise RuntimeError("egress policy snapshot is already bound")
+        registry[owner] = (
+            policy,
+            policy._url.encode("utf-8").decode("utf-8"),
+            bytes(bytearray(policy._digest)),
+        )
+
+    def matches(owner: object, policy: EgressProxyPolicy) -> bool:
+        snapshot = registry.get(owner)
+        if snapshot is None:
+            return False
+        original_policy, url, digest = snapshot
+        try:
+            return (
+                original_policy is policy
+                and policy._url == url
+                and hmac.compare_digest(policy._digest, digest)
+                and policy.is_valid
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    return bind, matches
+
+
+_bind_egress_snapshot, _matches_egress_snapshot = _snapshot_accessors()
 
 
 @dataclass(frozen=True, slots=True, repr=False)

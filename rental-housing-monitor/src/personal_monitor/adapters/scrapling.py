@@ -7,7 +7,6 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
-from weakref import WeakKeyDictionary
 
 from personal_monitor.adapters._policy import (
     MONITOR_USER_AGENT,
@@ -28,7 +27,11 @@ from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.extractor import DeclarativeExtractor
 from personal_monitor.scraping.scrapling_backend import ScraplingBackend
 from personal_monitor.scraping.validator import ObservationValidator
-from personal_monitor.security.egress import EgressProxyPolicy
+from personal_monitor.security.egress import (
+    EgressProxyPolicy,
+    _bind_egress_snapshot,
+    _matches_egress_snapshot,
+)
 from personal_monitor.security.rate_limit import HostRateLimiter
 from personal_monitor.security.robots import RobotsPolicy
 from personal_monitor.security.url_policy import MAX_REDIRECTS, ResolvedTarget, UrlPolicy
@@ -38,21 +41,6 @@ _RETRY_DELAYS = (1.0, 4.0)
 Clock = Callable[[], datetime]
 Sleeper = Callable[[float], Awaitable[None]]
 ShellDetector = Callable[[SourceDocument], bool]
-
-
-def _provenance_accessors():
-    registry: WeakKeyDictionary[object, EgressProxyPolicy] = WeakKeyDictionary()
-
-    def bind(owner: object, policy: EgressProxyPolicy) -> None:
-        registry[owner] = policy
-
-    def lookup(owner: object) -> EgressProxyPolicy | None:
-        return registry.get(owner)
-
-    return bind, lookup
-
-
-_bind_egress_provenance, _lookup_egress_provenance = _provenance_accessors()
 
 
 class ProfileProvider(Protocol):
@@ -112,7 +100,7 @@ class ScraplingSourceAdapter:
             or type(backend) is not ScraplingBackend
         ):
             raise TypeError("adapter egress components are invalid")
-        _bind_egress_provenance(self, egress_policy)
+        _bind_egress_snapshot(self, egress_policy)
         self._url_policy = url_policy
         self._rate_limiter = rate_limiter
         self._http_client = http_client
@@ -269,10 +257,12 @@ class ScraplingSourceAdapter:
                 exception = sys.exc_info()
                 try:
                     await async_exit(*exception)
-                except BaseException:
+                except BaseException as cleanup:
                     if not isinstance(original, Exception):
-                        raise original from None
-                    raise _profile_error() from None
+                        raise original.with_traceback(exception[2]) from None
+                    if not isinstance(cleanup, Exception):
+                        raise
+                    raise original.with_traceback(exception[2]) from None
                 raise
             try:
                 await async_exit(None, None, None)
@@ -298,10 +288,12 @@ class ScraplingSourceAdapter:
             exception = sys.exc_info()
             try:
                 exit_context(*exception)
-            except BaseException:
+            except BaseException as cleanup:
                 if not isinstance(original, Exception):
-                    raise original from None
-                raise _profile_error() from None
+                    raise original.with_traceback(exception[2]) from None
+                if not isinstance(cleanup, Exception):
+                    raise
+                raise original.with_traceback(exception[2]) from None
             raise
         try:
             exit_context(None, None, None)
@@ -430,9 +422,9 @@ class ScraplingSourceAdapter:
             return policy.check(MONITOR_USER_AGENT, target.normalized_url), retry_after
 
     def _require_sealed_egress(self) -> None:
-        egress_policy = _lookup_egress_provenance(self)
+        egress_policy = self._http_client._egress_policy
         if (
-            egress_policy is None
+            not _matches_egress_snapshot(self, egress_policy)
             or not egress_policy.is_valid
             or not self._http_client._uses_egress_policy(egress_policy)
             or not self._backend._uses_egress_policy(egress_policy)
