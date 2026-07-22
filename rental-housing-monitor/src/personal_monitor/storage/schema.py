@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import uuid4
+
+_MIGRATION_1 = """
+CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+CREATE TABLE users(
+  id TEXT PRIMARY KEY, telegram_user_id INTEGER NOT NULL UNIQUE,
+  status TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE delivery_targets(
+  id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, kind TEXT NOT NULL,
+  address TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(owner_id, kind, address), FOREIGN KEY(owner_id) REFERENCES users(id)
+);
+CREATE TABLE monitors(
+  id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL,
+  status TEXT NOT NULL, active_version_id TEXT, next_run_at TEXT,
+  lease_owner TEXT, lease_expires_at TEXT, disabled_at TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  FOREIGN KEY(owner_id) REFERENCES users(id)
+);
+CREATE TABLE monitor_versions(
+  id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, version_number INTEGER NOT NULL,
+  spec_json TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+  approved_by TEXT, approved_at TEXT, UNIQUE(monitor_id, version_number),
+  FOREIGN KEY(monitor_id) REFERENCES monitors(id)
+);
+CREATE TABLE observations(
+  monitor_id TEXT NOT NULL, item_id TEXT NOT NULL, fields_json TEXT NOT NULL,
+  content_hash TEXT NOT NULL, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+  PRIMARY KEY(monitor_id, item_id), FOREIGN KEY(monitor_id) REFERENCES monitors(id)
+);
+CREATE TABLE runs(
+  id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL, version_id TEXT NOT NULL,
+  stage TEXT NOT NULL, fetch_strategy TEXT, status TEXT NOT NULL,
+  started_at TEXT NOT NULL, finished_at TEXT, error_class TEXT, error_detail TEXT,
+  FOREIGN KEY(monitor_id) REFERENCES monitors(id)
+);
+CREATE TABLE outbox(
+  id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, monitor_id TEXT NOT NULL,
+  target_id TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL,
+  last_error TEXT, created_at TEXT NOT NULL,
+  FOREIGN KEY(monitor_id) REFERENCES monitors(id),
+  FOREIGN KEY(target_id) REFERENCES delivery_targets(id)
+);
+CREATE TABLE deliveries(
+  outbox_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, external_message_id TEXT NOT NULL,
+  delivered_at TEXT NOT NULL, FOREIGN KEY(outbox_id) REFERENCES outbox(id)
+);
+CREATE TABLE pending_actions(
+  token_hash TEXT PRIMARY KEY, owner_id TEXT NOT NULL, action TEXT NOT NULL,
+  payload_json TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT,
+  FOREIGN KEY(owner_id) REFERENCES users(id)
+);
+CREATE TABLE credential_refs(
+  id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, kind TEXT NOT NULL,
+  vault_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+  FOREIGN KEY(owner_id) REFERENCES users(id)
+);
+CREATE INDEX monitors_due_idx ON monitors(status, next_run_at);
+CREATE INDEX outbox_due_idx ON outbox(status, available_at);
+CREATE INDEX runs_monitor_started_idx ON runs(monitor_id, started_at);
+"""
+
+
+def open_database(path: str | Path) -> sqlite3.Connection:
+    """Open a configured SQLite connection and atomically apply known migrations."""
+    database_path = Path(path)
+    if str(path) != ":memory:":
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database_path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    try:
+        _apply_migrations(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _apply_migrations(connection: sqlite3.Connection) -> None:
+    with transaction(connection, immediate=True):
+        has_migrations = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        if (
+            has_migrations
+            and connection.execute("SELECT 1 FROM schema_migrations WHERE version = 1").fetchone()
+        ):
+            return
+        for statement in _statements(_MIGRATION_1):
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)",
+            (utc_now().isoformat(),),
+        )
+
+
+def _statements(script: str) -> Iterator[str]:
+    for statement in script.split(";"):
+        if statement.strip():
+            yield statement
+
+
+@contextmanager
+def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> Iterator[None]:
+    """Nest safely without committing or rolling back a caller-owned transaction."""
+    if connection.in_transaction:
+        savepoint = f"storage_{uuid4().hex}"
+        connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield
+        except BaseException:
+            connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return
+
+    connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+    try:
+        yield
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def utc_timestamp(value: datetime, *, parameter: str) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{parameter} must be timezone-aware")
+    return value.astimezone(UTC).isoformat()
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value is not None else None
+
+
+def canonical_json(value: object) -> str:
+    return json.dumps(
+        _json_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    return value
