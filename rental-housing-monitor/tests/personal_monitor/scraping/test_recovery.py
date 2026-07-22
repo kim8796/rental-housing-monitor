@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import FrozenInstanceError
@@ -489,6 +490,119 @@ def test_baseline_runs_full_extraction_and_validation_before_saving_features(
     assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0
 
 
+def test_baseline_feature_batch_rolls_back_when_a_later_insert_fails(
+    connection: sqlite3.Connection,
+    adaptive_storage: EncryptedAdaptiveStorage,
+) -> None:
+    recovery, registry, _, _, monitor_id = build_recovery(connection, adaptive_storage)
+    active = registry.get_active_monitor(monitor_id)
+    base_aad = (
+        b"personal-monitor/adaptive-feature/v1\0"
+        + f"owner\0{monitor_id}\0{active.version_id}\0field:title:0".encode()
+    )
+    failing_hash = hashlib.sha256(base_aad).hexdigest()
+    connection.execute(
+        "CREATE TRIGGER fail_second_feature BEFORE INSERT ON adaptive_features "
+        f"WHEN NEW.key_hash = '{failing_hash}' "
+        "BEGIN SELECT RAISE(ABORT, 'private later feature'); END"
+    )
+
+    with pytest.raises(RuntimeError, match="storage failed"):
+        save_baseline(
+            recovery,
+            monitor_id,
+            owner_id="owner",
+            document=document(baseline_html()),
+        )
+
+    assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0
+    assert registry.list_monitors("owner")[0].status is MonitorStatus.ACTIVE
+
+
+@pytest.mark.parametrize("operation", ["baseline", "diagnostic"])
+@pytest.mark.parametrize("mutation", ["status", "version"])
+def test_recovery_rechecks_stale_monitor_state_after_policy_await(
+    tmp_path: Path,
+    operation: str,
+    mutation: str,
+) -> None:
+    database_path = tmp_path / f"race-{operation}-{mutation}.db"
+    primary = open_database(database_path)
+    secondary = open_database(database_path)
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        resume = asyncio.Event()
+
+        class PausingResolver(Resolver):
+            paused = False
+
+            async def resolve(self, hostname: str, port: int) -> tuple[str, ...]:
+                if not self.paused:
+                    self.paused = True
+                    started.set()
+                    await resume.wait()
+                return await super().resolve(hostname, port)
+
+        storage = EncryptedAdaptiveStorage(
+            primary,
+            cipher=AesGcmCipher(b"a" * 32),
+            clock=lambda: datetime(2026, 7, 23, tzinfo=UTC),
+        )
+        recovery, registry, _, _, monitor_id = build_recovery(
+            primary, storage, resolver=PausingResolver()
+        )
+        active = registry.get_active_monitor(monitor_id)
+        if operation == "baseline":
+            coroutine = recovery.save_success_baseline(
+                monitor_id,
+                owner_id="owner",
+                document=document(baseline_html()),
+            )
+        else:
+            coroutine = recovery.propose_adaptive(
+                monitor_id,
+                owner_id="owner",
+                document=document(baseline_html()),
+                failure_class=ErrorClass.STRUCTURE,
+            )
+        task = asyncio.create_task(coroutine)
+        await started.wait()
+        if mutation == "status":
+            secondary.execute(
+                "UPDATE monitors SET status = 'paused_user' WHERE id = ?", (monitor_id,)
+            )
+            expected_versions = 1
+        else:
+            row = secondary.execute(
+                "SELECT spec_json FROM monitor_versions WHERE id = ?", (active.version_id,)
+            ).fetchone()
+            secondary.execute(
+                "INSERT INTO monitor_versions(id, monitor_id, version_number, spec_json, "
+                "created_by, created_at) VALUES ('replacement-version', ?, 2, ?, 'owner', ?)",
+                (monitor_id, row["spec_json"], datetime.now(UTC).isoformat()),
+            )
+            secondary.execute(
+                "UPDATE monitors SET active_version_id = 'replacement-version' WHERE id = ?",
+                (monitor_id,),
+            )
+            expected_versions = 2
+        resume.set()
+        with pytest.raises(ValueError, match="precondition"):
+            await task
+        assert primary.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0
+        assert primary.execute("SELECT count(*) FROM diagnostic_snapshots").fetchone()[0] == 0
+        assert primary.execute("SELECT count(*) FROM monitor_versions").fetchone()[0] == (
+            expected_versions
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        secondary.close()
+        primary.close()
+
+
 @pytest.mark.parametrize(
     ("failure_class", "content_type"),
     [
@@ -697,6 +811,63 @@ def test_dns_failure_is_a_fixed_eligibility_error_before_any_write(
     assert "private resolver path" not in str(caught.value)
     assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0
     assert connection.execute("SELECT count(*) FROM diagnostic_snapshots").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "_registry",
+        "_repository",
+        "_cipher",
+        "_adaptive_storage",
+        "_url_policy",
+        "_extractor",
+        "_validator",
+    ],
+)
+@pytest.mark.parametrize("low_level", [False, True])
+def test_recovery_dependency_replacement_fails_before_any_dispatch(
+    connection: sqlite3.Connection,
+    adaptive_storage: EncryptedAdaptiveStorage,
+    attribute: str,
+    low_level: bool,
+) -> None:
+    original_resolver = Resolver()
+    recovery, _, _, _, monitor_id = build_recovery(
+        connection, adaptive_storage, resolver=original_resolver
+    )
+    other_resolver = Resolver()
+    replacements: dict[str, object] = {
+        "_registry": RegistryRepository(connection),
+        "_repository": RecoveryRepository(connection),
+        "_cipher": AesGcmCipher(b"z" * 32),
+        "_adaptive_storage": EncryptedAdaptiveStorage(
+            connection,
+            cipher=AesGcmCipher(b"z" * 32),
+            clock=lambda: datetime(2026, 7, 23, tzinfo=UTC),
+        ),
+        "_url_policy": UrlPolicy(other_resolver),
+        "_extractor": DeclarativeExtractor(),
+        "_validator": ObservationValidator(),
+    }
+    if low_level:
+        object.__setattr__(recovery, attribute, replacements[attribute])
+    else:
+        setattr(recovery, attribute, replacements[attribute])
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    with pytest.raises(RuntimeError, match="integrity"):
+        save_baseline(
+            recovery,
+            monitor_id,
+            owner_id="owner",
+            document=document(baseline_html()),
+        )
+
+    assert statements == []
+    assert original_resolver.calls == []
+    assert other_resolver.calls == []
 
 
 def test_recovery_candidate_freezes_caps_and_redacts_nested_values() -> None:

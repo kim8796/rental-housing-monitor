@@ -47,6 +47,17 @@ def element():
     )
 
 
+def authenticated_aad(connection: sqlite3.Connection, identifier: str) -> bytes:
+    expires_at = connection.execute("SELECT expires_at FROM adaptive_features LIMIT 1").fetchone()[
+        "expires_at"
+    ]
+    base = (
+        b"personal-monitor/adaptive-feature/v1\0"
+        b"owner-secret\0monitor-secret\0version-secret\0" + identifier.encode()
+    )
+    return base + b"\0expires_at\0" + expires_at.encode()
+
+
 def test_encrypted_store_persists_only_hashes_ciphertext_and_redacted_metadata(
     connection: sqlite3.Connection,
 ) -> None:
@@ -288,10 +299,7 @@ def test_authenticated_but_invalid_feature_json_is_revalidated_before_relocation
     store = adaptive_store(connection)
     scoped = namespace(store)
     scoped.save(element(), "item_scope:0")
-    aad = (
-        b"personal-monitor/adaptive-feature/v1\0"
-        b"owner-secret\0monitor-secret\0version-secret\0item_scope:0"
-    )
+    aad = authenticated_aad(connection, "item_scope:0")
     crafted = cipher.encrypt(
         b'{"feature":{"tag":"div"},"format":"personal-monitor-adaptive-feature-v1"}',
         aad,
@@ -311,10 +319,7 @@ def test_authenticated_deep_json_is_rejected_with_a_fixed_payload_error(
     cipher = AesGcmCipher(b"k" * 32)
     scoped = namespace(adaptive_store(connection))
     scoped.save(element(), "item_scope:0")
-    aad = (
-        b"personal-monitor/adaptive-feature/v1\0"
-        b"owner-secret\0monitor-secret\0version-secret\0item_scope:0"
-    )
+    aad = authenticated_aad(connection, "item_scope:0")
     crafted = cipher.encrypt((b'{"feature":' + b"[" * 100 + b"]" * 100 + b"}"), aad)
     connection.execute(
         "UPDATE adaptive_features SET nonce = ?, ciphertext = ?",
@@ -333,10 +338,7 @@ def test_authenticated_noncanonical_feature_cannot_bypass_inner_limits(
     cipher = AesGcmCipher(b"k" * 32)
     scoped = namespace(adaptive_store(connection))
     scoped.save(element(), "item_scope:0")
-    aad = (
-        b"personal-monitor/adaptive-feature/v1\0"
-        b"owner-secret\0monitor-secret\0version-secret\0item_scope:0"
-    )
+    aad = authenticated_aad(connection, "item_scope:0")
     payload = {
         "format": "personal-monitor-adaptive-feature-v1",
         "feature": {
@@ -375,10 +377,7 @@ def test_authenticated_malformed_json_variants_have_one_safe_payload_error(
     cipher = AesGcmCipher(b"k" * 32)
     scoped = namespace(adaptive_store(connection))
     scoped.save(element(), "item_scope:0")
-    aad = (
-        b"personal-monitor/adaptive-feature/v1\0"
-        b"owner-secret\0monitor-secret\0version-secret\0item_scope:0"
-    )
+    aad = authenticated_aad(connection, "item_scope:0")
     crafted = cipher.encrypt(payload, aad)
     connection.execute(
         "UPDATE adaptive_features SET nonce = ?, ciphertext = ?",
@@ -409,6 +408,87 @@ def test_store_composition_and_namespace_are_sealed_before_any_sql(
 
     assert not any("adaptive_features" in statement for statement in statements)
     assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0
+
+
+def test_coordinated_low_level_store_and_namespace_snapshot_replacement_is_rejected(
+    connection: sqlite3.Connection,
+) -> None:
+    store = adaptive_store(connection)
+    replacement_cipher = AesGcmCipher(b"z" * 32)
+    original_clock = store._clock
+    object.__setattr__(store, "_cipher", replacement_cipher)
+    object.__setattr__(
+        store,
+        "_composition",
+        (connection, replacement_cipher, original_clock),
+    )
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    with pytest.raises(RuntimeError, match="integrity"):
+        namespace(store)
+    assert not any("adaptive_features" in statement for statement in statements)
+
+    clean_store = adaptive_store(connection)
+    scoped = namespace(clean_store)
+    swapped = b"other\0monitor\0version"
+    swapped_hash = __import__("hashlib").sha256(swapped).hexdigest()
+    object.__setattr__(scoped, "_namespace", swapped)
+    object.__setattr__(scoped, "_namespace_hash", swapped_hash)
+    object.__setattr__(
+        scoped,
+        "_composition",
+        (connection, clean_store._cipher, clean_store._clock, swapped, swapped_hash),
+    )
+    with pytest.raises(RuntimeError, match="integrity"):
+        scoped.save(element(), "item_scope:0")
+    assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 0
+
+
+def test_authenticated_semantically_valid_noncanonical_json_is_rejected(
+    connection: sqlite3.Connection,
+) -> None:
+    cipher = AesGcmCipher(b"k" * 32)
+    scoped = namespace(adaptive_store(connection))
+    scoped.save(element(), "item_scope:0")
+    restored = scoped.retrieve("item_scope:0")
+    assert restored is not None
+    aad = authenticated_aad(connection, "item_scope:0")
+    noncanonical = (
+        json.dumps(
+            {"feature": restored, "format": "personal-monitor-adaptive-feature-v1"},
+            indent=2,
+        ).encode()
+        + b"\n"
+    )
+    crafted = cipher.encrypt(noncanonical, aad)
+    connection.execute(
+        "UPDATE adaptive_features SET nonce = ?, ciphertext = ?",
+        (crafted.nonce, crafted.ciphertext),
+    )
+    with pytest.raises(ValueError, match="payload is invalid"):
+        scoped.retrieve("item_scope:0")
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "2027-01-01T00:00:00+00:00",
+        "2026-07-23T11:59:59+00:00",
+        "not-a-time",
+    ],
+)
+def test_expiry_metadata_is_authenticated_before_it_affects_usability(
+    connection: sqlite3.Connection,
+    replacement: str,
+) -> None:
+    scoped = namespace(adaptive_store(connection))
+    scoped.save(element(), "item_scope:0")
+    connection.execute("UPDATE adaptive_features SET expires_at = ?", (replacement,))
+
+    with pytest.raises(ValueError, match="authentication"):
+        scoped.retrieve("item_scope:0")
+
+    assert connection.execute("SELECT count(*) FROM adaptive_features").fetchone()[0] == 1
 
 
 def test_concurrent_connections_upsert_one_authenticated_feature(tmp_path: Path) -> None:

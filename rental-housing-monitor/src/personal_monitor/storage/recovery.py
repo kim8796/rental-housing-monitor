@@ -67,6 +67,32 @@ class RecoveryRepository:
             self._insert_diagnostic(snapshot_id, monitor_id, blob, created_at)
         return snapshot_id
 
+    def store_diagnostic_if_active(
+        self,
+        monitor_id: str,
+        owner_id: str,
+        expected_active_version_id: str,
+        blob: EncryptedBlob,
+    ) -> str:
+        _validate_blob(blob)
+        created_at = self._read_clock()
+        snapshot_id = uuid4().hex
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT 1 FROM monitors WHERE id = ? AND owner_id = ? AND status = ? "
+                "AND active_version_id = ?",
+                (
+                    monitor_id,
+                    owner_id,
+                    MonitorStatus.ACTIVE.value,
+                    expected_active_version_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ValueError("recovery precondition failed")
+            self._insert_diagnostic(snapshot_id, monitor_id, blob, created_at)
+        return snapshot_id
+
     def get_diagnostic(self, snapshot_id: str, *, owner_id: str) -> DiagnosticSnapshot:
         row = self.connection.execute(
             "SELECT d.id, d.monitor_id, d.nonce, d.ciphertext, d.created_at, d.expires_at "

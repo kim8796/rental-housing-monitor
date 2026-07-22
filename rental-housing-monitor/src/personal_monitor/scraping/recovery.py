@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -45,6 +47,29 @@ _CREDENTIAL_TEXT = re.compile(
     re.IGNORECASE,
 )
 _SAFE_SELECTOR_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
+
+
+def _private_recovery_pins():
+    pins: weakref.WeakKeyDictionary[object, tuple[object, ...]] = weakref.WeakKeyDictionary()
+    lock = threading.RLock()
+
+    def pin(owner: object, dependencies: tuple[object, ...]) -> None:
+        with lock:
+            if owner in pins:
+                raise RuntimeError("adaptive recovery integrity check failed")
+            pins[owner] = dependencies
+
+    def acquire(owner: object) -> tuple[object, ...]:
+        with lock:
+            dependencies = pins.get(owner)
+        if dependencies is None:
+            raise RuntimeError("adaptive recovery integrity check failed")
+        return dependencies
+
+    return pin, acquire
+
+
+_pin_recovery, _acquire_recovery = _private_recovery_pins()
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +147,15 @@ class AdaptiveRecovery:
             raise TypeError("extractor is invalid")
         if not isinstance(validator, ObservationValidator):
             raise TypeError("validator is invalid")
+        try:
+            storage_connection = adaptive_storage._trusted_connection()
+        except RuntimeError:
+            raise TypeError("adaptive storage is invalid") from None
+        if (
+            registry.connection is not repository.connection
+            or registry.connection is not storage_connection
+        ):
+            raise TypeError("recovery dependencies must share one SQLite connection")
         self._registry = registry
         self._repository = repository
         self._cipher = cipher
@@ -129,6 +163,19 @@ class AdaptiveRecovery:
         self._url_policy = url_policy
         self._extractor = extractor
         self._validator = validator
+        _pin_recovery(
+            self,
+            (
+                registry,
+                repository,
+                cipher,
+                adaptive_storage,
+                url_policy,
+                extractor,
+                validator,
+                storage_connection,
+            ),
+        )
 
     async def save_success_baseline(
         self,
@@ -137,10 +184,13 @@ class AdaptiveRecovery:
         owner_id: str,
         document: SourceDocument,
     ) -> None:
-        active = await self._eligible_active(monitor_id, owner_id, document)
-        items = self._extractor.extract(document, active.spec.extract)
-        self._validator.validate(items, active.spec.extract, active.spec.validators)
-        page = self._page(document, active)
+        dependencies = _trusted_recovery(self)
+        active = await self._eligible_active(monitor_id, owner_id, document, dependencies)
+        dependencies = _trusted_recovery(self)
+        extractor, validator, adaptive_storage = dependencies[5], dependencies[6], dependencies[3]
+        items = extractor.extract(document, active.spec.extract)
+        validator.validate(items, active.spec.extract, active.spec.validators)
+        page = self._page(document, active, adaptive_storage)
         roots = _select(page, active.spec.extract.item_scope)
         if not roots:
             raise ValueError("baseline selectors are unavailable")
@@ -151,10 +201,25 @@ class AdaptiveRecovery:
                 if len(matches) != 1:
                     raise ValueError("baseline selectors are unavailable")
                 baseline_fields.append((f"field:{name}:{index}", matches[0]))
-        for index, root in enumerate(roots):
-            page.save(root, f"item_scope:{index}")
-        for identifier, match in baseline_fields:
-            page.save(match, identifier)
+        dependencies = _trusted_recovery(self)
+        registry = dependencies[0]
+        adaptive_storage = dependencies[3]
+        namespace = adaptive_storage.for_namespace(
+            owner_id=active.owner_id,
+            monitor_id=active.id,
+            version_id=active.version_id,
+        )
+        entries = [(root._root, f"item_scope:{index}") for index, root in enumerate(roots)] + [
+            (match._root, identifier) for identifier, match in baseline_fields
+        ]
+        namespace.save_many(
+            entries,
+            precondition=lambda _connection: registry.require_recovery_active(
+                monitor_id,
+                owner_id=owner_id,
+                version_id=active.version_id,
+            ),
+        )
 
     async def propose_adaptive(
         self,
@@ -165,33 +230,37 @@ class AdaptiveRecovery:
         failure_class: ErrorClass,
         secret_values: Iterable[str] = (),
     ) -> RecoveryCandidate | None:
+        dependencies = _trusted_recovery(self)
         if failure_class not in _ADAPTIVE_FAILURES or document.content_type not in _HTML_TYPES:
             raise ValueError("failure is not eligible for adaptive recovery")
-        active = await self._eligible_active(monitor_id, owner_id, document)
+        active = await self._eligible_active(monitor_id, owner_id, document, dependencies)
+        dependencies = _trusted_recovery(self)
+        extractor, validator = dependencies[5], dependencies[6]
         secrets = _copy_secrets(secret_values)
-        diagnostic = self._diagnostic_blob(monitor_id, document, secrets)
+        diagnostic = self._diagnostic_blob(monitor_id, document, secrets, dependencies[2])
         try:
-            proposal = self._build_proposal(active, document, secrets)
+            proposal = self._build_proposal(active, document, secrets, dependencies[3])
         except Exception:
             proposal = None
         if proposal is None:
-            self._repository.store_diagnostic(monitor_id, owner_id, diagnostic)
+            self._store_diagnostic(active, monitor_id, owner_id, diagnostic)
             return None
         proposed_spec, field_changes = proposal
         try:
-            items = self._extractor.extract(document, proposed_spec.extract)
-            validated = self._validator.validate(
+            items = extractor.extract(document, proposed_spec.extract)
+            validated = validator.validate(
                 items,
                 proposed_spec.extract,
                 proposed_spec.validators,
             )
         except MonitorError:
-            self._repository.store_diagnostic(monitor_id, owner_id, diagnostic)
+            self._store_diagnostic(active, monitor_id, owner_id, diagnostic)
             return None
         if _unsafe_items(validated, secrets):
-            self._repository.store_diagnostic(monitor_id, owner_id, diagnostic)
+            self._store_diagnostic(active, monitor_id, owner_id, diagnostic)
             return None
-        version_id = self._repository.store_candidate(
+        repository = _trusted_recovery(self)[1]
+        version_id = repository.store_candidate(
             monitor_id=monitor_id,
             owner_id=owner_id,
             expected_active_version_id=active.version_id,
@@ -210,13 +279,14 @@ class AdaptiveRecovery:
         active: ActiveMonitor,
         document: SourceDocument,
         secrets: tuple[str, ...],
+        adaptive_storage: EncryptedAdaptiveStorage,
     ) -> tuple[MonitorSpec, Mapping[str, str]] | None:
-        page = self._page(document, active)
+        page = self._page(document, active, adaptive_storage)
         original = active.spec.extract.item_scope
         roots = _select(page, original)
         changes: dict[str, str] = {}
         if not roots:
-            namespace = self._adaptive_storage.for_namespace(
+            namespace = adaptive_storage.for_namespace(
                 owner_id=active.owner_id,
                 monitor_id=active.id,
                 version_id=active.version_id,
@@ -302,34 +372,37 @@ class AdaptiveRecovery:
         monitor_id: str,
         owner_id: str,
         document: SourceDocument,
+        dependencies: tuple[object, ...],
     ) -> ActiveMonitor:
         if not isinstance(document, SourceDocument) or document.content_type not in _HTML_TYPES:
             raise ValueError("document is not eligible for adaptive recovery")
         try:
-            active = self._registry.get_active_monitor_for_recovery(monitor_id, owner_id=owner_id)
+            registry = dependencies[0]
+            active = registry.get_active_monitor_for_recovery(monitor_id, owner_id=owner_id)
         except ValueError:
             raise ValueError("monitor is not eligible for adaptive recovery") from None
         if active.spec.source_adapter is not SourceAdapterKind.SCRAPLING:
             raise ValueError("monitor is not eligible for adaptive recovery")
-        await self._validate_document_lineage(active, document)
+        await self._validate_document_lineage(active, document, dependencies[4])
         return active
 
     async def _validate_document_lineage(
-        self, active: ActiveMonitor, document: SourceDocument
+        self, active: ActiveMonitor, document: SourceDocument, policy: UrlPolicy
     ) -> None:
         try:
-            requested = await self._url_policy.validate(active.spec.target_url)
+            requested = await policy.validate(active.spec.target_url)
+            policy = _trusted_recovery(self)[4]
             approved_chain: list[str] = []
             for redirect_count, redirect_url in enumerate(document.redirect_urls, start=1):
-                target = await self._url_policy.validate_redirect(
-                    redirect_url, redirect_count=redirect_count
-                )
+                target = await policy.validate_redirect(redirect_url, redirect_count=redirect_count)
+                policy = _trusted_recovery(self)[4]
                 if redirect_count == 1 and target.normalized_url != requested.normalized_url:
                     raise ValueError
                 if target.normalized_url in approved_chain:
                     raise ValueError
                 approved_chain.append(target.normalized_url)
-            final = await self._url_policy.validate(document.final_url)
+            final = await policy.validate(document.final_url)
+            _trusted_recovery(self)
             if approved_chain:
                 if final.normalized_url in approved_chain:
                     raise ValueError
@@ -338,8 +411,13 @@ class AdaptiveRecovery:
         except Exception:
             raise ValueError("document is not eligible for adaptive recovery") from None
 
-    def _page(self, document: SourceDocument, active: ActiveMonitor) -> Selector:
-        storage = self._adaptive_storage.for_namespace(
+    def _page(
+        self,
+        document: SourceDocument,
+        active: ActiveMonitor,
+        adaptive_storage: EncryptedAdaptiveStorage,
+    ) -> Selector:
+        storage = adaptive_storage.for_namespace(
             owner_id=active.owner_id,
             monitor_id=active.id,
             version_id=active.version_id,
@@ -356,10 +434,52 @@ class AdaptiveRecovery:
         monitor_id: str,
         document: SourceDocument,
         secrets: tuple[str, ...],
+        cipher: AesGcmCipher,
     ) -> EncryptedBlob:
         html = document.body.decode("utf-8", errors="replace")
         sanitized = sanitize_for_ai(html, secret_values=secrets)
-        return self._cipher.encrypt(sanitized.encode("utf-8"), monitor_id.encode())
+        return cipher.encrypt(sanitized.encode("utf-8"), monitor_id.encode())
+
+    def _store_diagnostic(
+        self,
+        active: ActiveMonitor,
+        monitor_id: str,
+        owner_id: str,
+        diagnostic: EncryptedBlob,
+    ) -> None:
+        dependencies = _trusted_recovery(self)
+        repository = dependencies[1]
+        repository.store_diagnostic_if_active(
+            monitor_id,
+            owner_id,
+            active.version_id,
+            diagnostic,
+        )
+
+
+def _trusted_recovery(owner: AdaptiveRecovery) -> tuple[object, ...]:
+    try:
+        dependencies = _acquire_recovery(owner)
+        registry, repository, cipher, storage, policy, extractor, validator, connection = (
+            dependencies
+        )
+        valid = (
+            owner._registry is registry
+            and owner._repository is repository
+            and owner._cipher is cipher
+            and owner._adaptive_storage is storage
+            and owner._url_policy is policy
+            and owner._extractor is extractor
+            and owner._validator is validator
+            and registry.connection is connection
+            and repository.connection is connection
+            and storage._trusted_connection() is connection
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise RuntimeError("adaptive recovery integrity check failed")
+    return dependencies
 
 
 def _select(

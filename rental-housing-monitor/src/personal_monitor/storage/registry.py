@@ -202,6 +202,15 @@ class RegistryRepository:
             spec=MonitorSpec.model_validate_json(row["spec_json"]),
         )
 
+    def require_recovery_active(self, monitor_id: str, *, owner_id: str, version_id: str) -> None:
+        row = self.connection.execute(
+            "SELECT 1 FROM monitors WHERE id = ? AND owner_id = ? AND status = ? "
+            "AND active_version_id = ?",
+            (monitor_id, owner_id, MonitorStatus.ACTIVE.value, version_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("recovery precondition failed")
+
     def get_active_monitor_for_recovery(self, monitor_id: str, *, owner_id: str) -> ActiveMonitor:
         row = self.connection.execute(
             "SELECT m.id, m.owner_id, v.id AS version_id, v.spec_json "

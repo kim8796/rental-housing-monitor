@@ -4,6 +4,8 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -29,10 +31,41 @@ _MAX_RELATED = 128
 _RETENTION = timedelta(days=90)
 
 
+def _private_weak_pins():
+    pins: weakref.WeakKeyDictionary[object, tuple[object, ...]] = weakref.WeakKeyDictionary()
+    lock = threading.RLock()
+
+    def pin(owner: object, values: tuple[object, ...]) -> None:
+        with lock:
+            if owner in pins:
+                raise RuntimeError("adaptive feature storage integrity check failed")
+            pins[owner] = values
+
+    def acquire(owner: object) -> tuple[object, ...]:
+        with lock:
+            values = pins.get(owner)
+        if values is None:
+            raise RuntimeError("adaptive feature storage integrity check failed")
+        return values
+
+    return pin, acquire
+
+
+_pin_storage, _acquire_storage = _private_weak_pins()
+_pin_namespace, _acquire_namespace = _private_weak_pins()
+
+
 class EncryptedAdaptiveStorage:
     """Factory for monitor/version-scoped authenticated Scrapling feature stores."""
 
-    __slots__ = ("_connection", "_cipher", "_clock", "_composition", "_sealed")
+    __slots__ = (
+        "_connection",
+        "_cipher",
+        "_clock",
+        "_composition",
+        "_sealed",
+        "__weakref__",
+    )
 
     def __init__(
         self,
@@ -74,6 +107,7 @@ class EncryptedAdaptiveStorage:
         self._clock = clock
         self._composition = (connection, cipher, clock)
         self._sealed = True
+        _pin_storage(self, (connection, cipher, clock))
 
     def __setattr__(self, name: str, value: object) -> None:
         if getattr(self, "_sealed", False):
@@ -110,7 +144,7 @@ class EncryptedAdaptiveStorage:
 
     def _assert_integrity(self) -> None:
         try:
-            connection, cipher, clock = self._composition
+            connection, cipher, clock = _acquire_storage(self)
             valid = (
                 self._connection is connection
                 and self._cipher is cipher
@@ -122,6 +156,13 @@ class EncryptedAdaptiveStorage:
             valid = False
         if not valid:
             raise RuntimeError("adaptive feature storage integrity check failed")
+
+    def _trusted_connection(self) -> sqlite3.Connection:
+        self._assert_integrity()
+        connection, _cipher, _clock = _acquire_storage(self)
+        if not isinstance(connection, sqlite3.Connection):
+            raise RuntimeError("adaptive feature storage integrity check failed")
+        return connection
 
 
 class EncryptedAdaptiveNamespace(StorageSystemMixin):
@@ -159,6 +200,10 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
             self._namespace_hash,
         )
         self._sealed = True
+        _pin_namespace(
+            self,
+            (connection, cipher, clock, self._namespace, self._namespace_hash),
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         if getattr(self, "_sealed", False):
@@ -169,19 +214,40 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
         return "EncryptedAdaptiveNamespace()"
 
     def save(self, element: HtmlElement, identifier: str) -> None:
+        self.save_many(((element, identifier),))
+
+    def save_many(
+        self,
+        entries: Sequence[tuple[HtmlElement, str]],
+        *,
+        precondition: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> None:
         self._assert_integrity()
-        checked_identifier = _identifier(identifier)
-        feature = _element_feature(element)
-        payload = _encode_feature(feature)
-        aad = self._aad(checked_identifier)
-        blob = self._cipher.encrypt(payload, aad)
         now = _clock_value(self._clock)
         timestamp = now.isoformat()
         expires_at = (now + _RETENTION).isoformat()
-        key_hash = hashlib.sha256(aad).hexdigest()
+        prepared: list[tuple[object, ...]] = []
+        for element, identifier in entries:
+            checked_identifier = _identifier(identifier)
+            payload = _encode_feature(_element_feature(element))
+            base_aad = self._aad(checked_identifier)
+            blob = self._cipher.encrypt(payload, _expiry_aad(base_aad, expires_at))
+            prepared.append(
+                (
+                    hashlib.sha256(base_aad).hexdigest(),
+                    self._namespace_hash,
+                    blob.nonce,
+                    blob.ciphertext,
+                    timestamp,
+                    timestamp,
+                    expires_at,
+                )
+            )
         try:
             with transaction(self._connection, immediate=True):
-                self._connection.execute(
+                if precondition is not None:
+                    precondition(self._connection)
+                self._connection.executemany(
                     "INSERT INTO adaptive_features("
                     "key_hash, namespace_hash, nonce, ciphertext, created_at, updated_at, "
                     "expires_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -189,15 +255,7 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
                     "namespace_hash = excluded.namespace_hash, nonce = excluded.nonce, "
                     "ciphertext = excluded.ciphertext, updated_at = excluded.updated_at, "
                     "expires_at = excluded.expires_at",
-                    (
-                        key_hash,
-                        self._namespace_hash,
-                        blob.nonce,
-                        blob.ciphertext,
-                        timestamp,
-                        timestamp,
-                        expires_at,
-                    ),
+                    prepared,
                 )
         except sqlite3.Error:
             raise RuntimeError("adaptive feature storage failed") from None
@@ -205,8 +263,8 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
     def retrieve(self, identifier: str) -> dict[str, object] | None:
         self._assert_integrity()
         checked_identifier = _identifier(identifier)
-        aad = self._aad(checked_identifier)
-        key_hash = hashlib.sha256(aad).hexdigest()
+        base_aad = self._aad(checked_identifier)
+        key_hash = hashlib.sha256(base_aad).hexdigest()
         try:
             row = self._connection.execute(
                 "SELECT nonce, ciphertext, expires_at FROM adaptive_features "
@@ -218,24 +276,31 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
         if row is None:
             return None
         try:
-            expires_at = datetime.fromisoformat(row["expires_at"])
-            if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            expires_at_value = row["expires_at"]
+            if not isinstance(expires_at_value, str):
                 raise ValueError
-            if expires_at.astimezone(UTC) <= _clock_value(self._clock):
-                self.delete(checked_identifier)
-                return None
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            raise ValueError("adaptive feature authentication failed") from None
-        try:
             plaintext = self._cipher.decrypt(
-                EncryptedBlob(nonce=row["nonce"], ciphertext=row["ciphertext"]), aad
+                EncryptedBlob(nonce=row["nonce"], ciphertext=row["ciphertext"]),
+                _expiry_aad(base_aad, expires_at_value),
             )
-        except (TypeError, ValueError):
+        except (KeyError, TypeError, ValueError):
             raise ValueError("adaptive feature authentication failed") from None
         try:
-            return _decode_feature(plaintext)
+            feature = _decode_feature(plaintext)
+            if _encode_feature(feature) != plaintext:
+                raise ValueError
         except (KeyError, TypeError, ValueError, UnicodeError, RecursionError):
             raise ValueError("adaptive feature payload is invalid") from None
+        try:
+            expires_at = datetime.fromisoformat(expires_at_value)
+            if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("adaptive feature authentication failed") from None
+        if expires_at.astimezone(UTC) <= _clock_value(self._clock):
+            self.delete(checked_identifier)
+            return None
+        return feature
 
     def delete(self, identifier: str) -> bool:
         self._assert_integrity()
@@ -269,7 +334,7 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
 
     def _assert_integrity(self) -> None:
         try:
-            connection, cipher, clock, namespace, namespace_hash = self._composition
+            connection, cipher, clock, namespace, namespace_hash = _acquire_namespace(self)
             valid = (
                 self._connection is connection
                 and self._cipher is cipher
@@ -285,6 +350,14 @@ class EncryptedAdaptiveNamespace(StorageSystemMixin):
             valid = False
         if not valid:
             raise RuntimeError("adaptive feature storage integrity check failed")
+
+
+def _expiry_aad(base_aad: bytes, expires_at: str) -> bytes:
+    try:
+        encoded = expires_at.encode("ascii")
+    except (AttributeError, UnicodeError):
+        raise ValueError("adaptive feature authentication failed") from None
+    return base_aad + b"\0expires_at\0" + encoded
 
 
 def _namespace_part(value: object) -> str:
