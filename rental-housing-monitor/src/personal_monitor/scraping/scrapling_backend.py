@@ -489,12 +489,13 @@ class _BoundedBodyCollector:
     def body(self) -> bytes:
         return bytes(self._body)
 
-    def __call__(self, chunk: bytes) -> None:
+    def __call__(self, chunk: bytes) -> int:
         self.saw_chunk = True
         if len(chunk) > self._max_bytes - len(self._body):
             self.exceeded = True
             raise _BodyLimitExceeded("response size limit exceeded")
         self._body.extend(chunk)
+        return len(chunk)
 
 
 def normalize_response(

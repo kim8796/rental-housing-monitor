@@ -611,6 +611,13 @@ def test_http_callback_rejects_huge_chunk_before_retaining_it() -> None:
     assert collector.retained_bytes == 0
 
 
+def test_http_callback_reports_every_consumed_byte_to_curl() -> None:
+    collector = backend_module._BoundedBodyCollector(max_bytes=3)
+
+    assert collector(b"abc") == 3
+    assert collector.body == b"abc"
+
+
 def test_http_callback_body_is_carried_into_normalization() -> None:
     def fetcher(_url: str, **kwargs: object) -> FakeResponse:
         callback = kwargs["content_callback"]

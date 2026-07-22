@@ -32,6 +32,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "browser: launches the locally installed Scrapling browser against loopback fixtures only",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rental_monitor", "src/personal_monitor"]
