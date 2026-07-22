@@ -107,11 +107,13 @@ https://example.com/product/123
 
 조회는 즉시 실행할 수 있다. 등록, 조건 변경, 일정 변경, 자동 복구 적용과 삭제는 변경 요약과 확인 버튼을 먼저 보여준다. 대상이 둘 이상이거나 의도가 모호하면 추측하지 않고 구분에 필요한 가장 작은 질문 하나를 한다. 확인 요청에는 10분 만료 시간과 요청자 Telegram user ID를 묶은 일회성 토큰을 사용한다.
 
-개인용 단계에서는 환경설정에 등록된 Telegram `user_id` 하나만 명령을 사용할 수 있다. `chat_id`는 알림 목적지이고 `user_id`는 명령 권한이므로 별도 저장한다.
+개인용 단계에서는 환경설정에 등록된 Telegram `user_id`와 command `chat_id`가 모두 일치하는 요청만 명령으로 처리한다. 알림 목적지 `chat_id`와 명령 채팅은 같은 값일 수 있지만 권한과 전달 목적을 구분해 별도 저장한다.
+
+long polling은 같은 bot token에서 하나의 소비자만 허용하므로 전용 bot token을 기본으로 사용한다. 기존 token을 재사용하려면 기존 시스템이 `sendMessage`만 사용하고 webhook이나 다른 `getUpdates` 소비자가 없음을 먼저 확인해야 한다.
 
 ## AI 사용과 인증
 
-운영 서버는 Codex CLI 또는 SDK를 ChatGPT 계정으로 로그인해 ChatGPT Pro의 Codex 사용 한도를 소비한다. Platform API 키는 기본 경로에서 사용하지 않는다.
+운영 서버는 Codex CLI를 ChatGPT 계정으로 로그인해 ChatGPT Pro의 Codex 사용 한도를 소비한다. Platform API 키는 기본 경로에서 사용하지 않는다. 구현은 공식 비대화형 `codex exec --output-schema` 경로를 사용하며, 애플리케이션은 Unix socket을 통해 격리된 Codex worker에 구조화 요청만 전달한다.
 
 - 정상 시작 시 `codex login status`로 ChatGPT 인증인지 확인한다.
 - `OPENAI_API_KEY` 또는 `CODEX_API_KEY`가 설정된 경우 Pro 사용 경로와 혼동하지 않도록 AI 등록 기능을 시작하지 않고 운영자에게 알린다.
@@ -126,7 +128,7 @@ Codex는 운영 중 다음 권한만 가진다.
 - 허용된 JSON Schema에 맞는 의도와 `MonitorSpec` 후보 출력
 - 실패한 설정과 검증 결과를 바탕으로 새 설정 버전 제안
 
-Codex는 운영 DB 쓰기, 셸 실행, Git 작업, Docker 제어와 Telegram 직접 전송 권한을 갖지 않는다. 복잡한 Python 플러그인은 이 저장소의 별도 개발 작업으로 작성하고 테스트·리뷰·배포한다.
+Codex worker는 빈 read-only 작업 디렉터리에서 실행하고 운영 DB, Git 저장소, Docker socket, Telegram token, 수집 자격정보 volume을 마운트하지 않는다. command execution, 파일 변경, MCP 또는 web search 이벤트가 한 번이라도 나타난 실행 결과는 폐기한다. 복잡한 Python 플러그인은 이 저장소의 별도 개발 작업으로 작성하고 테스트·리뷰·배포한다.
 
 ## MonitorSpec 계약
 
@@ -139,6 +141,7 @@ Codex는 운영 DB 쓰기, 셸 실행, Git 작업, Docker 제어와 Telegram 직
   "name": "상품 가격 감시",
   "target_url": "https://example.com/product/123",
   "source_adapter": "scrapling",
+  "adapter_ref": null,
   "fetch_strategy": "auto",
   "schedule": "0 * * * *",
   "timezone": "Asia/Seoul",
@@ -162,7 +165,7 @@ Codex는 운영 DB 쓰기, 셸 실행, Git 작업, Docker 제어와 Telegram 직
 }
 ```
 
-`source_adapter`는 `official_api`, `scrapling`, `python_plugin` 중 하나다. Scrapling의 `fetch_strategy`는 `auto`, `http`, `dynamic`, `stealthy` 중 하나이며 `auto`는 HTTP 요청부터 시작해 필요할 때만 브라우저 방식으로 승격한다.
+`source_adapter`는 `official_api`, `scrapling`, `python_plugin` 중 하나다. `official_api`와 `python_plugin`은 임의 모듈 경로가 아닌 배포 코드에 등록된 allowlist 키를 `adapter_ref`로 요구하고, `scrapling`은 `adapter_ref=null`만 허용한다. Scrapling의 `fetch_strategy`는 `auto`, `http`, `dynamic`, `stealthy` 중 하나이며 `auto`는 HTTP 요청부터 시작해 필요할 때만 브라우저 방식으로 승격한다.
 
 선택자는 실행 가능한 코드가 아니라 CSS/XPath와 제한된 텍스트·정규식 연산만 허용한다. 조건도 등록된 연산자 집합으로 표현하며 Python 표현식이나 셸 문자열을 저장하지 않는다. 모든 변경은 새 `monitor_versions` 행을 만들고 승인된 버전만 활성화한다.
 
@@ -203,7 +206,7 @@ adaptive 기능은 요소 특징을 저장하고 구조 변경 시 후보를 찾
 
 정상 수집의 원시 응답은 추출 후 저장하지 않는다. 구조·검증 실패를 분석할 때만 script, style, hidden 요소와 Secret을 제거한 DOM 조각을 암호화해 최대 7일 보관한다. `runs`는 90일, 성공한 `deliveries`는 180일 보존하고, 활성 모니터의 정규화된 `observations`는 모니터가 삭제될 때까지 유지한다. 이 값은 개인용 1단계의 고정 기본값이며 다중 사용자 단계에서 사용자별 정책으로 바꾼다.
 
-Scrapling adaptive 저장소, SQLite DB, 브라우저 프로필과 로그는 `/srv/personal-monitor/` 아래의 분리된 Docker volume에 둔다. Google Persistent Disk의 기본 암호화를 사용하고 자격정보는 애플리케이션 키로 추가 암호화한다. 백업에는 평문 Secret을 넣지 않는다.
+Scrapling adaptive 저장소, SQLite DB, 암호화된 브라우저 프로필 vault와 로그는 `/srv/personal-monitor/` 아래의 분리된 Docker volume에 둔다. 실행 중 필요한 브라우저 프로필 평문은 tmpfs에만 materialize하고 실행 종료 시 다시 암호화한 뒤 삭제한다. Google Persistent Disk의 기본 암호화를 사용하고 자격정보는 애플리케이션 키로 추가 암호화한다. 백업에는 평문 Secret을 넣지 않는다.
 
 ## 실행, 비교와 중복 방지
 
@@ -245,6 +248,7 @@ Scheduler는 `next_run_at`이 지난 활성 모니터에 lease를 발급한다. 
 - URL 사용자정보, 로컬 파일, `localhost`, loopback, RFC1918 사설망, link-local, 멀티캐스트와 Google metadata 주소를 차단한다.
 - 최초 DNS 결과와 실제 연결 주소를 모두 검사하고 redirect마다 같은 검사를 반복한다.
 - 허용하지 않은 포트와 한도를 넘는 redirect, 응답 크기와 다운로드를 차단한다.
+- 사용자 URL을 처리하는 Scrapling 요청은 private/reserved 목적지를 거부하는 전용 egress proxy를 통과시켜 브라우저 내부 redirect와 하위 리소스에도 같은 네트워크 정책을 적용한다.
 
 ### 프롬프트 인젝션 방어
 
@@ -257,10 +261,10 @@ Scheduler는 `next_run_at`이 지난 활성 모니터에 lease를 발급한다. 
 ### 자격정보
 
 - ChatGPT 인증 파일, Telegram token, 세션 쿠키와 암호화 키는 Git, 이미지, 로그와 DB 평문에 저장하지 않는다.
-- Codex app-server는 localhost 또는 private Unix socket에만 바인딩한다.
+- Codex worker socket은 두 컨테이너가 공유하는 전용 서비스 UID 소유의 `0700` 디렉터리에 `0600` private Unix socket으로만 바인딩한다. 다른 UID와 호스트 사용자는 접근할 수 없고 public TCP port는 열지 않는다.
 - 서버에 Platform API 키를 기본 설정으로 두지 않는다.
 - Google Cloud 서비스 계정은 백업에 필요한 최소 버킷 권한만 가진다.
-- 자격정보 vault의 무작위 master key는 root만 읽을 수 있는 데이터 volume 밖의 secret 파일에 둔다. 백업 묶음에는 이 키를 포함하되 운영자가 서버 밖에 보관하는 `age` 공개키로 묶음 전체를 암호화하므로, GCS 객체만으로는 자격정보를 복호화할 수 없다.
+- 자격정보 vault의 무작위 master key는 전용 서비스 UID만 읽을 수 있는 데이터 volume 밖의 mode `0600` secret 파일에 둔다. 백업 묶음에는 이 키를 포함하되 운영자가 서버 밖에 보관하는 `age` 공개키로 묶음 전체를 암호화하므로, GCS 객체만으로는 자격정보를 복호화할 수 없다.
 - ChatGPT device-code 로그인과 로그인 세션 bootstrap은 Telegram으로 받지 않고 운영자가 IAP SSH 관리 세션에서 수행한다.
 - 브라우저 로그인이 필요한 경우 headed browser 화면은 loopback에만 바인딩하고 IAP 터널로 일시 노출한다. 사용자가 직접 로그인을 마치면 프로필을 암호화해 저장하고 일시 화면 서비스를 종료한다.
 
