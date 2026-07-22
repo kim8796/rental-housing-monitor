@@ -57,6 +57,26 @@ class MonitorStatus(StrEnum):
 
 SAFE_SELECTOR = re.compile(r"^[\w\s.#>*+~:\-\[\]=\"'()/@|]+$")
 SAFE_FIELD = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+MIN_SCHEDULE_INTERVAL_SECONDS = 900
+SCHEDULE_GAP_SAMPLE_COUNT = 512
+SENSITIVE_QUERY_PARAMETER_NAMES = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth",
+        "authorization",
+        "client_secret",
+        "credentials",
+        "key",
+        "passwd",
+        "password",
+        "secret",
+        "session",
+        "signature",
+        "token",
+    }
+)
 
 
 class FieldSpec(StrictModel):
@@ -185,18 +205,8 @@ class MonitorSpec(StrictModel):
             or parts.password is not None
         ):
             raise ValueError("target_url must be an http(s) URL without userinfo")
-        sensitive_names = {
-            "access_token",
-            "api_key",
-            "apikey",
-            "auth",
-            "key",
-            "session",
-            "signature",
-            "token",
-        }
         if any(
-            name.casefold() in sensitive_names
+            name.casefold() in SENSITIVE_QUERY_PARAMETER_NAMES
             for name, _ in parse_qsl(parts.query, keep_blank_values=True)
         ):
             raise ValueError("target_url query contains a credential-like parameter")
@@ -210,10 +220,12 @@ class MonitorSpec(StrictModel):
             raise ValueError("unknown timezone") from error
         base = datetime(2026, 1, 1, tzinfo=zone)
         iterator = croniter(self.schedule, base)
-        first = iterator.get_next(datetime)
-        second = iterator.get_next(datetime)
-        if (second - first).total_seconds() < 900:
-            raise ValueError("schedule interval must be at least 15 minutes")
+        previous = iterator.get_next(datetime)
+        for _ in range(SCHEDULE_GAP_SAMPLE_COUNT):
+            current = iterator.get_next(datetime)
+            if (current - previous).total_seconds() < MIN_SCHEDULE_INTERVAL_SECONDS:
+                raise ValueError("schedule interval must be at least 15 minutes")
+            previous = current
         if self.source_adapter is SourceAdapterKind.SCRAPLING and self.adapter_ref is not None:
             raise ValueError("scrapling does not accept adapter_ref")
         if self.source_adapter is not SourceAdapterKind.SCRAPLING and self.adapter_ref is None:

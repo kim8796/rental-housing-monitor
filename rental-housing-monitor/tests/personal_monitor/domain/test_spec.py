@@ -74,6 +74,12 @@ def test_monitor_spec_rejects_unsafe_values(path: tuple[str, ...], value: object
         MonitorSpec.model_validate(payload)
 
 
+def test_monitor_spec_rejects_a_later_too_frequent_schedule_gap() -> None:
+    payload = valid_spec() | {"schedule": "0,5 0 1,15 * *"}
+    with pytest.raises(ValidationError, match="schedule interval"):
+        MonitorSpec.model_validate(payload)
+
+
 def test_monitor_spec_rejects_unknown_fields() -> None:
     payload = valid_spec() | {"python_code": "print('unsafe')"}
     with pytest.raises(ValidationError, match="extra_forbidden"):
@@ -159,12 +165,20 @@ def test_rule_spec_arguments_must_match_kind(payload: dict[str, object], valid: 
         "https://user:pass@example.com/listing",
         "https://example.com/listing?access_token=secret",
         "https://example.com/listing?API_KEY=secret",
+        "https://example.com/listing?client_secret=secret",
+        "https://example.com/listing?password=secret",
+        "https://example.com/listing?authorization=secret",
     ],
 )
 def test_monitor_spec_rejects_unsafe_target_urls(url: str) -> None:
     payload = valid_spec() | {"target_url": url}
     with pytest.raises(ValidationError):
         MonitorSpec.model_validate(payload)
+
+
+def test_monitor_spec_allows_ordinary_target_url_query_parameters() -> None:
+    payload = valid_spec() | {"target_url": "https://example.com/listing?page=2&sort=price"}
+    assert MonitorSpec.model_validate(payload).target_url == payload["target_url"]
 
 
 @pytest.mark.parametrize(
