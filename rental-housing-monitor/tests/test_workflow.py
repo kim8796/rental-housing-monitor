@@ -1,7 +1,6 @@
 from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/rental-housing-monitor.yml"
-PROBE_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/schedule-probe.yml"
 PROJECT = Path(__file__).resolve().parents[1]
 
 
@@ -40,13 +39,3 @@ def test_required_operator_files_exist() -> None:
     assert (PROJECT / ".env.example").is_file()
     assert (PROJECT / "README.md").is_file()
     assert (PROJECT / "scripts/persist_data_snapshot.sh").is_file()
-
-
-def test_schedule_probe_is_frequent_and_isolated() -> None:
-    text = PROBE_WORKFLOW.read_text(encoding="utf-8")
-
-    assert "cron: '*/5 * * * *'" in text
-    assert "permissions: {}" in text
-    assert "timeout-minutes: 2" in text
-    for forbidden in ("actions/checkout", "secrets.", "TELEGRAM", "SQLite", "rental_monitor"):
-        assert forbidden not in text
