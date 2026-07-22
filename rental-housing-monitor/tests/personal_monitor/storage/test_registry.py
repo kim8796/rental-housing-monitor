@@ -95,6 +95,23 @@ def test_repository_does_not_commit_a_caller_owned_transaction(
     assert connection.execute("SELECT 1 FROM users WHERE id = 'temporary'").fetchone() is None
 
 
+def test_get_delivery_target_resolves_internal_id_and_returns_existing_row_type(
+    registry: RegistryRepository,
+) -> None:
+    registry.create_delivery_target("target-1", "telegram-user:1", "chat-address")
+
+    target = registry.get_delivery_target("target-1")
+
+    assert (target.id, target.owner_id, target.kind, target.address) == (
+        "target-1",
+        "telegram-user:1",
+        "telegram",
+        "chat-address",
+    )
+    with pytest.raises(ValueError, match="delivery target does not exist"):
+        registry.get_delivery_target("chat-address")
+
+
 def test_immediate_operation_rejects_a_caller_owned_transaction_before_work(
     registry: RegistryRepository, connection: sqlite3.Connection
 ) -> None:

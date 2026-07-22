@@ -201,6 +201,17 @@ class RegistryRepository:
             id=row["id"], owner_id=row["owner_id"], kind=row["kind"], address=row["address"]
         )
 
+    def get_delivery_target(self, target_id: str) -> DeliveryTargetRow:
+        row = self.connection.execute(
+            "SELECT id, owner_id, kind, address FROM delivery_targets WHERE id = ?",
+            (target_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("delivery target does not exist")
+        return DeliveryTargetRow(
+            id=row["id"], owner_id=row["owner_id"], kind=row["kind"], address=row["address"]
+        )
+
     def list_monitors(self, owner_id: str, *, include_disabled: bool = False) -> list[MonitorRow]:
         where = "owner_id = ?" if include_disabled else "owner_id = ? AND status != ?"
         parameters: tuple[object, ...] = (

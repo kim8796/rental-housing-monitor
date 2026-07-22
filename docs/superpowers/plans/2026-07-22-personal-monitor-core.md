@@ -827,7 +827,7 @@ git commit -m "feat: schedule monitor runs with leases"
 
 **Interfaces:**
 - Consumes: adapters, validators, observation diff/rules, registry/runtime repositories, delivery sender.
-- Produces: async `SourceAdapter.fetch(monitor_id, spec)`, `AdapterRegistry.resolve(kind, adapter_ref)`, `DeliverySender.send(address, payload)`, `MonitorRunner.run(monitor_id)`, and `OutboxWorker.drain_once()`.
+- Produces: async `SourceAdapter.fetch(monitor_id, spec)`, `AdapterRegistry.resolve(kind, adapter_ref)`, `DeliverySender.send(address, payload)`, `OperatorHealthSink.emit_once(dedupe_key, payload)`, `RegistryRepository.get_delivery_target(target_id)`, `MonitorRunner.run(monitor_id)`, and `OutboxWorker.drain_once()`.
 
 - [ ] **Step 1: Write failing execution-boundary tests**
 
@@ -868,6 +868,10 @@ class AdapterRegistry(Protocol):
 
 class DeliverySender(Protocol):
     async def send(self, address: str, payload: dict[str, object]) -> str: ...
+
+
+class OperatorHealthSink(Protocol):
+    async def emit_once(self, dedupe_key: str, payload: dict[str, object]) -> None: ...
 
 
 class Clock(Protocol):
@@ -952,13 +956,13 @@ runtime.release_lease(
 )
 ```
 
-Map `MonitorError` to state transitions: authentication → `paused_auth`; structure/validation → `needs_review`; policy → `needs_review`; transient network → keep active and schedule retry; internal → `needs_review`. A failed run must finish its run record and release the lease. No AI type appears in the runner constructor or module imports.
+Map `MonitorError` to state transitions: authentication → `paused_auth`; structure/validation → `needs_review`; policy → `needs_review`; transient network → keep active and schedule retry; internal → `needs_review`. Persist only the closed diagnostic code derived from `ErrorClass` (`network_error`, `authentication_failed`, `structure_changed`, `validation_failed`, `policy_rejected`, `delivery_failed`, or `internal_error`); never persist `MonitorError.safe_detail`. Transient-network failures release the lease with `next_run_at=clock.now()+timedelta(minutes=5)`; every other failed run uses the next regular cron time after its status transition. A failed run must finish its run record and release the lease. No AI type appears in the runner constructor or module imports.
 
 `delivery_key()` is exact and stable: new-item events use `f"{monitor_id}:{item.item_id}:new_item"`; all other rule events append rule kind, field name, and SHA-256 of canonical previous/current values. This lets the rental importer preseed old new-item deliveries while allowing a future threshold to alert again only after a real crossing. A partial-source warning suppresses the no-change message.
 
 - [ ] **Step 5: Implement outbox retry and success ordering**
 
-`OutboxWorker` uses delays `(60, 300, 1800, 7200, 21600)` seconds. It selects pending rows whose `available_at <= now`, calls `DeliverySender.send()`, and executes `mark_delivered()` only after a message ID returns. After the fifth failed attempt it retains status `pending`, schedules the next attempt 21,600 seconds later, and emits one operator-health event per six-hour window rather than dropping the message.
+Add `RegistryRepository.get_delivery_target(target_id) -> DeliveryTargetRow`, which resolves the internal foreign-key ID and raises when absent; `OutboxWorker` uses its address and never treats `target_id` itself as a delivery address. `OutboxWorker` uses delays `(60, 300, 1800, 7200, 21600)` seconds. It selects pending rows whose `available_at <= now`, resolves the target, calls `DeliverySender.send()`, and executes `mark_delivered()` only after a message ID returns. It maps arbitrary sender exceptions to the closed `delivery_failed` storage code. After the fifth failed attempt it retains status `pending`, schedules the next attempt 21,600 seconds later, computes the UTC six-hour window start, and calls `OperatorHealthSink.emit_once()` with dedupe key `outbox-stuck:{outbox_id}:{window_start_iso}` rather than dropping the message. The sink owns persistence of that dedupe key, so restarts cannot duplicate an operator event within the window.
 
 - [ ] **Step 6: Run the engine and full suites, then commit**
 
