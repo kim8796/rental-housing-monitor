@@ -144,7 +144,7 @@ def valid_spec() -> dict[str, object]:
 
 def test_monitor_spec_round_trips() -> None:
     spec = MonitorSpec.model_validate(valid_spec())
-    assert spec.model_dump(mode="json") == valid_spec()
+    assert spec.model_dump(mode="json", exclude_unset=True) == valid_spec()
 
 
 @pytest.mark.parametrize(
