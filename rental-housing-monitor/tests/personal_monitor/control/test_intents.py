@@ -160,7 +160,10 @@ def test_malformed_and_unknown_slash_commands_clarify_without_dependencies(text:
     assert worker.calls == []
 
 
-@pytest.mark.parametrize("prefix", ["⧸", "⫽", "╱", "⁄", "∕", "／", "\u0338"])
+@pytest.mark.parametrize(
+    "prefix",
+    ["⧸", "⫽", "╱", "⁄", "∕", "／", "\u0338", "⟋", "ꜘ"],
+)
 def test_unicode_slash_lookalikes_never_reach_dependencies(prefix: str) -> None:
     router, provider, worker = _router([_result(IntentKind.LIST)])
 
@@ -379,6 +382,26 @@ def test_empty_update_is_invalid_and_retries_to_safe_fallback() -> None:
     assert len(worker.calls) == 3
 
 
+@pytest.mark.parametrize("confidence", [0.95, 0.5])
+def test_update_with_smuggled_url_is_invalid_at_every_confidence(
+    confidence: float,
+) -> None:
+    smuggled = _result(
+        IntentKind.UPDATE,
+        targets=["m1"],
+        url="https://example.com/smuggled",
+        schedule="매일",
+        confidence=confidence,
+    )
+    router, _, worker = _router([smuggled, object(), object()])
+
+    result = run(router.route(REQUEST("주기를 바꿔줘")))
+
+    assert result.kind is IntentKind.UNKNOWN
+    assert result.clarification == "요청을 이해하지 못했습니다"
+    assert len(worker.calls) == 3
+
+
 def test_cancellation_propagates_without_retry() -> None:
     router, _, worker = _router([asyncio.CancelledError(), _result(IntentKind.LIST)])
 
@@ -442,7 +465,6 @@ def test_semantically_conflicting_results_never_pass_as_actions(output: IntentRe
         "https://..",
         "https://.example.com",
         "https://example..com",
-        "https://example.com.",
         "https://example.com:",
         "https://example.com:abc/path",
         "https://example.com:+80/path",
@@ -470,6 +492,7 @@ def test_malformed_create_urls_are_invalid_and_retry(url: str) -> None:
     [
         "https://example.com/path?x=1",
         "https://예시.한국/상품",
+        "https://example.com./path",
         "http://192.0.2.1:8080/path",
         "https://[2001:db8::1]:443/path",
     ],

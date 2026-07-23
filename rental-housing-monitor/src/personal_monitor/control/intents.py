@@ -291,10 +291,7 @@ def _looks_like_command(value: object) -> bool:
     if normalized.startswith("/"):
         return True
     name = unicodedata.name(prefix, "")
-    category = unicodedata.category(prefix)
-    return (category[0] in {"M", "P", "S"} and ("SLASH" in name or "SOLIDUS" in name)) or (
-        category == "So" and "BOX DRAWINGS" in name and "DIAGONAL" in name
-    )
+    return any(token in name for token in ("SLASH", "SOLIDUS", "DIAGONAL"))
 
 
 def _action(
@@ -390,10 +387,10 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
     semantically_valid = True
     if value.kind is IntentKind.CREATE:
         semantically_valid = _safe_http_url(value.target_url)
-    elif value.kind is IntentKind.UPDATE:
-        semantically_valid = value.condition_text is not None or value.schedule_text is not None
     elif value.target_url is not None:
         semantically_valid = False
+    elif value.kind is IntentKind.UPDATE:
+        semantically_valid = value.condition_text is not None or value.schedule_text is not None
     elif value.kind is IntentKind.LIST or value.kind in {
         IntentKind.PAUSE,
         IntentKind.RESUME,
@@ -425,8 +422,12 @@ def _safe_http_url(value: object) -> bool:
         if hostname is None:
             return False
         dotted_hostname = hostname.translate(str.maketrans({"。": ".", "．": ".", "｡": "."}))
-        if ":" not in dotted_hostname and any(not label for label in dotted_hostname.split(".")):
-            return False
+        if ":" not in dotted_hostname:
+            labels = dotted_hostname.split(".")
+            if labels[-1] == "":
+                labels = labels[:-1]
+            if not labels or any(not label for label in labels):
+                return False
         canonicalize_hostname(hostname)
         return (
             parsed.scheme.casefold() in {"http", "https"}
