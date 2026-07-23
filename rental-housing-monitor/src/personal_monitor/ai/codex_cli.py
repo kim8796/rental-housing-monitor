@@ -5,7 +5,6 @@ import inspect
 import json
 import math
 import os
-import re
 import shutil
 import stat
 import tempfile
@@ -15,6 +14,8 @@ from pathlib import Path
 from typing import Final
 
 from pydantic import ValidationError
+
+from personal_monitor.security.secret_text import contains_sensitive_text
 
 from .auth import CodexAuthError, CodexAuthGuard, _safe_directory, _stop_process
 from .contracts import (
@@ -45,18 +46,6 @@ _ALLOWED_MODELS: Final = {
     ("gpt-5.6-sol", "high"),
 }
 _ALLOWED_ITEM_TYPES: Final = {"agent_message", "reasoning"}
-_SECRET_PATTERNS: Final = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"),
-    re.compile(r"\b(?:authorization|cookie|set-cookie)\s*[:=]\s*\S+", re.IGNORECASE),
-    re.compile(r"\b(?:session|sessionid|access_token|api_key)\s*=\s*\S+", re.IGNORECASE),
-    re.compile(
-        r"^(?:authorization|cookie|set-cookie|session|sessionid|access_token|api_key)$",
-        re.IGNORECASE,
-    ),
-)
-
 ProcessFactory = Callable[..., Awaitable[object]]
 
 
@@ -347,7 +336,7 @@ def _scan_secrets(value: object) -> None:
         elif type(current) in {list, tuple}:
             stack.extend(current)
         elif isinstance(current, str):
-            if any(pattern.search(current) for pattern in _SECRET_PATTERNS):
+            if contains_sensitive_text(current):
                 raise CodexProtocolError
         elif current is not None and type(current) not in {bool, int, float}:
             raise CodexProtocolError

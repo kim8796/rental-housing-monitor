@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
@@ -10,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
+import personal_monitor.control.planner as planner_module
 from personal_monitor.ai.contracts import IntentKind, IntentResult, PlanRequest, PlanResult
 from personal_monitor.ai.worker import CodexWorkerError
 from personal_monitor.control.actions import ActionDenied, ConsumedAction, PendingActionService
@@ -236,6 +238,32 @@ def run(value: object) -> Any:
 
 def pending_count(connection: sqlite3.Connection) -> int:
     return connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0]
+
+
+def mutate_planner_local(name: str, mutation: object) -> None:
+    frame = inspect.currentframe()
+    try:
+        frame = None if frame is None else frame.f_back
+        while frame is not None:
+            value = frame.f_locals.get(name)
+            if value is not None:
+                mutation(value)  # type: ignore[operator]
+                return
+            frame = frame.f_back
+    finally:
+        del frame
+
+
+class MutatingIdSource:
+    def __init__(self, mutation: object) -> None:
+        self.count = 0
+        self.mutation = mutation
+
+    def __call__(self) -> str:
+        self.count += 1
+        if self.count == 2:
+            self.mutation()  # type: ignore[operator]
+        return f"{self.count:032x}"
 
 
 def test_policy_precedes_single_probe_and_closed_attempt_sequence(
@@ -739,6 +767,56 @@ def test_worker_projection_removes_original_url_all_query_values_and_profile(
     assert consumed.payload["spec"]["auth_profile_ref"] == profile  # type: ignore[index]
 
 
+def test_ordinary_short_query_values_do_not_collide_with_application_metadata(
+    connection: sqlite3.Connection,
+) -> None:
+    original = f"{TARGET_URL}?page=7&rank=1&mode=create&scheme=http"
+    safe = projected_url(original)
+    worker = FakeWorker([plan(spec(url=safe))])
+    value = MonitorPlanner(
+        FakePolicy(target(original)),
+        FakeProbe(
+            probe_result(
+                value=target(original),
+                source=document(final_url=original),
+            )
+        ),
+        worker,
+        PendingActionService(connection),
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+    )
+
+    proposal = run(
+        value.propose(
+            request(f"{original} 상품 7개를 모니터해줘"),
+            intent(original),
+        )
+    )
+
+    sent = worker.calls[0][0]
+    assert original not in sent.message
+    assert "?page=7" not in sent.message
+    assert "상품 7개" in sent.message
+    assert sent.owner_id == OWNER
+    assert sent.intent.target_url == safe
+    assert proposal.spec.target_url == original
+    assert pending_count(connection) == 1
+
+
+def test_broad_jwt_is_redacted_from_worker_sanitized_document(
+    connection: sqlite3.Connection,
+) -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.YWJjZGVm.signature"
+    body = f"<main><h1>{jwt}</h1><span class='price'>99,000원</span></main>".encode()
+    page_probe = FakeProbe(probe_result(source=document(body=body)))
+    value, _, _, worker = planner(connection, [plan()], probe=page_probe)
+
+    run(value.propose(request(), intent()))
+
+    assert jwt not in worker.calls[0][0].sanitized_document
+
+
 def test_sanitizer_that_retains_established_query_secret_fails_before_worker(
     connection: sqlite3.Connection,
 ) -> None:
@@ -763,6 +841,105 @@ def test_sanitizer_that_retains_established_query_secret_fails_before_worker(
         run(value.propose(request(original), intent(original)))
 
     assert worker.calls == []
+    assert pending_count(connection) == 0
+
+
+def test_id_callback_mutating_source_strategy_never_leaves_orphan_action(
+    connection: sqlite3.Connection,
+) -> None:
+    ids = MutatingIdSource(
+        lambda: mutate_planner_local(
+            "probe",
+            lambda value: object.__setattr__(
+                value.document,
+                "strategy",
+                FetchStrategy.AUTO,
+            ),
+        )
+    )
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        FakeWorker([plan()]),
+        PendingActionService(connection),
+        id_source=ids,
+        now_source=lambda: NOW,
+    )
+
+    with pytest.raises(PlanningFailed):
+        run(value.propose(request(), intent()))
+
+    assert pending_count(connection) == 0
+
+
+def test_id_callback_mutating_local_spec_never_leaves_orphan_action(
+    connection: sqlite3.Connection,
+) -> None:
+    ids = MutatingIdSource(
+        lambda: mutate_planner_local(
+            "spec",
+            lambda value: object.__setattr__(value.extract, "item_scope", "bad;selector"),
+        )
+    )
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        FakeWorker([plan()]),
+        PendingActionService(connection),
+        id_source=ids,
+        now_source=lambda: NOW,
+    )
+
+    with pytest.raises(PlanningFailed):
+        run(value.propose(request(), intent()))
+
+    assert pending_count(connection) == 0
+
+
+def test_clock_callback_mutating_local_spec_never_leaves_orphan_action(
+    connection: sqlite3.Connection,
+) -> None:
+    def mutating_clock() -> datetime:
+        mutate_planner_local(
+            "spec",
+            lambda value: object.__setattr__(value.extract, "item_scope", "bad;selector"),
+        )
+        return NOW
+
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        FakeWorker([plan()]),
+        PendingActionService(connection),
+        id_source=IdSource(),
+        now_source=mutating_clock,
+    )
+
+    with pytest.raises(PlanningFailed):
+        run(value.propose(request(), intent()))
+
+    assert pending_count(connection) == 0
+
+
+def test_post_insert_proposal_validation_failure_is_atomically_rolled_back(
+    connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = planner_module._valid_proposal
+    calls = 0
+
+    def reject_once_after_insert(value: object) -> bool:
+        nonlocal calls
+        calls += 1
+        return False if calls == 1 else original(value)
+
+    monkeypatch.setattr(planner_module, "_valid_proposal", reject_once_after_insert)
+    value, _, _, _ = planner(connection, [plan()])
+
+    with pytest.raises(PlanningFailed):
+        run(value.propose(request(), intent()))
+
+    assert calls == 1
     assert pending_count(connection) == 0
 
 

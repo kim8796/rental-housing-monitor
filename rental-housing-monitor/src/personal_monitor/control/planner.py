@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import ipaddress
+import json
 import math
 import re
 import secrets
@@ -13,7 +14,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import Final
+from typing import Final, NamedTuple
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from personal_monitor.ai.contracts import IntentKind, IntentResult, PlanRequest, PlanResult
@@ -33,12 +34,13 @@ from personal_monitor.scraping.extractor import DeclarativeExtractor
 from personal_monitor.scraping.validator import ObservationValidator
 from personal_monitor.security.robots import RobotsDecision
 from personal_monitor.security.sanitize import sanitize_for_ai
+from personal_monitor.security.secret_text import contains_sensitive_text, redact_sensitive_text
 from personal_monitor.security.url_policy import (
     ResolvedTarget,
     canonicalize_hostname,
     is_public_address,
 )
-from personal_monitor.storage.schema import canonical_json
+from personal_monitor.storage.schema import canonical_json, transaction
 from personal_monitor.telegram.gateway import ControlRequest
 
 _ATTEMPTS: Final = (
@@ -61,15 +63,6 @@ _FEEDBACK_SCHEMA: Final = "candidate_schema_invalid"
 _FEEDBACK_BINDING: Final = "candidate_binding_invalid"
 _FEEDBACK_EXTRACT: Final = "candidate_extract_invalid"
 _FEEDBACK_WORKER: Final = "worker_unavailable"
-_SENSITIVE_ASSIGNMENT_RE: Final = re.compile(
-    r"(?:authorization|bearer|cookie|set-cookie|session(?:id)?|access[_-]?token|"
-    r"api[_-]?key|client[_-]?secret|credential|passwd|password|secret|token)"
-    r"\s*[:=]",
-    re.IGNORECASE,
-)
-_BEARER_RE: Final = re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
-_JWT_RE: Final = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")
-_SK_TOKEN_RE: Final = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
 _CREDENTIAL_QUERY_NAMES: Final = frozenset(
     {
         *SENSITIVE_QUERY_PARAMETER_NAMES,
@@ -156,6 +149,16 @@ class _Dependency:
     owner: object | None
     name: str | None
     call: object
+
+
+class _ProposalSnapshot(NamedTuple):
+    spec_json: str
+    items_json: str
+    probe_json: str
+    document_body: bytes
+
+    def __repr__(self) -> str:
+        return "<_ProposalSnapshot redacted>"
 
 
 class MonitorPlanner:
@@ -384,8 +387,10 @@ class MonitorPlanner:
                 allow_empty=True,
                 allow_layout_controls=True,
             )
-            or not _worker_text_is_clean(sanitized, secrets_to_remove)
         ):
+            raise PlanningFailed
+        sanitized = redact_sensitive_text(sanitized)
+        if not _worker_text_is_clean(sanitized, secrets_to_remove):
             raise PlanningFailed
         return sanitized
 
@@ -519,64 +524,95 @@ class MonitorPlanner:
         items: tuple[ObservedItem, ...],
         probe: ProbeResult,
     ) -> ProposedMonitor:
+        snapshot = _capture_proposal_snapshot(spec, items, probe)
+        if snapshot is None:
+            raise PlanningFailed
         candidate_version_id = self._new_id()
-        spec_json = spec.model_dump(mode="json")
+        if not _dependency_intact(self._now_source, self._now_source_anchor):
+            raise PlanningFailed
+        now: datetime | None = None
+        try:
+            now = _fresh_action_time(self._now_source_anchor.call())
+        except Exception:
+            now = None
+        if now is None or not self._all_dependencies_intact():
+            raise PlanningFailed
+        rebuilt = _rebuild_proposal_inputs(
+            snapshot,
+            live_spec=spec,
+            live_items=items,
+            live_probe=probe,
+        )
+        if rebuilt is None:
+            raise PlanningFailed
+        fresh_spec, fresh_items, fresh_probe = rebuilt
+        spec_json = fresh_spec.model_dump(mode="json")
         digest = hashlib.sha256(canonical_json(spec_json).encode("utf-8")).hexdigest()
         previews: tuple[PreviewItem, ...] | None = None
         with suppress(Exception):
-            previews = tuple(_preview_item(item, spec) for item in items[:3])
-        if previews is None or not _valid_previews(previews, spec):
+            previews = tuple(_preview_item(item, fresh_spec) for item in fresh_items[:3])
+        if previews is None or not _valid_previews(previews, fresh_spec):
             raise PlanningFailed
         payload = {
             "candidate_version_id": candidate_version_id,
             "spec_hash": digest,
-            "binding_hash": _proposal_binding(spec.owner_id, candidate_version_id, digest),
+            "binding_hash": _proposal_binding(
+                fresh_spec.owner_id,
+                candidate_version_id,
+                digest,
+            ),
             "spec": spec_json,
         }
         runtime_material = _runtime_material(
-            spec.owner_id,
+            fresh_spec.owner_id,
             candidate_version_id,
             digest,
             previews,
-            probe.document.strategy,
-            probe.robots,
-            probe.warnings,
+            fresh_probe.document.strategy,
+            fresh_probe.robots,
+            fresh_probe.warnings,
             _SAFE_EXPLANATION,
         )
-        if not self._all_dependencies_intact() or not _dependency_intact(
-            self._now_source, self._now_source_anchor
-        ):
+        action_input = _fresh_action_input(payload)
+        if action_input is None:
             raise PlanningFailed
-        now: datetime | None = None
+        actions = self._actions_anchor.root
+        if type(actions) is not PendingActionService:
+            raise PlanningFailed
         pending: object | None = None
-        failed = False
+        proposal: ProposedMonitor | None = None
         try:
-            now = _fresh_action_time(self._now_source_anchor.call())
-            if now is None:
-                raise ValueError
-            pending = self._actions_anchor.call(
-                spec.owner_id,
-                "create",
-                payload,
-                now=now,
-            )
+            with transaction(actions.connection):
+                pending = self._actions_anchor.call(
+                    fresh_spec.owner_id,
+                    "create",
+                    action_input,
+                    now=now,
+                )
+                if type(pending) is not PendingAction:
+                    raise ValueError
+                proposal = ProposedMonitor(
+                    spec=fresh_spec,
+                    preview_items=previews,
+                    resolved_strategy=fresh_probe.document.strategy,
+                    robots=fresh_probe.robots,
+                    warnings=fresh_probe.warnings,
+                    explanation=_SAFE_EXPLANATION,
+                    candidate_version_id=candidate_version_id,
+                    spec_hash=digest,
+                    pending_action=pending,
+                    _runtime_binding_hash=_complete_runtime_binding(
+                        runtime_material,
+                        pending,
+                    ),
+                )
+                if not _valid_proposal(proposal):
+                    raise ValueError
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            failed = True
-        if failed or type(pending) is not PendingAction:
-            raise PlanningFailed
-        proposal = ProposedMonitor(
-            spec=spec,
-            preview_items=previews,
-            resolved_strategy=probe.document.strategy,
-            robots=probe.robots,
-            warnings=probe.warnings,
-            explanation=_SAFE_EXPLANATION,
-            candidate_version_id=candidate_version_id,
-            spec_hash=digest,
-            pending_action=pending,
-            _runtime_binding_hash=_complete_runtime_binding(runtime_material, pending),
-        )
-        if not _valid_proposal(proposal):
+            raise PlanningFailed from None
+        if proposal is None:
             raise PlanningFailed
         return proposal
 
@@ -722,16 +758,30 @@ def _project_worker_input(
         secrets_to_remove: list[str] = []
         if parts.query:
             secrets_to_remove.append(original_url)
+            secrets_to_remove.append(parts.query)
         for name, value in parse_qsl(parts.query, keep_blank_values=True):
-            if value:
-                secrets_to_remove.append(value)
+            pair = f"{name}={value}"
+            if pair != "=":
+                secrets_to_remove.append(pair)
             normalized_name = name.casefold()
-            if normalized_name in _CREDENTIAL_QUERY_NAMES or normalized_name.startswith("x-amz-"):
+            credential_name = (
+                normalized_name in _CREDENTIAL_QUERY_NAMES or normalized_name.startswith("x-amz-")
+            )
+            if value and (credential_name or len(value) >= 8):
+                secrets_to_remove.append(value)
+            if credential_name:
                 secrets_to_remove.append(name)
         for pair in parts.query.split("&"):
+            if pair:
+                secrets_to_remove.append(pair)
             if "=" in pair:
-                _, raw_value = pair.split("=", 1)
-                if raw_value:
+                raw_name, raw_value = pair.split("=", 1)
+                normalized_raw_name = raw_name.casefold()
+                if raw_value and (
+                    len(raw_value) >= 8
+                    or normalized_raw_name in _CREDENTIAL_QUERY_NAMES
+                    or normalized_raw_name.startswith("x-amz-")
+                ):
                     secrets_to_remove.append(raw_value)
         if probe.auth_profile_ref is not None:
             secrets_to_remove.append(probe.auth_profile_ref)
@@ -794,8 +844,7 @@ def _project_text(
     projected = value.replace(original_url, safe_url)
     for secret in forbidden:
         projected = projected.replace(secret, "[숨김]")
-    if _contains_established_secret(projected):
-        return "[숨김]"
+    projected = redact_sensitive_text(projected)
     if not _safe_unicode(projected, max_chars=2_000):
         raise ValueError
     return projected
@@ -803,9 +852,39 @@ def _project_text(
 
 def _worker_request_is_clean(value: PlanRequest, forbidden: tuple[str, ...]) -> bool:
     try:
-        return all(
-            _worker_text_is_clean(item, forbidden)
-            for item in _nested_strings(value.model_dump(mode="python"))
+        intent = value.intent
+        target_url = intent.target_url
+        surfaces = (
+            value.message,
+            value.sanitized_document,
+            intent.condition_text,
+            intent.schedule_text,
+        )
+        return (
+            type(value) is PlanRequest
+            and _OPAQUE_ID_RE.fullmatch(value.request_id) is not None
+            and _OWNER_RE.fullmatch(value.owner_id) is not None
+            and intent.kind is IntentKind.CREATE
+            and intent.target_monitor_ids == []
+            and type(target_url) is str
+            and _safe_web_url(target_url)
+            and not urlsplit(target_url).query
+            and not urlsplit(target_url).fragment
+            and _worker_text_is_clean(target_url, ())
+            and all(
+                item is None or (type(item) is str and _worker_text_is_clean(item, forbidden))
+                for item in surfaces
+            )
+            and all(
+                item
+                in {
+                    _FEEDBACK_SCHEMA,
+                    _FEEDBACK_BINDING,
+                    _FEEDBACK_EXTRACT,
+                    _FEEDBACK_WORKER,
+                }
+                for item in value.observed_preview_values
+            )
         )
     except Exception:
         return False
@@ -822,7 +901,7 @@ def _nested_strings(value: object) -> tuple[str, ...]:
 def _worker_text_is_clean(value: str, forbidden: tuple[str, ...]) -> bool:
     try:
         folded = value.casefold()
-        return not _contains_established_secret(value) and all(
+        return not contains_sensitive_text(value) and all(
             secret.casefold() not in folded for secret in forbidden
         )
     except Exception:
@@ -838,18 +917,6 @@ def _contains_forbidden_value(value: object, forbidden: tuple[str, ...]) -> bool
         )
     except Exception:
         return True
-
-
-def _contains_established_secret(value: str) -> bool:
-    return any(
-        pattern.search(value) is not None
-        for pattern in (
-            _SENSITIVE_ASSIGNMENT_RE,
-            _BEARER_RE,
-            _JWT_RE,
-            _SK_TOKEN_RE,
-        )
-    )
 
 
 def _bind_application_spec(
@@ -906,6 +973,182 @@ def _fresh_observations(
             spec.extract,
             spec.validators,
         )
+    return result
+
+
+def _capture_proposal_snapshot(
+    spec: MonitorSpec,
+    items: tuple[ObservedItem, ...],
+    probe: ProbeResult,
+) -> _ProposalSnapshot | None:
+    result: _ProposalSnapshot | None = None
+    with suppress(Exception):
+        if (
+            type(spec) is not MonitorSpec
+            or type(items) is not tuple
+            or type(probe) is not ProbeResult
+            or type(probe.document.body) is not bytes
+        ):
+            raise TypeError
+        result = _ProposalSnapshot(
+            spec_json=canonical_json(spec.model_dump(mode="json")),
+            items_json=canonical_json(
+                [
+                    {"item_id": item.item_id, "fields": dict(item.fields)}
+                    for item in items
+                    if type(item) is ObservedItem
+                ]
+            ),
+            probe_json=canonical_json(_probe_primitives(probe)),
+            document_body=bytes(probe.document.body),
+        )
+        if len(json.loads(result.items_json)) != len(items):
+            raise ValueError
+    return result
+
+
+def _probe_primitives(probe: ProbeResult) -> dict[str, object]:
+    return {
+        "target": {
+            "normalized_url": probe.target.normalized_url,
+            "hostname": probe.target.hostname,
+            "port": probe.target.port,
+            "addresses": sorted(probe.target.addresses),
+        },
+        "document": {
+            "final_url": probe.document.final_url,
+            "status": probe.document.status,
+            "content_type": probe.document.content_type,
+            "headers": dict(probe.document.headers),
+            "body_hash": hashlib.sha256(probe.document.body).hexdigest(),
+            "strategy": probe.document.strategy.value,
+            "redirect_urls": list(probe.document.redirect_urls),
+            "redirect_location": probe.document.redirect_location,
+            "peer_ip": probe.document.peer_ip,
+        },
+        "robots": {
+            "allowed": probe.robots.allowed,
+            "crawl_delay_seconds": probe.robots.crawl_delay_seconds,
+            "checked_at": probe.robots.checked_at.isoformat(),
+            "policy_fetched": probe.robots.policy_fetched,
+        },
+        "auth_profile_ref": probe.auth_profile_ref,
+        "warnings": list(probe.warnings),
+    }
+
+
+def _rebuild_proposal_inputs(
+    snapshot: _ProposalSnapshot,
+    *,
+    live_spec: MonitorSpec,
+    live_items: tuple[ObservedItem, ...],
+    live_probe: ProbeResult,
+) -> tuple[MonitorSpec, tuple[ObservedItem, ...], ProbeResult] | None:
+    result: tuple[MonitorSpec, tuple[ObservedItem, ...], ProbeResult] | None = None
+    with suppress(Exception):
+        if _capture_proposal_snapshot(live_spec, live_items, live_probe) != snapshot:
+            raise ValueError
+        spec_payload = json.loads(snapshot.spec_json)
+        fresh_spec = MonitorSpec.model_validate(spec_payload)
+        if canonical_json(fresh_spec.model_dump(mode="json")) != snapshot.spec_json:
+            raise ValueError
+
+        item_payload = json.loads(snapshot.items_json)
+        if type(item_payload) is not list:
+            raise TypeError
+        copied_items: list[ObservedItem] = []
+        for item in item_payload:
+            if (
+                type(item) is not dict
+                or set(item) != {"item_id", "fields"}
+                or type(item["item_id"]) is not str
+                or type(item["fields"]) is not dict
+            ):
+                raise TypeError
+            copied_items.append(ObservedItem(item["item_id"], item["fields"]))
+        fresh_items = _fresh_observations(tuple(copied_items), fresh_spec)
+        if fresh_items is None:
+            raise ValueError
+
+        probe_payload = json.loads(snapshot.probe_json)
+        fresh_probe = _probe_from_primitives(
+            probe_payload,
+            snapshot.document_body,
+            owner_id=fresh_spec.owner_id,
+        )
+        if (
+            fresh_probe is None
+            or fresh_probe.target.normalized_url != fresh_spec.target_url
+            or canonical_json(_probe_primitives(fresh_probe)) != snapshot.probe_json
+        ):
+            raise ValueError
+        result = fresh_spec, fresh_items, fresh_probe
+    return result
+
+
+def _probe_from_primitives(
+    value: object,
+    body: bytes,
+    *,
+    owner_id: str,
+) -> ProbeResult | None:
+    result: ProbeResult | None = None
+    with suppress(Exception):
+        if type(value) is not dict:
+            raise TypeError
+        target_value = value["target"]
+        document_value = value["document"]
+        robots_value = value["robots"]
+        if (
+            type(target_value) is not dict
+            or type(document_value) is not dict
+            or type(robots_value) is not dict
+            or type(body) is not bytes
+            or hashlib.sha256(body).hexdigest() != document_value["body_hash"]
+        ):
+            raise TypeError
+        target = ResolvedTarget(
+            normalized_url=target_value["normalized_url"],
+            hostname=target_value["hostname"],
+            port=target_value["port"],
+            addresses=frozenset(target_value["addresses"]),
+        )
+        document = SourceDocument(
+            final_url=document_value["final_url"],
+            status=document_value["status"],
+            content_type=document_value["content_type"],
+            headers=document_value["headers"],
+            body=body,
+            strategy=FetchStrategy(document_value["strategy"]),
+            redirect_urls=tuple(document_value["redirect_urls"]),
+            redirect_location=document_value["redirect_location"],
+            peer_ip=document_value["peer_ip"],
+        )
+        robots = RobotsDecision(
+            allowed=robots_value["allowed"],
+            crawl_delay_seconds=robots_value["crawl_delay_seconds"],
+            checked_at=datetime.fromisoformat(robots_value["checked_at"]),
+            policy_fetched=robots_value["policy_fetched"],
+        )
+        raw = ProbeResult(
+            target=target,
+            document=document,
+            robots=robots,
+            auth_profile_ref=value["auth_profile_ref"],
+            warnings=tuple(value["warnings"]),
+        )
+        result = _fresh_probe(raw, owner_id=owner_id, target=target)
+    return result
+
+
+def _fresh_action_input(value: object) -> dict[str, object] | None:
+    result: dict[str, object] | None = None
+    with suppress(Exception):
+        canonical = canonical_json(value)
+        rebuilt = json.loads(canonical)
+        if type(rebuilt) is not dict or canonical_json(rebuilt) != canonical:
+            raise TypeError
+        result = rebuilt
     return result
 
 

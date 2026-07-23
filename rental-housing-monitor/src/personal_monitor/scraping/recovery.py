@@ -24,6 +24,7 @@ from personal_monitor.scraping.extractor import DeclarativeExtractor, _scope_xpa
 from personal_monitor.scraping.validator import ObservationValidator
 from personal_monitor.security.encryption import AesGcmCipher, EncryptedBlob
 from personal_monitor.security.sanitize import sanitize_for_ai
+from personal_monitor.security.secret_text import contains_sensitive_text
 from personal_monitor.security.url_policy import UrlPolicy
 from personal_monitor.storage.recovery import RecoveryRepository
 from personal_monitor.storage.registry import ActiveMonitor, RegistryRepository
@@ -40,11 +41,6 @@ _HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 _ADAPTIVE_FAILURES = frozenset({ErrorClass.STRUCTURE, ErrorClass.VALIDATION})
 _SENSITIVE_FIELD = re.compile(
     r"(?:auth|cookie|credential|key|pass(?:word|wd)?|secret|session|token)", re.IGNORECASE
-)
-_CREDENTIAL_TEXT = re.compile(
-    r"\b(?:access[_-]?token|api[_-]?key|authorization|cookie|credential|passwd|password|"
-    r"secret|session(?:id)?|token)\s*[=:]",
-    re.IGNORECASE,
 )
 _SAFE_SELECTOR_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 
@@ -670,7 +666,7 @@ def _unsafe_items(items: Sequence[ObservedItem], secrets: tuple[str, ...]) -> bo
 
 
 def _unsafe_text(value: str, secrets: tuple[str, ...]) -> bool:
-    if any(secret in value for secret in secrets) or _CREDENTIAL_TEXT.search(value):
+    if any(secret in value for secret in secrets) or contains_sensitive_text(value):
         return True
     normalized = value.casefold()
     if not normalized.startswith(("http://", "https://")):

@@ -313,6 +313,7 @@ async def test_invalid_stream_is_fixed(tmp_path: Path, stdout: bytes) -> None:
         "sk-abcdefghijklmnopqrstuvwxyz123456",
         "Bearer abcdefghijklmnopqrstuvwxyz",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signaturevalue",
+        "eyJhbGciOiJIUzI1NiJ9.YWJjZGVm.signature",
         "Cookie: session=abcdefghijklmnop",
         "Authorization: private-value",
     ],

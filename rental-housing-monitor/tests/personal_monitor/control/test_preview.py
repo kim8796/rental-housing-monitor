@@ -329,6 +329,7 @@ def test_preview_callback_shapes_and_total_output_are_bounded(
     [
         "Bearer abcdefghijklmnop",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature",
+        "eyJhbGciOiJIUzI1NiJ9.YWJjZGVm.signature",
         "sk-privateOpenAIKey123456",
         "authorization: private-auth-value",
         "Cookie=session-private-value",
@@ -372,6 +373,30 @@ def test_planner_integrated_observed_jwt_is_hidden_from_preview(
 
     assert jwt not in preview.text
     assert "[숨김]" in preview.text
+
+
+def test_broad_jwt_is_hidden_from_every_rendered_preview_value(
+    connection: sqlite3.Connection,
+) -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.YWJjZGVm.signature"
+    body = f"<main><h1>{jwt}</h1><span class='price'>99,000원</span></main>".encode()
+    candidate = MonitorSpec.model_validate(
+        {
+            **spec().model_dump(mode="json"),
+            "name": jwt,
+        }
+    )
+    value = _custom_proposal(
+        connection,
+        candidate,
+        document(body=body),
+        sanitizer=lambda _html, *, secret_values: "<main>safe projection</main>",
+    )
+
+    preview = render_preview(value)
+
+    assert jwt not in preview.text
+    assert preview.text.count("[숨김]") >= 2
 
 
 @pytest.mark.parametrize(

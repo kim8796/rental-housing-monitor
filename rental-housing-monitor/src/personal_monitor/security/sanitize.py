@@ -7,6 +7,8 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
+from personal_monitor.security.secret_text import contains_sensitive_text
+
 MAX_SANITIZED_CHARACTERS = 40_000
 _ACTIVE_TAGS = frozenset({"script", "style", "noscript", "template"})
 _FORM_CONTROLS = frozenset({"button", "datalist", "input", "option", "select", "textarea"})
@@ -15,11 +17,6 @@ _CSS_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.DOTALL)
 _HIDDEN_STYLE = re.compile(
     r"(?:\A|;)display:none(?:!important)?(?:;|\Z)"
     r"|(?:\A|;)visibility:(?:hidden|collapse)(?:!important)?(?:;|\Z)"
-)
-_CREDENTIAL_TEXT = re.compile(
-    r"(?:\bcookie\s*:|\b(?:access[_-]?token|api[_-]?key|authorization|bearer|"
-    r"client[_-]?secret|credential|passwd|password|secret|session(?:id)?|token)\s*[=:])",
-    re.IGNORECASE,
 )
 _VALID_PERCENT = re.compile(r"%(?:[0-9A-Fa-f]{2})")
 _MAX_SERIALIZATION_DEPTH = 128
@@ -74,7 +71,7 @@ def sanitize_for_ai(html: str, *, secret_values: Iterable[str] = ()) -> str:
     for text in list(soup.find_all(string=True)):
         if not isinstance(text, NavigableString):
             continue
-        if _CREDENTIAL_TEXT.search(str(text)):
+        if contains_sensitive_text(str(text)):
             text.extract()
             continue
         sanitized_text = _remove_secrets(str(text), secrets)
