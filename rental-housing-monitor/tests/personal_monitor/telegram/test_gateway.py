@@ -43,6 +43,19 @@ class FakeRouter:
             raise self.error
 
 
+class CountingProtocolBoundary:
+    def __init__(self, attribute: str) -> None:
+        self.attribute = attribute
+        self.accesses = 0
+        self.call = AsyncMock()
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        if name != self.attribute:
+            raise AttributeError(name)
+        self.accesses += 1
+        return self.call
+
+
 def _connection(path: str | Path = ":memory:") -> sqlite3.Connection:
     connection = open_database(path)
     connection.execute(
@@ -465,21 +478,8 @@ def test_unauthorized_and_unsupported_updates_do_not_retrieve_protocol_callables
     gateway_parts,
 ) -> None:
     _, _, _, actions, _ = gateway_parts
-
-    class CountingBoundary:
-        def __init__(self, attribute: str) -> None:
-            self.attribute = attribute
-            self.accesses = 0
-            self.call = AsyncMock()
-
-        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
-            if name != self.attribute:
-                raise AttributeError(name)
-            self.accesses += 1
-            return self.call
-
-    router = CountingBoundary("route")
-    api = CountingBoundary("answer_callback")
+    router = CountingProtocolBoundary("route")
+    api = CountingProtocolBoundary("answer_callback")
     gateway = TelegramGateway(7, 42, router, actions, api)
     assert (router.accesses, api.accesses) == (1, 1)
 
@@ -489,6 +489,66 @@ def test_unauthorized_and_unsupported_updates_do_not_retrieve_protocol_callables
     assert (router.accesses, api.accesses) == (1, 1)
     assert router.call.await_count == 0
     assert api.call.await_count == 0
+
+
+@pytest.mark.parametrize("field", ["_allowed_user_id", "_command_chat_id"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "hostile_current",
+        "hostile_anchor",
+        "wrong_type_current",
+        "wrong_type_anchor",
+        "replace_current",
+        "replace_anchor",
+        "delete_current",
+        "delete_anchor",
+    ],
+)
+def test_corrupt_config_drops_all_updates_before_authorization_or_protocol_access(
+    gateway_parts,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    mutation: str,
+) -> None:
+    _, _, _, actions, connection = gateway_parts
+    router = CountingProtocolBoundary("route")
+    api = CountingProtocolBoundary("answer_callback")
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    assert (router.accesses, api.accesses) == (1, 1)
+
+    class HostileEquality:
+        def __eq__(self, _other: object) -> bool:
+            raise RuntimeError("private-config-equality-secret")
+
+    anchor_field = f"{field}_anchor"
+    target = anchor_field if mutation.endswith("anchor") else field
+    if mutation.startswith("hostile"):
+        object.__setattr__(gateway, target, HostileEquality())
+    elif mutation.startswith("wrong_type"):
+        object.__setattr__(gateway, target, True)
+    elif mutation.startswith("replace"):
+        object.__setattr__(gateway, target, 8)
+    else:
+        object.__delattr__(gateway, target)
+
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    with caplog.at_level(logging.WARNING):
+        for update in (
+            _message(user_id=7),
+            _message(user_id=999),
+            _callback("confirm:" + "x" * 32, user_id=7),
+            _callback("confirm:" + "x" * 32, user_id=999),
+        ):
+            run(gateway.handle_update(update, now=NOW))
+    connection.set_trace_callback(None)
+
+    assert (router.accesses, api.accesses) == (1, 1)
+    assert router.call.await_count == 0
+    assert api.call.await_count == 0
+    assert not any("pending_actions" in statement for statement in statements)
+    assert caplog.text == ""
 
 
 @pytest.mark.parametrize("boundary", ["router", "api"])

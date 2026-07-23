@@ -126,6 +126,8 @@ class TelegramGateway:
             message = update.message
             if type(message) is not TelegramMessage:
                 return
+            if not self._config_integrity_ok():
+                return
             if not self._authorized(message.from_user_id, message.chat_id):
                 return
             try:
@@ -142,10 +144,12 @@ class TelegramGateway:
             return
 
         callback = update.callback_query
+        if callback is None or type(callback) is not CallbackQuery:
+            return
+        if not self._config_integrity_ok():
+            return
         if (
-            callback is None
-            or type(callback) is not CallbackQuery
-            or not self._authorized(callback.from_user_id, callback.chat_id)
+            not self._authorized(callback.from_user_id, callback.chat_id)
             or not _valid_callback_id(callback.id)
             or not _valid_identifier(callback.message_id)
         ):
@@ -187,6 +191,31 @@ class TelegramGateway:
         safe_user_id = user_id if _valid_log_identifier(user_id) else 0
         _LOGGER.warning("unauthorized_telegram_user_id=%d", safe_user_id)
         return False
+
+    def _config_integrity_ok(self) -> bool:
+        try:
+            allowed_user_id = self._allowed_user_id
+            allowed_user_id_anchor = self._allowed_user_id_anchor
+            command_chat_id = self._command_chat_id
+            command_chat_id_anchor = self._command_chat_id_anchor
+            if not all(
+                type(value) is int
+                for value in (
+                    allowed_user_id,
+                    allowed_user_id_anchor,
+                    command_chat_id,
+                    command_chat_id_anchor,
+                )
+            ):
+                return False
+            if (
+                allowed_user_id is not allowed_user_id_anchor
+                or command_chat_id is not command_chat_id_anchor
+            ):
+                return False
+            return _valid_identifier(allowed_user_id) and _valid_identifier(command_chat_id)
+        except Exception:
+            return False
 
     def _integrity_ok(self) -> bool:
         try:
