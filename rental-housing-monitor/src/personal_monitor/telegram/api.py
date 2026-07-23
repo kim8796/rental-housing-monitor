@@ -63,6 +63,8 @@ class _NoOpHttpcoreLogger(logging.Logger):
     """A permanently inert logger that preserves references held by httpcore modules."""
 
     def __setattr__(self, name: str, value: object) -> None:
+        if name == "__class__":
+            raise AttributeError("httpcore logger class is sealed")
         if name == "level":
             value = _HTTP_CORE_SUPPRESS_LEVEL
         elif name == "disabled":
@@ -133,14 +135,54 @@ def _seal_httpcore_logger(logger: logging.Logger) -> bool:
         return False
 
 
+class _HttpcoreSealingManager(logging.Manager):
+    """Preserve stdlib logger creation while sealing the httpcore namespace."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"__class__", "getLogger", "loggerDict"}:
+            raise AttributeError("logging manager boundary is sealed")
+        super().__setattr__(name, value)
+
+    def getLogger(self, name: str) -> logging.Logger:
+        logger = super().getLogger(name)
+        if (name == "httpcore" or name.startswith("httpcore.")) and not _seal_httpcore_logger(
+            logger
+        ):
+            raise RuntimeError("httpcore logger sealing failed")
+        return logger
+
+
+_LOGGING_MANAGER_ANCHOR: Final = logging.Logger.manager
+_LOGGING_LOGGER_DICT_ANCHOR: Final = _LOGGING_MANAGER_ANCHOR.loggerDict
+
+
+def _install_httpcore_logger_boundary() -> bool:
+    try:
+        manager = _LOGGING_MANAGER_ANCHOR
+        if logging.Logger.manager is not manager or logging.root.manager is not manager:
+            return False
+        if type(manager) is logging.Manager:
+            manager.__class__ = _HttpcoreSealingManager
+        return (
+            type(manager) is _HttpcoreSealingManager
+            and manager.loggerDict is _LOGGING_LOGGER_DICT_ANCHOR
+            and "getLogger" not in manager.__dict__
+            and type(manager).getLogger is _HttpcoreSealingManager.getLogger
+        )
+    except Exception:
+        return False
+
+
 def _suppress_httpcore_diagnostics() -> bool:
     """Permanently seal every registered httpcore diagnostic origin."""
     try:
-        parent = logging.getLogger("httpcore")
+        if not _install_httpcore_logger_boundary():
+            return False
+        parent = _LOGGING_MANAGER_ANCHOR.getLogger("httpcore")
         candidates = [parent]
         candidates.extend(
             candidate
-            for name, candidate in list(logging.Logger.manager.loggerDict.items())
+            for name, candidate in list(_LOGGING_LOGGER_DICT_ANCHOR.items())
             if name.startswith("httpcore.") and isinstance(candidate, logging.Logger)
         )
         if not all(_seal_httpcore_logger(candidate) for candidate in candidates):
@@ -148,7 +190,7 @@ def _suppress_httpcore_diagnostics() -> bool:
         return all(
             type(candidate) is _NoOpHttpcoreLogger
             and not candidate.isEnabledFor(logging.CRITICAL + 100)
-            for name, candidate in list(logging.Logger.manager.loggerDict.items())
+            for name, candidate in list(_LOGGING_LOGGER_DICT_ANCHOR.items())
             if (name == "httpcore" or name.startswith("httpcore."))
             and isinstance(candidate, logging.Logger)
         )

@@ -6,7 +6,10 @@ import json
 import logging
 import zlib
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import FrozenInstanceError
+from threading import Barrier
 from typing import Any
 
 import httpx
@@ -1398,6 +1401,176 @@ def test_third_final_review_installed_transport_loggers_are_immediately_sealed(
             unrelated_logger.level,
             unrelated_logger.propagate,
         ) = original_unrelated
+
+
+def test_fourth_final_review_sealed_logger_rejects_normal_class_restoration(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("httpcore.http11")
+    caplog.set_level(logging.DEBUG)
+
+    try:
+        with suppress(AttributeError, TypeError):
+            logger.__class__ = logging.Logger
+        logger.disabled = False
+        logger.setLevel(logging.DEBUG)
+        logger.handlers = []
+        logger.addHandler(caplog.handler)
+        logger.propagate = True
+        logger.debug("restored-httpcore-class-secret")
+        direct_record = logging.LogRecord(
+            logger.name,
+            logging.DEBUG,
+            __file__,
+            0,
+            "restored-httpcore-direct-secret",
+            (),
+            None,
+        )
+        logger.handle(direct_record)
+        logger.callHandlers(direct_record)
+
+        assert all("restored-httpcore" not in record.getMessage() for record in caplog.records)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+    finally:
+        api_module._suppress_httpcore_diagnostics()
+
+
+def test_fourth_final_review_in_flight_future_httpcore_child_is_sealed_on_creation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unrelated_logger = logging.getLogger("personal_monitor.telegram_fourth_review_probe")
+    original_unrelated = (
+        unrelated_logger.disabled,
+        unrelated_logger.level,
+        unrelated_logger.propagate,
+    )
+
+    def create_and_reconfigure_after_preflight(_request: httpx.Request) -> httpx.Response:
+        logger = logging.getLogger("httpcore.explicit_future_fourth_review_probe")
+        logger.disabled = False
+        logger.setLevel(logging.DEBUG)
+        logger.filters = []
+        logger.handlers = []
+        logger.addHandler(caplog.handler)
+        logger.propagate = True
+        logger.debug("future-httpcore-debug-secret")
+        logger._log(logging.DEBUG, "future-httpcore-direct-log-secret", ())
+        direct_record = logging.LogRecord(
+            logger.name,
+            logging.DEBUG,
+            __file__,
+            0,
+            "future-httpcore-direct-handle-secret",
+            (),
+            None,
+        )
+        logger.handle(direct_record)
+        logger.callHandlers(direct_record)
+        unrelated_logger.warning("fourth-review-unrelated-marker")
+        return json_response({"ok": True, "result": []})
+
+    unrelated_logger.disabled = False
+    unrelated_logger.setLevel(logging.DEBUG)
+    unrelated_logger.propagate = True
+    caplog.set_level(logging.DEBUG)
+    manager = logging.Logger.manager
+    harness = TelegramHarness([create_and_reconfigure_after_preflight])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert all("future-httpcore" not in message for message in messages)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert any(record.name == "httpx" for record in caplog.records)
+        assert any(message == "fourth-review-unrelated-marker" for message in messages)
+        assert logging.Logger.manager is manager
+        assert logging.root.manager is manager
+    finally:
+        api_module._suppress_httpcore_diagnostics()
+        (
+            unrelated_logger.disabled,
+            unrelated_logger.level,
+            unrelated_logger.propagate,
+        ) = original_unrelated
+
+
+def test_fourth_final_review_concurrent_logger_creation_seals_only_httpcore_namespace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    original_logger_class = logging.getLoggerClass()
+    manager = logging.Logger.manager
+
+    class ConfiguredLogger(logging.Logger):
+        def __init__(self, name: str) -> None:
+            super().__init__(name, logging.WARNING)
+            self.configuration_marker = "preserved"
+            self.configuration_handler = logging.NullHandler(logging.ERROR)
+            self.configuration_filter = logging.Filter(name)
+            self.addHandler(self.configuration_handler)
+            self.addFilter(self.configuration_filter)
+
+    barrier = Barrier(8)
+
+    def create_logger(index: int) -> tuple[logging.Logger, bool]:
+        is_httpcore = index % 2 == 0
+        namespace = "httpcore" if is_httpcore else "personal_monitor.concurrent_unrelated"
+        barrier.wait()
+        logger = logging.getLogger(f"{namespace}.fourth_review_{index}")
+        if is_httpcore:
+            logger.disabled = False
+            logger.setLevel(logging.DEBUG)
+            logger.handlers = []
+            logger.addHandler(caplog.handler)
+            logger.propagate = True
+            logger.debug(f"concurrent-httpcore-secret-{index}")
+            record = logging.LogRecord(
+                logger.name,
+                logging.DEBUG,
+                __file__,
+                0,
+                f"concurrent-httpcore-direct-secret-{index}",
+                (),
+                None,
+            )
+            logger.handle(record)
+            logger.callHandlers(record)
+        else:
+            assert isinstance(logger, ConfiguredLogger)
+            assert logger.configuration_marker == "preserved"
+            assert logger.level == logging.WARNING
+            assert logger.handlers == [logger.configuration_handler]
+            assert logger.filters == [logger.configuration_filter]
+            logger.setLevel(logging.DEBUG)
+            logger.addHandler(caplog.handler)
+            logger.propagate = False
+            logger.debug(f"concurrent-unrelated-marker-{index}")
+        return logger, is_httpcore
+
+    caplog.set_level(logging.DEBUG)
+    logging.setLoggerClass(ConfiguredLogger)
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            created = list(executor.map(create_logger, range(8)))
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert all("concurrent-httpcore" not in message for message in messages)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert {
+            message for message in messages if message.startswith("concurrent-unrelated-marker-")
+        } == {f"concurrent-unrelated-marker-{index}" for index in (1, 3, 5, 7)}
+        assert all(
+            isinstance(logger, ConfiguredLogger)
+            for logger, is_httpcore in created
+            if not is_httpcore
+        )
+        assert logging.getLoggerClass() is ConfiguredLogger
+        assert logging.Logger.manager is manager
+        assert logging.root.manager is manager
+    finally:
+        logging.setLoggerClass(original_logger_class)
+        api_module._suppress_httpcore_diagnostics()
 
 
 @pytest.mark.parametrize(
