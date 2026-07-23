@@ -14,10 +14,13 @@ from urllib.parse import urlsplit
 
 from personal_monitor.ai.contracts import IntentKind, IntentRequest, IntentResult
 from personal_monitor.ai.worker import CodexWorkerError
+from personal_monitor.security.url_policy import canonicalize_hostname
 from personal_monitor.telegram.gateway import ControlRequest
 
 _OWNER_RE: Final = re.compile(r"telegram-user:[1-9][0-9]{0,18}\Z")
 _MONITOR_ID_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_STATUS_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_INVALID_PERCENT_ESCAPE_RE: Final = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _TARGET_COMMAND_RE: Final = re.compile(
     r"/(status|pause|resume|delete) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\Z"
 )
@@ -38,7 +41,6 @@ _CANCEL_CLARIFICATION: Final = "요청을 취소했습니다"
 _FAILED_CLARIFICATION: Final = "요청을 이해하지 못했습니다"
 _MAX_MONITORS: Final = 100
 _MAX_NAME: Final = 300
-_MAX_STATUS: Final = 64
 _MAX_CLARIFICATION: Final = 500
 
 
@@ -66,7 +68,8 @@ class OwnedMonitorSummary:
             or type(self.id) is not str
             or _MONITOR_ID_RE.fullmatch(self.id) is None
             or not _safe_text(self.name, _MAX_NAME)
-            or not _safe_text(self.status, _MAX_STATUS)
+            or type(self.status) is not str
+            or _STATUS_RE.fullmatch(self.status) is None
         ):
             raise ValueError("invalid monitor summary") from None
 
@@ -189,15 +192,14 @@ class IntentRouter:
             values = self._provider_anchor.call(owner_id)
             if type(values) in {list, tuple} and len(values) <= _MAX_MONITORS:
                 candidate = tuple(values)
-                ids = [value.id for value in candidate if type(value) is OwnedMonitorSummary]
-                if (
-                    len(ids) == len(candidate)
-                    and all(value.owner_id == owner_id for value in candidate)
-                    and len(set(ids)) == len(ids)
-                ):
-                    summaries = tuple(
-                        sorted(candidate, key=lambda value: (value.id, value.name, value.status))
-                    )
+                if all(_valid_summary(value, owner_id) for value in candidate):
+                    ids = [value.id for value in candidate]
+                    if len(set(ids)) == len(ids):
+                        summaries = tuple(
+                            sorted(
+                                candidate, key=lambda value: (value.id, value.name, value.status)
+                            )
+                        )
         if summaries is None:
             raise IntentRouterError
         return summaries
@@ -264,10 +266,35 @@ def _safe_text(value: object, limit: int) -> bool:
     return not any(unicodedata.category(character).startswith("C") for character in value)
 
 
+def _valid_summary(value: object, owner_id: str) -> bool:
+    return (
+        type(value) is OwnedMonitorSummary
+        and type(value.owner_id) is str
+        and _OWNER_RE.fullmatch(value.owner_id) is not None
+        and value.owner_id == owner_id
+        and type(value.id) is str
+        and _MONITOR_ID_RE.fullmatch(value.id) is not None
+        and _safe_text(value.name, _MAX_NAME)
+        and type(value.status) is str
+        and _STATUS_RE.fullmatch(value.status) is not None
+    )
+
+
 def _looks_like_command(value: object) -> bool:
     if type(value) is not str:
         return False
-    return value.lstrip().startswith(("/", "／", "⁄", "∕"))
+    candidate = value.lstrip()
+    if not candidate:
+        return False
+    prefix = candidate[0]
+    normalized = unicodedata.normalize("NFKC", prefix)
+    if normalized.startswith("/"):
+        return True
+    name = unicodedata.name(prefix, "")
+    category = unicodedata.category(prefix)
+    return (category[0] in {"M", "P", "S"} and ("SLASH" in name or "SOLIDUS" in name)) or (
+        category == "So" and "BOX DRAWINGS" in name and "DIAGONAL" in name
+    )
 
 
 def _action(
@@ -363,6 +390,8 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
     semantically_valid = True
     if value.kind is IntentKind.CREATE:
         semantically_valid = _safe_http_url(value.target_url)
+    elif value.kind is IntentKind.UPDATE:
+        semantically_valid = value.condition_text is not None or value.schedule_text is not None
     elif value.target_url is not None:
         semantically_valid = False
     elif value.kind is IntentKind.LIST or value.kind in {
@@ -382,17 +411,54 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
 
 
 def _safe_http_url(value: object) -> bool:
-    if not _safe_text(value, 2_048):
+    if (
+        not _safe_text(value, 2_048)
+        or any(character.isspace() for character in value)
+        or "\\" in value
+        or _INVALID_PERCENT_ESCAPE_RE.search(value) is not None
+    ):
         return False
     try:
         parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+        if hostname is None:
+            return False
+        dotted_hostname = hostname.translate(str.maketrans({"。": ".", "．": ".", "｡": "."}))
+        if ":" not in dotted_hostname and any(not label for label in dotted_hostname.split(".")):
+            return False
+        canonicalize_hostname(hostname)
         return (
-            parsed.scheme in {"http", "https"}
+            parsed.scheme.casefold() in {"http", "https"}
             and bool(parsed.netloc)
-            and parsed.hostname is not None
             and parsed.username is None
             and parsed.password is None
             and parsed.fragment == ""
+            and _valid_url_port(parsed.netloc, port)
         )
     except Exception:
         return False
+
+
+def _valid_url_port(netloc: str, parsed_port: int | None) -> bool:
+    authority = netloc.rsplit("@", 1)[-1]
+    suffix = ""
+    if authority.startswith("["):
+        closing = authority.find("]")
+        if closing < 0:
+            return False
+        suffix = authority[closing + 1 :]
+    elif ":" in authority:
+        if authority.count(":") != 1:
+            return False
+        suffix = ":" + authority.rsplit(":", 1)[1]
+    if not suffix:
+        return parsed_port is None
+    if (
+        not suffix.startswith(":")
+        or len(suffix) == 1
+        or not suffix[1:].isascii()
+        or not suffix[1:].isdigit()
+    ):
+        return False
+    return parsed_port is not None and 1 <= parsed_port <= 65_535

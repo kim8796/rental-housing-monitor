@@ -160,6 +160,18 @@ def test_malformed_and_unknown_slash_commands_clarify_without_dependencies(text:
     assert worker.calls == []
 
 
+@pytest.mark.parametrize("prefix", ["⧸", "⫽", "╱", "⁄", "∕", "／", "\u0338"])
+def test_unicode_slash_lookalikes_never_reach_dependencies(prefix: str) -> None:
+    router, provider, worker = _router([_result(IntentKind.LIST)])
+
+    result = run(router.route(REQUEST(f"{prefix}pause m1")))
+
+    assert result.kind is IntentKind.UNKNOWN
+    assert result.clarification
+    assert provider.calls == []
+    assert worker.calls == []
+
+
 def test_unknown_or_unowned_exact_command_target_does_not_guess() -> None:
     router, provider, worker = _router([])
 
@@ -230,6 +242,57 @@ def test_hostile_provider_iteration_fails_without_leaking_input() -> None:
     assert "private" not in str(caught.value)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+    assert worker.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("owner_id", OTHER_OWNER),
+        ("owner_id", 7),
+        ("id", "bad\nid"),
+        ("id", "x" * 129),
+        ("id", 7),
+        ("name", "bad\nname"),
+        ("name", "x" * 301),
+        ("name", 7),
+        ("status", "bad\nstatus"),
+        ("status", "bad status"),
+        ("status", "x" * 65),
+        ("status", 7),
+    ],
+)
+def test_mutated_provider_summaries_are_revalidated_before_worker(
+    field: str, value: object
+) -> None:
+    summary = OwnedMonitorSummary(OWNER, "m1", "private-name", "active")
+    object.__setattr__(summary, field, value)
+    router, provider, worker = _router([_result(IntentKind.LIST)], (summary,))
+
+    with pytest.raises(IntentRouterError) as caught:
+        run(router.route(REQUEST("private-message")))
+
+    assert str(caught.value) == "intent routing failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert provider.calls == [OWNER]
+    assert worker.calls == []
+
+
+def test_forged_provider_summary_is_revalidated_before_worker() -> None:
+    summary = object.__new__(OwnedMonitorSummary)
+    object.__setattr__(summary, "owner_id", OWNER)
+    object.__setattr__(summary, "id", "m1")
+    object.__setattr__(summary, "name", "private-name")
+    object.__setattr__(summary, "status", "")
+    router, provider, worker = _router([_result(IntentKind.LIST)], (summary,))
+
+    with pytest.raises(IntentRouterError) as caught:
+        run(router.route(REQUEST("private-message")))
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert provider.calls == [OWNER]
     assert worker.calls == []
 
 
@@ -305,6 +368,17 @@ def test_semantically_invalid_low_confidence_results_retry(output: IntentResult)
     assert len(worker.calls) == 3
 
 
+def test_empty_update_is_invalid_and_retries_to_safe_fallback() -> None:
+    empty_update = _result(IntentKind.UPDATE, targets=["m1"])
+    router, _, worker = _router([empty_update, object(), object()])
+
+    result = run(router.route(REQUEST("이 모니터 바꿔줘")))
+
+    assert result.kind is IntentKind.UNKNOWN
+    assert result.clarification == "요청을 이해하지 못했습니다"
+    assert len(worker.calls) == 3
+
+
 def test_cancellation_propagates_without_retry() -> None:
     router, _, worker = _router([asyncio.CancelledError(), _result(IntentKind.LIST)])
 
@@ -357,6 +431,57 @@ def test_semantically_conflicting_results_never_pass_as_actions(output: IntentRe
     assert result.target_monitor_ids == []
     assert result.clarification == "요청을 이해하지 못했습니다"
     assert len(worker.calls) == 3
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://exa mple.com/path",
+        "https://example.com/a path",
+        "https://.",
+        "https://..",
+        "https://.example.com",
+        "https://example..com",
+        "https://example.com.",
+        "https://example.com:",
+        "https://example.com:abc/path",
+        "https://example.com:+80/path",
+        "https://example.com:0/path",
+        "https://example.com:65536/path",
+        "https://example.com/%zz",
+        "https://user@example.com/path",
+        "https://example.com/path#fragment",
+        "https://[2001:db8::1/path",
+    ],
+)
+def test_malformed_create_urls_are_invalid_and_retry(url: str) -> None:
+    output = _result(IntentKind.CREATE, url=url)
+    router, _, worker = _router([output, object(), object()])
+
+    result = run(router.route(REQUEST("이 URL 모니터해줘")))
+
+    assert result.kind is IntentKind.UNKNOWN
+    assert result.clarification == "요청을 이해하지 못했습니다"
+    assert len(worker.calls) == 3
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/path?x=1",
+        "https://예시.한국/상품",
+        "http://192.0.2.1:8080/path",
+        "https://[2001:db8::1]:443/path",
+    ],
+)
+def test_syntactically_valid_create_urls_are_preserved(url: str) -> None:
+    output = _result(IntentKind.CREATE, url=url)
+    router, _, worker = _router([output])
+
+    result = run(router.route(REQUEST("이 URL 모니터해줘")))
+
+    assert result is output
+    assert len(worker.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -425,6 +550,7 @@ def test_owned_summary_is_immutable_validated_and_redacted() -> None:
         (OWNER, "bad\nid", "name", "active"),
         (OWNER, "m1", "bad\nname", "active"),
         (OWNER, "m1", "name", "bad\nstatus"),
+        (OWNER, "m1", "name", "bad status"),
         ("invalid-owner", "m1", "name", "active"),
         (OWNER, "x" * 129, "name", "active"),
     ]:
