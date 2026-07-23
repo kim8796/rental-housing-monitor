@@ -189,8 +189,16 @@ def test_worker_socket_wait_and_stale_cleanup_are_exact_and_bounded() -> None:
     assert "socket_path=/run/personal-monitor-ai/worker.sock" in wait
     assert '"$attempts" -lt 100' in wait
     assert 'validate_socket "$socket_path"' in wait
+    assert "socket_listener_ready" in wait
+    assert 'before_identity=$(stat -c "%d:%i" "$socket_path")' in wait
+    assert 'after_identity=$(stat -c "%d:%i" "$socket_path")' in wait
+    assert '[ "$before_identity" = "$after_identity" ]' in wait
+    assert wait.index("socket_listener_ready") < wait.index("return 0")
     assert "socket_path=/run/personal-monitor-ai/worker.sock" in remove
     assert 'validate_socket "$socket_path"' in remove
+    assert "socket_listener_ready" in remove
+    assert remove.index("socket_listener_ready") < remove.index('rm -f "$socket_path"')
+    assert "fail" in remove[: remove.index('rm -f "$socket_path"')]
     assert 'rm -f "$socket_path"' in remove
     assert "*" not in remove
     assert '"$(stat -c %u "$path")" = "10001"' in socket_validation

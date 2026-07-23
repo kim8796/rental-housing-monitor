@@ -410,51 +410,46 @@ class CodexWorkerServer:
 
 
 class CodexWorkerClient:
-    __slots__ = ("_parent", "_parent_identity", "_socket_identity", "_socket_path")
+    __slots__ = ("_parent", "_parent_identity", "_socket_path")
 
     def __init__(self, socket_path: Path) -> None:
         if type(self) is not CodexWorkerClient:
             raise CodexWorkerError
+        if Path(socket_path).name != "worker.sock":
+            raise CodexWorkerError
         parent, parent_identity = _safe_socket_parent(Path(socket_path))
         resolved_socket = parent / Path(socket_path).name
+        object.__setattr__(self, "_parent", parent)
+        object.__setattr__(self, "_parent_identity", parent_identity)
+        object.__setattr__(self, "_socket_path", resolved_socket)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("CodexWorkerClient composition is sealed")
+
+    def _current_socket_identity(self) -> tuple[int, int]:
         try:
-            metadata = resolved_socket.lstat()
+            _require_parent(self._parent, self._parent_identity)
+            metadata = self._socket_path.lstat()
             if (
                 not stat.S_ISSOCK(metadata.st_mode)
                 or metadata.st_uid != os.geteuid()
                 or stat.S_IMODE(metadata.st_mode) != 0o600
             ):
                 raise CodexWorkerError
+            return metadata.st_dev, metadata.st_ino
         except CodexWorkerError:
             raise
         except Exception:
             raise CodexWorkerError from None
-        object.__setattr__(self, "_parent", parent)
-        object.__setattr__(self, "_parent_identity", parent_identity)
-        object.__setattr__(self, "_socket_identity", (metadata.st_dev, metadata.st_ino))
-        object.__setattr__(self, "_socket_path", resolved_socket)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("CodexWorkerClient composition is sealed")
-
-    def _require_socket(self) -> None:
-        _require_parent(self._parent, self._parent_identity)
-        metadata = self._socket_path.lstat()
-        if (
-            not stat.S_ISSOCK(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-            or (metadata.st_dev, metadata.st_ino) != self._socket_identity
-        ):
-            raise CodexWorkerError
 
     async def _exchange(self, envelope: object) -> object:
-        self._require_socket()
+        socket_identity = self._current_socket_identity()
         reader: asyncio.StreamReader
         writer: asyncio.StreamWriter
         reader, writer = await asyncio.open_unix_connection(self._socket_path)
         try:
-            self._require_socket()
+            if self._current_socket_identity() != socket_identity:
+                raise CodexWorkerError
             writer.write(_encode(envelope))
             await writer.drain()
             if not writer.can_write_eof():

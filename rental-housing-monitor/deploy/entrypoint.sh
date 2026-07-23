@@ -51,13 +51,36 @@ validate_socket() {
     [ "$(stat -c %a "$path")" = "600" ] || fail
 }
 
+socket_listener_ready() {
+    /usr/local/bin/python -c \
+        'import socket;s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(0.1);s.connect("/run/personal-monitor-ai/worker.sock");s.close()' \
+        >/dev/null 2>&1
+}
+
 wait_for_worker_socket() {
     socket_path=/run/personal-monitor-ai/worker.sock
     attempts=0
     while [ "$attempts" -lt 100 ]; do
         if [ -e "$socket_path" ] || [ -L "$socket_path" ]; then
             validate_socket "$socket_path"
-            return 0
+            if ! before_identity=$(stat -c "%d:%i" "$socket_path"); then
+                attempts=$((attempts + 1))
+                sleep 0.1
+                continue
+            fi
+            listener_ready=false
+            if socket_listener_ready; then
+                listener_ready=true
+            fi
+            if [ -e "$socket_path" ] || [ -L "$socket_path" ]; then
+                validate_socket "$socket_path"
+                if after_identity=$(stat -c "%d:%i" "$socket_path"); then
+                    if [ "$listener_ready" = "true" ] &&
+                        [ "$before_identity" = "$after_identity" ]; then
+                        return 0
+                    fi
+                fi
+            fi
         fi
         attempts=$((attempts + 1))
         sleep 0.1
@@ -69,6 +92,25 @@ remove_stale_worker_socket() {
     socket_path=/run/personal-monitor-ai/worker.sock
     if [ -e "$socket_path" ] || [ -L "$socket_path" ]; then
         validate_socket "$socket_path"
+        before_identity=$(stat -c "%d:%i" "$socket_path") || fail
+        if socket_listener_ready; then
+            validate_socket "$socket_path"
+            after_identity=$(stat -c "%d:%i" "$socket_path") || fail
+            [ "$before_identity" = "$after_identity" ] || fail
+            fail
+        fi
+        if [ ! -e "$socket_path" ] && [ ! -L "$socket_path" ]; then
+            return 0
+        fi
+        validate_socket "$socket_path"
+        after_identity=$(stat -c "%d:%i" "$socket_path") || fail
+        [ "$before_identity" = "$after_identity" ] || fail
+        if socket_listener_ready; then
+            fail
+        fi
+        validate_socket "$socket_path"
+        after_identity=$(stat -c "%d:%i" "$socket_path") || fail
+        [ "$before_identity" = "$after_identity" ] || fail
         rm -f "$socket_path"
         [ ! -e "$socket_path" ] && [ ! -L "$socket_path" ] || fail
     fi

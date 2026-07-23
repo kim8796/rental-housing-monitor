@@ -27,7 +27,7 @@ def async_test(function):
 def short_socket_path() -> tuple[Path, Path]:
     directory = Path(tempfile.mkdtemp(prefix="pm-ai-", dir="/tmp")).resolve()
     directory.chmod(0o700)
-    return directory, directory / "codex.sock"
+    return directory, directory / "worker.sock"
 
 
 class FakeStdin:
@@ -250,17 +250,71 @@ async def test_delayed_second_frame_never_invokes_codex() -> None:
 async def test_client_rejects_unsafe_socket_directory(tmp_path: Path) -> None:
     directory = tmp_path / "worker"
     directory.mkdir(mode=0o755)
-    socket_path = directory / "codex.sock"
+    socket_path = directory / "worker.sock"
     with pytest.raises(CodexWorkerError):
         CodexWorkerClient(socket_path)
 
 
-def test_client_requires_existing_legitimate_socket() -> None:
+@async_test
+async def test_client_allows_transient_absence_and_rebind() -> None:
     directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+    client = CodexWorkerClient(socket_path)
     try:
         with pytest.raises(CodexWorkerError):
-            CodexWorkerClient(socket_path)
+            await client.check()
+        first = CodexWorkerServer(
+            socket_path,
+            harness.cli,
+            auth_check=harness.guard.check,
+        )
+        await first.start()
+        await client.check()
+        await first.close()
+        with pytest.raises(CodexWorkerError):
+            await client.check()
+        second = CodexWorkerServer(
+            socket_path,
+            harness.cli,
+            auth_check=harness.guard.check,
+        )
+        await second.start()
+        await client.check()
+        await second.close()
     finally:
+        shutil.rmtree(directory)
+
+
+@async_test
+@pytest.mark.parametrize("unsafe_kind", ["regular", "symlink", "wrong-mode-socket"])
+async def test_dynamic_client_rejects_unsafe_current_socket(unsafe_kind: str) -> None:
+    directory, socket_path = short_socket_path()
+    client = CodexWorkerClient(socket_path)
+    listener: asyncio.AbstractServer | None = None
+    target = directory / "target"
+    try:
+        if unsafe_kind == "regular":
+            socket_path.write_bytes(b"not-a-socket")
+            socket_path.chmod(0o600)
+        elif unsafe_kind == "symlink":
+            target.write_bytes(b"not-a-socket")
+            socket_path.symlink_to(target)
+        else:
+            listener = await asyncio.start_unix_server(
+                lambda _reader, _writer: None,
+                path=socket_path,
+            )
+            socket_path.chmod(0o666)
+        with pytest.raises(CodexWorkerError):
+            await client.check()
+        with pytest.raises(CodexWorkerError):
+            await client.run(intent())
+    finally:
+        if listener is not None:
+            listener.close()
+            await listener.wait_closed()
+        socket_path.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
         shutil.rmtree(directory)
 
 
@@ -327,7 +381,11 @@ async def test_server_and_client_reject_parent_rename_replacement() -> None:
 
 
 @async_test
-async def test_client_rejects_same_mode_socket_identity_replacement() -> None:
+@pytest.mark.parametrize("operation", ["check", "run"])
+async def test_client_rejects_within_exchange_socket_identity_replacement(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
     secured_server = CodexWorkerServer(
@@ -337,41 +395,79 @@ async def test_client_rejects_same_mode_socket_identity_replacement() -> None:
     )
     await secured_server.start()
     client = CodexWorkerClient(socket_path)
-    socket_path.unlink()
+    real_open = asyncio.open_unix_connection
+    malicious_servers: list[asyncio.AbstractServer] = []
 
-    async def malicious(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        payload = json.dumps(
-            {
-                "ok": True,
-                "result": {
-                    "kind": "unknown",
-                    "target_monitor_ids": [],
-                    "target_url": None,
-                    "condition_text": None,
-                    "schedule_text": None,
-                    "clarification": None,
-                    "confidence": 0.0,
-                },
-            }
-        ).encode()
-        writer.write(len(payload).to_bytes(4, "big") + payload)
-        await writer.drain()
+    async def malicious(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read()
         writer.close()
         await writer.wait_closed()
 
-    malicious_server = await asyncio.start_unix_server(malicious, path=socket_path)
-    socket_path.chmod(0o600)
+    async def swap_before_connect(path: Path):
+        socket_path.unlink()
+        malicious_server = await asyncio.start_unix_server(malicious, path=socket_path)
+        malicious_servers.append(malicious_server)
+        socket_path.chmod(0o600)
+        return await real_open(path)
+
+    monkeypatch.setattr(
+        "personal_monitor.ai.worker.asyncio.open_unix_connection",
+        swap_before_connect,
+    )
     try:
         with pytest.raises(CodexWorkerError):
-            await client.run(intent())
-        with pytest.raises(CodexWorkerError):
-            await client.check()
+            if operation == "check":
+                await client.check()
+            else:
+                await client.run(intent())
         assert harness.exec_calls == 0
     finally:
-        malicious_server.close()
-        await malicious_server.wait_closed()
+        for malicious_server in malicious_servers:
+            malicious_server.close()
+            await malicious_server.wait_closed()
         socket_path.unlink(missing_ok=True)
         await secured_server.close()
+        shutil.rmtree(directory)
+
+
+@async_test
+async def test_same_client_recovers_after_legitimate_worker_restart() -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+    client = CodexWorkerClient(socket_path)
+    first = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
+    await first.start()
+    first_identity = (socket_path.stat().st_dev, socket_path.stat().st_ino)
+    try:
+        await client.check()
+        first_result = await client.run(intent(1))
+        assert isinstance(first_result, IntentResult)
+        await first.close()
+        assert not socket_path.exists()
+
+        second = CodexWorkerServer(
+            socket_path,
+            harness.cli,
+            auth_check=harness.guard.check,
+        )
+        await second.start()
+        second_identity = (socket_path.stat().st_dev, socket_path.stat().st_ino)
+        assert second_identity != first_identity
+        await client.check()
+        second_result = await client.run(intent(2))
+        assert isinstance(second_result, IntentResult)
+        await second.close()
+        assert harness.exec_calls == 2
+    finally:
+        with suppress(FileNotFoundError):
+            await first.close()
+        if "second" in locals():
+            with suppress(FileNotFoundError):
+                await second.close()
         shutil.rmtree(directory)
 
 
