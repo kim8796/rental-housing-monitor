@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -12,7 +13,7 @@ from typing import Any
 import pytest
 
 from personal_monitor.ai.contracts import IntentKind, IntentResult
-from personal_monitor.control.actions import ConsumedAction, PendingActionService
+from personal_monitor.control.actions import ConsumedAction, PendingAction, PendingActionService
 from personal_monitor.control.messages import ControlReply, safe_plain
 from personal_monitor.control.planner import (
     PlannedMonitor,
@@ -195,6 +196,28 @@ def _proposal(actions: PendingActionService) -> ProposedMonitor:
         spec_hash=digest,
         pending_action=pending,
         _runtime_binding_hash=_complete_runtime_binding(material, pending),
+    )
+
+
+def _rebind_proposal_pending(
+    proposal: ProposedMonitor,
+    pending: PendingAction,
+) -> None:
+    material = _runtime_material(
+        proposal.spec.owner_id,
+        proposal.candidate_version_id,
+        proposal.spec_hash,
+        proposal.preview_items,
+        proposal.resolved_strategy,
+        proposal.robots,
+        proposal.warnings,
+        proposal.explanation,
+    )
+    object.__setattr__(proposal, "pending_action", pending)
+    object.__setattr__(
+        proposal,
+        "_runtime_binding_hash",
+        _complete_runtime_binding(material, pending),
     )
 
 
@@ -675,6 +698,111 @@ def test_create_is_absent_before_confirmation_and_created_for_authenticated_owne
     connection.close()
 
 
+def test_create_preview_rejects_same_database_pending_with_wrong_payload() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    proposal = _proposal(actions)
+    actions.revoke(proposal.pending_action.token, OWNER)
+    wrong_pending = actions.create(
+        OWNER,
+        "create",
+        {"candidate_version_id": "wrong-payload"},
+        now=NOW,
+    )
+    _rebind_proposal_pending(proposal, wrong_pending)
+    intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=_spec().target_url,
+        condition_text="새 상품",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakePlanner(proposal, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("새 상품을 모니터해줘")))
+
+    assert "처리하지 못했습니다" in reply.text
+    assert reply.buttons == ()
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    connection.close()
+
+
+def test_create_preview_rejects_pending_from_different_database() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    foreign_connection = open_database(":memory:")
+    RegistryRepository(foreign_connection).create_user(OWNER, 7)
+    foreign_actions = PendingActionService(foreign_connection)
+    proposal = _proposal(foreign_actions)
+    intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=_spec().target_url,
+        condition_text="새 상품",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakePlanner(proposal, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("새 상품을 모니터해줘")))
+
+    assert "처리하지 못했습니다" in reply.text
+    assert reply.buttons == ()
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    assert (
+        foreign_connection.execute(
+            "SELECT count(*) FROM pending_actions WHERE consumed_at IS NULL"
+        ).fetchone()[0]
+        == 1
+    )
+    connection.close()
+    foreign_connection.close()
+
+
+def test_create_preview_rejects_expired_pending_at_trusted_service_time() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    proposal = _proposal(actions)
+    intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=_spec().target_url,
+        condition_text="새 상품",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakePlanner(proposal, actions),
+        actions,
+        now_source=lambda: NOW.replace(minute=11),
+    )
+
+    reply = _run(service.handle(_request("새 상품을 모니터해줘")))
+
+    assert "처리하지 못했습니다" in reply.text
+    assert reply.buttons == ()
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    connection.close()
+
+
 def test_planner_error_html_cookie_and_token_never_reach_reply_or_logs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -705,6 +833,90 @@ def test_planner_error_html_cookie_and_token_never_reach_reply_or_logs(
     assert "session-secret" not in exposed
     assert "eyJhbGci" not in exposed
     assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    connection.close()
+
+
+def test_nested_cancellation_group_from_create_planner_is_reraised_unchanged() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    fatal = BaseExceptionGroup(
+        "outer",
+        [
+            RuntimeError("ordinary"),
+            BaseExceptionGroup("inner", [asyncio.CancelledError()]),
+        ],
+    )
+
+    class GroupPlanner:
+        action_service = actions
+
+        async def propose(self, *_args: object, **_kwargs: object) -> object:
+            raise fatal
+
+    intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=_spec().target_url,
+        condition_text="새 상품",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        GroupPlanner(),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        _run(service.handle(_request("새 상품을 모니터해줘")))
+
+    assert caught.value is fatal
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
+    connection.close()
+
+
+def test_nested_cancellation_group_during_create_reply_revokes_pending_and_reraises() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    proposal = _proposal(actions)
+    fatal = BaseExceptionGroup(
+        "outer",
+        [BaseExceptionGroup("inner", [asyncio.CancelledError()])],
+    )
+
+    class FatalSpec:
+        @property
+        def owner_id(self) -> str:
+            raise fatal
+
+    object.__setattr__(proposal, "spec", FatalSpec())
+    intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=_spec().target_url,
+        condition_text="새 상품",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakePlanner(proposal, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        _run(service.handle(_request("새 상품을 모니터해줘")))
+
+    assert caught.value is fatal
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
     connection.close()
 
 
@@ -913,6 +1125,108 @@ def test_keyword_preview_redacts_secret_and_preserves_safe_actual_keyword() -> N
     assert "재입고" in reply.text
     assert "[숨김]" in reply.text
     assert "session-secret" not in reply.text
+    connection.close()
+
+
+def test_keyword_preview_preserves_long_safe_keyword_without_ellipsis() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    current_payload = _spec().model_dump(mode="json")
+    current_payload["extract"]["fields"]["title"] = {
+        "selector": ".title",
+        "type": "text",
+    }
+    current = MonitorSpec.model_validate(current_payload)
+    monitor_id = registry.create_monitor(current, created_by=OWNER)
+    keyword = "재입고-" + "안전한키워드" * 30
+    payload = current.model_dump(mode="json")
+    payload["rules"] = [
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": [keyword],
+        }
+    ]
+    planned = PlannedMonitor(
+        spec=MonitorSpec.model_validate(payload),
+        preview_items=(PreviewItem({"title": "재입고"}),),
+        resolved_strategy=FetchStrategy.HTTP,
+        robots=RobotsDecision(True, None, NOW, True),
+        warnings=(),
+    )
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text="긴 키워드로 바꿔줘",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(planned, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("긴 키워드로 바꿔줘")))
+
+    assert keyword in reply.text
+    assert "…" not in reply.text
+    assert len(reply.text) <= 3_500
+    connection.close()
+
+
+def test_status_value_preview_preserves_long_safe_value_without_ellipsis() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    current_payload = _spec().model_dump(mode="json")
+    current_payload["extract"]["fields"]["title"] = {
+        "selector": ".title",
+        "type": "text",
+    }
+    current = MonitorSpec.model_validate(current_payload)
+    monitor_id = registry.create_monitor(current, created_by=OWNER)
+    value = "상태-" + "검증된값" * 100
+    payload = current.model_dump(mode="json")
+    payload["rules"] = [
+        {
+            "kind": "status_equals",
+            "field": "title",
+            "value": value,
+        }
+    ]
+    planned = PlannedMonitor(
+        spec=MonitorSpec.model_validate(payload),
+        preview_items=(PreviewItem({"title": value}),),
+        resolved_strategy=FetchStrategy.HTTP,
+        robots=RobotsDecision(True, None, NOW, True),
+        warnings=(),
+    )
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text="긴 상태 값으로 바꿔줘",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(planned, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("긴 상태 값으로 바꿔줘")))
+
+    assert value in reply.text
+    assert "…" not in reply.text
+    assert len(reply.text) <= 3_500
     connection.close()
 
 

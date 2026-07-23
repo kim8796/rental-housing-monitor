@@ -11,6 +11,7 @@ from typing import Final
 from personal_monitor.ai.contracts import IntentKind, IntentResult
 from personal_monitor.control.actions import ConsumedAction, PendingActionService
 from personal_monitor.control.messages import (
+    MAX_CONTROL_REPLY_CHARS,
     ControlReply,
     safe_plain,
     safe_url,
@@ -19,6 +20,8 @@ from personal_monitor.control.messages import (
 )
 from personal_monitor.control.planner import (
     PlannedMonitor,
+    ProposedMonitor,
+    _proposal_binding,
     reconstruct_confirmed_spec,
     update_scope_is_valid,
 )
@@ -26,7 +29,7 @@ from personal_monitor.control.preview import render_preview
 from personal_monitor.domain.spec import MonitorStatus, RuleKind, RuleSpec
 from personal_monitor.storage.registry import ControlMonitor, RegistryRepository
 from personal_monitor.storage.schema import canonical_json, transaction, utc_now
-from personal_monitor.telegram.gateway import ControlRequest
+from personal_monitor.telegram.gateway import ControlRequest, _is_fatal_exception
 from personal_monitor.telegram.types import InlineButton
 
 _SAFE_FAILURE: Final = "요청을 처리하지 못했습니다. 모니터 상태를 다시 확인해 주세요."
@@ -55,6 +58,7 @@ class ControlService:
         "_route_anchor",
         "_router",
         "_router_anchor",
+        "_validate_create_anchor",
     )
 
     def __init__(
@@ -79,6 +83,7 @@ class ControlService:
             plan_update = getattr(planner, "plan_update", None)
             planner_actions = planner.action_service
             claim = actions.claim
+            validate_create = actions.valid_create_membership
             registry_methods = tuple(
                 (name, getattr(registry, name))
                 for name in (
@@ -94,13 +99,20 @@ class ControlService:
             )
             actions_methods = tuple(
                 (name, getattr(actions, name))
-                for name in ("_integrity_ok", "claim", "create", "revoke")
+                for name in (
+                    "_integrity_ok",
+                    "claim",
+                    "create",
+                    "revoke",
+                    "valid_create_membership",
+                )
             )
             now_call = _capture_callable(now_source)
             if (
                 not callable(route)
                 or not callable(propose)
                 or not callable(claim)
+                or not callable(validate_create)
                 or planner_actions is not actions
             ):
                 raise TypeError
@@ -127,6 +139,7 @@ class ControlService:
         object.__setattr__(self, "_actions_anchor", actions)
         object.__setattr__(self, "_actions_methods_anchor", actions_methods)
         object.__setattr__(self, "_claim_anchor", claim)
+        object.__setattr__(self, "_validate_create_anchor", validate_create)
         object.__setattr__(self, "_now_source", now_source)
         object.__setattr__(self, "_now_source_anchor", now_source)
         object.__setattr__(self, "_now_call_anchor", now_call)
@@ -236,9 +249,26 @@ class ControlService:
             proposal = await self._propose_anchor(request, intent)
             if not self._integrity_ok():
                 raise ValueError
-            if proposal.spec.owner_id != request.owner_id:
+            if type(proposal) is not ProposedMonitor or proposal.spec.owner_id != request.owner_id:
                 raise ValueError
             preview = render_preview(proposal)
+            expected_payload = {
+                "candidate_version_id": proposal.candidate_version_id,
+                "spec_hash": proposal.spec_hash,
+                "binding_hash": _proposal_binding(
+                    request.owner_id,
+                    proposal.candidate_version_id,
+                    proposal.spec_hash,
+                ),
+                "spec": proposal.spec.model_dump(mode="json"),
+            }
+            if not self._validate_create_anchor(
+                proposal.pending_action,
+                request.owner_id,
+                expected_payload,
+                now=_safe_now(self._call_now()),
+            ):
+                raise ValueError
             return ControlReply(preview.text, preview.buttons)
         except BaseException as error:
             with suppress(Exception):
@@ -246,10 +276,7 @@ class ControlService:
                     proposal.pending_action.token,
                     request.owner_id,
                 )
-            if isinstance(
-                error,
-                (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
-            ):
+            if _is_fatal_exception(error):
                 raise
             return ControlReply(_SAFE_FAILURE)
 
@@ -354,10 +381,8 @@ class ControlService:
             if type(reply) is not ControlReply:
                 raise ValueError
             return ControlReply(reply.text, reply.buttons)
-        except asyncio.CancelledError:
-            raise
         except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            if _is_fatal_exception(error):
                 raise
             return ControlReply(_SAFE_FAILURE)
 
@@ -436,7 +461,7 @@ class ControlService:
                     ),
                 )
         except BaseException as error:
-            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            if _is_fatal_exception(error):
                 raise
             return None
 
@@ -501,7 +526,7 @@ class ControlService:
                 )
             return reply
         except BaseException as error:
-            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            if _is_fatal_exception(error):
                 raise
             return ControlReply(_NOT_FOUND)
 
@@ -625,6 +650,11 @@ class ControlService:
                     self._claim_anchor,
                     self._actions_anchor,
                     "claim",
+                )
+                and _callable_still_attached(
+                    self._validate_create_anchor,
+                    self._actions_anchor,
+                    "valid_create_membership",
                 )
                 and all(
                     _callable_still_attached(method, self._registry_anchor, name)
@@ -806,15 +836,22 @@ _RULE_KIND_LABELS: Final = {
 def _rule_summary(rule: RuleSpec, index: int) -> str:
     parts = [f"조건 {index}: 종류={_RULE_KIND_LABELS[rule.kind]}"]
     if rule.field is not None:
-        parts.append(f"필드={safe_plain(rule.field, limit=80)}")
+        parts.append(f"필드={_exact_rule_text(rule.field)}")
     if rule.operator is not None:
-        parts.append(f"연산자={safe_plain(rule.operator, limit=20)}")
+        parts.append(f"연산자={_exact_rule_text(rule.operator)}")
     if rule.value is not None:
-        parts.append(f"값={safe_plain(str(rule.value), limit=300)}")
+        parts.append(f"값={_exact_rule_text(str(rule.value))}")
     if rule.keywords:
-        keywords = ", ".join(safe_plain(keyword, limit=120) for keyword in rule.keywords)
+        keywords = ", ".join(_exact_rule_text(keyword) for keyword in rule.keywords)
         parts.append(f"키워드={keywords}")
     return ", ".join(parts)
+
+
+def _exact_rule_text(value: str) -> str:
+    rendered = safe_plain(value, limit=MAX_CONTROL_REPLY_CHARS)
+    if rendered != safe_plain(value, limit=MAX_CONTROL_REPLY_CHARS + 1):
+        raise ValueError("rule value cannot be rendered exactly")
+    return rendered
 
 
 def _bounded_reply(lines: list[str]) -> ControlReply:

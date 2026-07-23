@@ -54,54 +54,6 @@ class _RejectAction(Exception):
     pass
 
 
-def _make_consumed_action_registry():  # type: ignore[no-untyped-def]
-    records: dict[
-        int,
-        tuple[ConsumedAction, PendingActionService, tuple[str, str, str, str]],
-    ] = {}
-    lock = threading.RLock()
-
-    def register(
-        issuer: PendingActionService,
-        action: ConsumedAction,
-        fingerprint: tuple[str, str, str, str],
-    ) -> None:
-        with lock:
-            key = id(action)
-            if key in records:
-                raise RuntimeError("consumed action registration failed")
-            records[key] = (action, issuer, fingerprint)
-
-    def claim(
-        issuer: PendingActionService,
-        action: ConsumedAction,
-        fingerprint: tuple[str, str, str, str],
-    ) -> bool:
-        with lock:
-            key = id(action)
-            record = records.get(key)
-            if (
-                record is None
-                or record[0] is not action
-                or record[1] is not issuer
-                or record[2] != fingerprint
-            ):
-                return False
-            records.pop(key)
-            return True
-
-    def discard(issuer: PendingActionService, action: ConsumedAction) -> bool:
-        with lock:
-            key = id(action)
-            record = records.get(key)
-            if record is None or record[0] is not action or record[1] is not issuer:
-                return False
-            records.pop(key)
-            return True
-
-    return register, claim, discard
-
-
 @dataclass(frozen=True, slots=True, repr=False)
 class PendingAction:
     token: str
@@ -147,7 +99,7 @@ class ConsumedAction:
         return "<ConsumedAction redacted>"
 
 
-class PendingActionService:
+class _PendingActionServiceBase:
     __slots__ = (
         "_connection",
         "_connection_anchor",
@@ -226,103 +178,48 @@ class PendingActionService:
             raise ValueError("invalid pending action") from None
         return PendingAction(token, expires_at)
 
-    def consume(
+    def valid_create_membership(
         self,
-        token: str,
+        pending: object,
         owner_id: str,
+        payload: Mapping[str, object],
         *,
         now: datetime,
-        operation: str = "confirm",
-    ) -> ConsumedAction:
-        safe_token = _valid_token(token)
+    ) -> bool:
         owner = _valid_owner(owner_id)
         normalized_now = _utc_datetime(now)
+        try:
+            payload_json, _ = _validated_payload(payload)
+        except Exception:
+            payload_json = None
         if (
             not self._integrity_ok()
-            or safe_token is None
+            or type(pending) is not PendingAction
             or owner is None
             or normalized_now is None
-            or operation not in {"confirm", "edit"}
-            or self._connection_anchor.in_transaction
+            or payload_json is None
         ):
-            raise ActionDenied("pending action denied")
-
-        result: ConsumedAction | None = None
-        failed = False
-        try:
-            with transaction(self._connection_anchor, immediate=True):
-                row = self._connection_anchor.execute(
-                    "SELECT owner_id, action, payload_json, expires_at, consumed_at "
-                    "FROM pending_actions WHERE token_hash = ?",
-                    (_token_hash(safe_token),),
-                ).fetchone()
-                if row is None:
-                    raise _RejectAction
-                expires_at = _stored_expiry(row["expires_at"])
-                action = _valid_action(row["action"])
-                payload_json, payload = _stored_payload(row["payload_json"])
-                if (
-                    row["owner_id"] != owner
-                    or row["consumed_at"] is not None
-                    or expires_at is None
-                    or normalized_now >= expires_at
-                    or action is None
-                    or payload_json is None
-                    or payload is None
-                ):
-                    raise _RejectAction
-                cursor = self._connection_anchor.execute(
-                    "UPDATE pending_actions SET consumed_at = ? "
-                    "WHERE token_hash = ? AND owner_id = ? AND consumed_at IS NULL",
-                    (normalized_now.isoformat(), _token_hash(safe_token), owner),
-                )
-                if cursor.rowcount != 1:
-                    raise _RejectAction
-                result = ConsumedAction(action, payload, owner, operation)
-                _register_consumed_action(
-                    self,
-                    result,
-                    (
-                        action,
-                        payload_json,
-                        owner,
-                        operation,
-                    ),
-                )
-        except Exception:
-            failed = True
-        if failed and result is not None:
-            _discard_consumed_action(self, result)
-        if failed or result is None:
-            raise ActionDenied("pending action denied") from None
-        return result
-
-    def claim(self, action: object) -> bool:
-        """Claim one exact issuer-bound receipt before any control mutation."""
-        if not self._integrity_ok() or type(action) is not ConsumedAction:
             return False
         try:
-            payload_json, _ = _validated_payload(action.payload)
-            return _claim_consumed_action(
-                self,
-                action,
-                (
-                    action.action,
-                    payload_json,
-                    action.owner_id,
-                    action.operation,
-                ),
+            row = self._connection_anchor.execute(
+                "SELECT owner_id, action, payload_json, expires_at, consumed_at "
+                "FROM pending_actions WHERE token_hash = ?",
+                (_token_hash(pending.token),),
+            ).fetchone()
+            expires_at = None if row is None else _stored_expiry(row["expires_at"])
+            return (
+                row is not None
+                and row["owner_id"] == owner
+                and row["action"] == "create"
+                and row["payload_json"] == payload_json
+                and row["expires_at"] == pending.expires_at.isoformat()
+                and row["consumed_at"] is None
+                and expires_at is not None
+                and expires_at == pending.expires_at
+                and normalized_now < expires_at
             )
         except Exception:
             return False
-
-    def discard(self, action: object) -> bool:
-        """Consume an unused in-memory receipt, such as a cancelled callback."""
-        return (
-            type(action) is ConsumedAction
-            and self._integrity_ok()
-            and _discard_consumed_action(self, action)
-        )
 
     def revoke(self, token: str, owner_id: str) -> None:
         safe_token = _valid_token(token)
@@ -356,11 +253,134 @@ class PendingActionService:
             return False
 
 
-(
-    _register_consumed_action,
-    _claim_consumed_action,
-    _discard_consumed_action,
-) = _make_consumed_action_registry()
+def _make_pending_action_service(base: type):  # type: ignore[type-arg]
+    records: dict[
+        int,
+        tuple[ConsumedAction, object, tuple[str, str, str, str]],
+    ] = {}
+    lock = threading.RLock()
+
+    class PendingActionService(base):  # type: ignore[misc, valid-type]
+        __slots__ = ()
+
+        def consume(
+            self,
+            token: str,
+            owner_id: str,
+            *,
+            now: datetime,
+            operation: str = "confirm",
+        ) -> ConsumedAction:
+            safe_token = _valid_token(token)
+            owner = _valid_owner(owner_id)
+            normalized_now = _utc_datetime(now)
+            if (
+                not self._integrity_ok()
+                or safe_token is None
+                or owner is None
+                or normalized_now is None
+                or operation not in {"confirm", "edit"}
+                or self._connection_anchor.in_transaction
+            ):
+                raise ActionDenied("pending action denied")
+
+            result: ConsumedAction | None = None
+            failed = False
+            try:
+                with transaction(self._connection_anchor, immediate=True):
+                    row = self._connection_anchor.execute(
+                        "SELECT owner_id, action, payload_json, expires_at, consumed_at "
+                        "FROM pending_actions WHERE token_hash = ?",
+                        (_token_hash(safe_token),),
+                    ).fetchone()
+                    if row is None:
+                        raise _RejectAction
+                    expires_at = _stored_expiry(row["expires_at"])
+                    action = _valid_action(row["action"])
+                    payload_json, payload = _stored_payload(row["payload_json"])
+                    if (
+                        row["owner_id"] != owner
+                        or row["consumed_at"] is not None
+                        or expires_at is None
+                        or normalized_now >= expires_at
+                        or action is None
+                        or payload_json is None
+                        or payload is None
+                    ):
+                        raise _RejectAction
+                    cursor = self._connection_anchor.execute(
+                        "UPDATE pending_actions SET consumed_at = ? "
+                        "WHERE token_hash = ? AND owner_id = ? AND consumed_at IS NULL",
+                        (normalized_now.isoformat(), _token_hash(safe_token), owner),
+                    )
+                    if cursor.rowcount != 1:
+                        raise _RejectAction
+                    result = ConsumedAction(action, payload, owner, operation)
+                    fingerprint = (action, payload_json, owner, operation)
+                    with lock:
+                        key = id(result)
+                        if key in records:
+                            raise RuntimeError("consumed action registration failed")
+                        records[key] = (result, self, fingerprint)
+            except Exception:
+                failed = True
+            if failed and result is not None:
+                with lock:
+                    key = id(result)
+                    record = records.get(key)
+                    if record is not None and record[0] is result and record[1] is self:
+                        records.pop(key)
+            if failed or result is None:
+                raise ActionDenied("pending action denied") from None
+            return result
+
+        def claim(self, action: object) -> bool:
+            """Claim one exact issuer-bound receipt before any control mutation."""
+            if not self._integrity_ok() or type(action) is not ConsumedAction:
+                return False
+            try:
+                payload_json, _ = _validated_payload(action.payload)
+                fingerprint = (
+                    action.action,
+                    payload_json,
+                    action.owner_id,
+                    action.operation,
+                )
+                with lock:
+                    key = id(action)
+                    record = records.get(key)
+                    if (
+                        record is None
+                        or record[0] is not action
+                        or record[1] is not self
+                        or record[2] != fingerprint
+                    ):
+                        return False
+                    records.pop(key)
+                    return True
+            except Exception:
+                return False
+
+        def discard(self, action: object) -> bool:
+            """Consume one unused exact receipt, such as a cancelled callback."""
+            if type(action) is not ConsumedAction or not self._integrity_ok():
+                return False
+            with lock:
+                key = id(action)
+                record = records.get(key)
+                if record is None or record[0] is not action or record[1] is not self:
+                    return False
+                records.pop(key)
+                return True
+
+    PendingActionService.__name__ = "PendingActionService"
+    PendingActionService.__qualname__ = "PendingActionService"
+    return PendingActionService
+
+
+PendingActionService = _make_pending_action_service(_PendingActionServiceBase)
+del _make_pending_action_service
+del _PendingActionServiceBase
 
 
 def _valid_owner(value: object) -> str | None:

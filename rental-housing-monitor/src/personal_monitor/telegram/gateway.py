@@ -219,7 +219,7 @@ class TelegramGateway:
                 raise RuntimeError("gateway integrity failure")
         except BaseException as error:
             self._discard_anchor(action)
-            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            if _is_fatal_exception(error):
                 raise
             try:
                 await self._answer_callback_anchor(
@@ -228,7 +228,7 @@ class TelegramGateway:
                     show_alert=True,
                 )
             except BaseException as alert_error:
-                if isinstance(alert_error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                if _is_fatal_exception(alert_error):
                     raise
             return
         self._discard_anchor(action)
@@ -331,6 +331,14 @@ class TelegramGateway:
 
 def _valid_identifier(value: object) -> bool:
     return type(value) is int and 1 <= value <= _MAX_IDENTIFIER
+
+
+def _is_fatal_exception(error: BaseException) -> bool:
+    if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+        return True
+    return isinstance(error, BaseExceptionGroup) and any(
+        _is_fatal_exception(nested) for nested in error.exceptions
+    )
 
 
 def _valid_log_identifier(value: object) -> bool:

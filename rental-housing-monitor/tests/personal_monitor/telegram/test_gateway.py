@@ -270,6 +270,59 @@ def test_custom_base_exception_from_send_after_claim_alerts_once() -> None:
     connection.close()
 
 
+def test_nested_cancellation_group_from_router_is_reraised_after_receipt_cleanup() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = FakeRouter(actions)
+    fatal = BaseExceptionGroup(
+        "outer",
+        [
+            RuntimeError("ordinary"),
+            BaseExceptionGroup("inner", [asyncio.CancelledError()]),
+        ],
+    )
+    router.error = fatal
+    api = FakeApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+
+    assert caught.value is fatal
+    assert len(router.calls) == 1
+    assert actions.claim(router.calls[0]) is False
+    assert api.answers == []
+    connection.close()
+
+
+def test_nested_cancellation_group_from_send_is_reraised_after_receipt_cleanup() -> None:
+    fatal = BaseExceptionGroup(
+        "outer",
+        [BaseExceptionGroup("inner", [asyncio.CancelledError()])],
+    )
+
+    class FatalSendApi(FakeApi):
+        async def send_message(self, *args: object, **kwargs: object) -> str:
+            raise fatal
+
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = ReplyRouter(actions)
+    api = FatalSendApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+
+    assert caught.value is fatal
+    assert len(router.calls) == 1
+    assert actions.claim(router.calls[0]) is False
+    assert api.answers == []
+    connection.close()
+
+
 def test_gateway_rejects_router_bound_to_different_action_service() -> None:
     connection = _connection()
     actions = PendingActionService(connection)

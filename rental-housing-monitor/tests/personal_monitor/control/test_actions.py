@@ -92,6 +92,36 @@ def test_confirmation_is_requester_bound_single_use_and_immutable(
         actions.consume(pending.token, OWNER, now=NOW)
 
 
+def test_public_action_cannot_be_registered_through_module_or_instance_state(
+    actions: PendingActionService,
+) -> None:
+    forged = ConsumedAction("delete", {"monitor_id": "m1"}, OWNER)
+
+    assert not hasattr(actions_module, "_register_consumed_action")
+    assert not hasattr(actions_module, "_claim_consumed_action")
+    assert not hasattr(actions_module, "_discard_consumed_action")
+    assert not hasattr(actions_module, "_make_consumed_action_registry")
+    service_slots = {
+        slot
+        for service_type in PendingActionService.__mro__
+        for slot in getattr(service_type, "__slots__", ())
+    }
+    assert service_slots == {
+        "_connection",
+        "_connection_anchor",
+        "_token_source",
+        "_token_source_anchor",
+    }
+    assert set(ConsumedAction.__slots__) == {
+        "action",
+        "payload",
+        "owner_id",
+        "operation",
+    }
+    assert actions.claim(forged) is False
+    assert actions.discard(forged) is False
+
+
 def test_wrong_owner_does_not_consume_valid_action(actions: PendingActionService) -> None:
     pending = actions.create(OWNER, "delete", {"monitor_id": "m1"}, now=NOW)
 
