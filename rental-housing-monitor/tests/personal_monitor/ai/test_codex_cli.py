@@ -518,10 +518,18 @@ def test_worker_cannot_capture_an_arbitrary_run_callable(tmp_path: Path) -> None
         async def run(self, *_args: object) -> IntentResult:
             raise AssertionError
 
+        async def check(self) -> None:
+            raise AssertionError
+
     directory = tmp_path / "socket"
     directory.mkdir(mode=0o700)
     with pytest.raises(CodexWorkerError):
-        CodexWorkerServer(directory / "worker.sock", Arbitrary())
+        arbitrary = Arbitrary()
+        CodexWorkerServer(
+            directory / "worker.sock",
+            arbitrary,
+            auth_check=arbitrary.check,
+        )
 
 
 @async_test

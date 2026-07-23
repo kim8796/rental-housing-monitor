@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -287,6 +288,15 @@ def test_runtime_composition_without_key_keeps_builtins_and_rejects_only_rental(
         runner.adapters.resolve(SourceAdapterKind.PYTHON_PLUGIN, "rental_housing")
     assert caught.value.error_class is ErrorClass.POLICY
     assert "key" not in str(caught.value).casefold()
+
+
+def test_production_heartbeat_uses_worker_auth_without_monitor_codex_home() -> None:
+    source = inspect.getsource(service_module.build_service)
+    assert "CodexAuthGuard" not in source
+    assert "PERSONAL_MONITOR_CODEX_HOME" not in source
+    assert "PERSONAL_MONITOR_CODEX_BINARY" not in source
+    assert "PERSONAL_MONITOR_NODE_BINARY" not in source
+    assert "auth_guard=worker" in source
 
 
 def test_telegram_delivery_uses_configured_address_not_untrusted_outbox_address() -> None:

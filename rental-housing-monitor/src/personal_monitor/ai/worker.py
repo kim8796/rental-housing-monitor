@@ -11,7 +11,7 @@ from typing import Final
 
 from pydantic import ValidationError
 
-from .auth import CodexAuthError
+from .auth import CodexAuthError, CodexAuthGuard
 from .codex_cli import (
     MAX_FRAME_BYTES,
     CodexCli,
@@ -34,6 +34,7 @@ _READ_TIMEOUT: Final = 5.0
 _EOF_TIMEOUT: Final = 1.0
 _CLOSE_TIMEOUT: Final = 1.0
 _RUN_TIMEOUT: Final = 125.0
+_AUTH_CHECK_TIMEOUT: Final = 12.0
 _HANDLER_TIMEOUT: Final = 128.0
 _CLIENT_TIMEOUT: Final = 130.0
 
@@ -155,9 +156,15 @@ def _parse_worker_request(value: object) -> WorkerRequest:
         raise CodexWorkerError from None
 
 
+def _is_auth_status_request(value: object) -> bool:
+    return type(value) is dict and set(value) == {"kind"} and value.get("kind") == "auth_status"
+
+
 class CodexWorkerServer:
     __slots__ = (
         "_active",
+        "_auth_check",
+        "_auth_check_anchor",
         "_connections",
         "_handle_anchor",
         "_identity",
@@ -170,8 +177,23 @@ class CodexWorkerServer:
         "_tasks",
     )
 
-    def __init__(self, socket_path: Path, cli: CodexCli, *, concurrency: int = 1) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        cli: CodexCli,
+        *,
+        auth_check: object,
+        concurrency: int = 1,
+    ) -> None:
         if type(self) is not CodexWorkerServer or concurrency != 1 or type(cli) is not CodexCli:
+            raise CodexWorkerError
+        if (
+            not callable(auth_check)
+            or getattr(auth_check, "__self__", None) is None
+            or type(auth_check.__self__) is not CodexAuthGuard
+            or getattr(auth_check, "__func__", None) is not CodexAuthGuard.check
+            or auth_check.__self__ is not cli._auth_guard_anchor
+        ):
             raise CodexWorkerError
         parent, parent_identity = _safe_socket_parent(Path(socket_path))
         path = parent / Path(socket_path).name
@@ -198,6 +220,8 @@ class CodexWorkerServer:
         object.__setattr__(self, "_parent_identity", parent_identity)
         object.__setattr__(self, "_run", run)
         object.__setattr__(self, "_run_anchor", run)
+        object.__setattr__(self, "_auth_check", auth_check)
+        object.__setattr__(self, "_auth_check_anchor", auth_check)
         object.__setattr__(self, "_active", asyncio.Semaphore(1))
         object.__setattr__(self, "_connections", set())
         object.__setattr__(self, "_tasks", set())
@@ -212,6 +236,9 @@ class CodexWorkerServer:
         return (
             type(self) is CodexWorkerServer
             and self._run is self._run_anchor
+            and self._auth_check is self._auth_check_anchor
+            and self._auth_check_anchor.__func__ is CodexAuthGuard.check
+            and type(self._auth_check_anchor.__self__) is CodexAuthGuard
             and self._handle_anchor.__self__ is self
             and self._handle_anchor.__func__ is CodexWorkerServer._handle
         )
@@ -306,6 +333,12 @@ class CodexWorkerServer:
     async def _response_for(self, reader: asyncio.StreamReader) -> object:
         try:
             value = await _read_frame(reader)
+            if _is_auth_status_request(value):
+                await asyncio.wait_for(
+                    self._auth_check_anchor(),
+                    _AUTH_CHECK_TIMEOUT,
+                )
+                return {"ok": True, "authenticated": True}
             request = _parse_worker_request(value)
             if self._active.locked():
                 return WorkerFailure(ok=False, error_code="busy").model_dump()
@@ -404,6 +437,57 @@ class CodexWorkerClient:
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("CodexWorkerClient composition is sealed")
 
+    def _require_socket(self) -> None:
+        _require_parent(self._parent, self._parent_identity)
+        metadata = self._socket_path.lstat()
+        if (
+            not stat.S_ISSOCK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (metadata.st_dev, metadata.st_ino) != self._socket_identity
+        ):
+            raise CodexWorkerError
+
+    async def _exchange(self, envelope: object) -> object:
+        self._require_socket()
+        reader: asyncio.StreamReader
+        writer: asyncio.StreamWriter
+        reader, writer = await asyncio.open_unix_connection(self._socket_path)
+        try:
+            self._require_socket()
+            writer.write(_encode(envelope))
+            await writer.drain()
+            if not writer.can_write_eof():
+                raise CodexWorkerError
+            writer.write_eof()
+            value = await _read_frame(reader)
+        finally:
+            await _shielded_close_writer(writer)
+        _scan_secrets(value)
+        return value
+
+    async def check(self) -> None:
+        try:
+            value = await asyncio.wait_for(
+                self._exchange({"kind": "auth_status"}),
+                _CLIENT_TIMEOUT,
+            )
+            if type(value) is not dict or type(value.get("ok")) is not bool:
+                raise CodexWorkerError
+            if (
+                set(value) != {"ok", "authenticated"}
+                or value["ok"] is not True
+                or type(value.get("authenticated")) is not bool
+                or value["authenticated"] is not True
+            ):
+                raise CodexWorkerError
+        except asyncio.CancelledError:
+            raise
+        except CodexWorkerError:
+            raise
+        except Exception:
+            raise CodexWorkerError from None
+
     async def run(
         self,
         request: RequestModel,
@@ -412,45 +496,16 @@ class CodexWorkerClient:
         effort: str = "medium",
     ):
         try:
-            _require_parent(self._parent, self._parent_identity)
-            metadata = self._socket_path.lstat()
-            if (
-                not stat.S_ISSOCK(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or (metadata.st_dev, metadata.st_ino) != self._socket_identity
-            ):
-                raise CodexWorkerError
             envelope = WorkerRequest(
                 kind=request_kind(request),
                 request=request,
                 model=model,
                 effort=effort,
             )
-        except (ValidationError, OSError, TypeError):
-            raise CodexWorkerError from None
-
-        async def exchange():
-            reader: asyncio.StreamReader
-            writer: asyncio.StreamWriter
-            reader, writer = await asyncio.open_unix_connection(self._socket_path)
-            try:
-                _require_parent(self._parent, self._parent_identity)
-                connected = self._socket_path.lstat()
-                if (
-                    not stat.S_ISSOCK(connected.st_mode)
-                    or (connected.st_dev, connected.st_ino) != self._socket_identity
-                ):
-                    raise CodexWorkerError
-                writer.write(_encode(envelope.model_dump(mode="json")))
-                await writer.drain()
-                if not writer.can_write_eof():
-                    raise CodexWorkerError
-                writer.write_eof()
-                value = await _read_frame(reader)
-            finally:
-                await _shielded_close_writer(writer)
-            _scan_secrets(value)
+            value = await asyncio.wait_for(
+                self._exchange(envelope.model_dump(mode="json")),
+                _CLIENT_TIMEOUT,
+            )
             if type(value) is not dict or type(value.get("ok")) is not bool:
                 raise CodexWorkerError
             if value["ok"] is not True or set(value) != {"ok", "result"}:
@@ -462,9 +517,6 @@ class CodexWorkerClient:
                 raise CodexWorkerError from None
             _scan_secrets(result.model_dump(mode="python"))
             return result
-
-        try:
-            return await asyncio.wait_for(exchange(), _CLIENT_TIMEOUT)
         except asyncio.CancelledError:
             raise
         except CodexWorkerError:

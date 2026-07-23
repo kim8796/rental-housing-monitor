@@ -132,16 +132,28 @@ def test_serve_mode_validates_private_paths_and_initializes_database() -> None:
         "PERSONAL_MONITOR_DATABASE_PATH",
         "PERSONAL_MONITOR_ADAPTIVE_ROOT",
         "PERSONAL_MONITOR_DIAGNOSTICS_ROOT",
-        "PERSONAL_MONITOR_LOG_ROOT",
+        "PERSONAL_MONITOR_LOG_PATH",
+        "PERSONAL_MONITOR_BACKUP_STATUS_PATH",
         "PERSONAL_MONITOR_MASTER_KEY_PATH",
+        "PERSONAL_MONITOR_PROFILES_ROOT",
+        "PERSONAL_MONITOR_CODEX_SOCKET",
+        "PERSONAL_MONITOR_EGRESS_PROXY",
     ):
         assert setting in serve
     assert "readlink" in serve
     assert '"$(stat -c %u "$path")" = "10001"' in entrypoint
     assert '"$(stat -c %g "$path")" = "10001"' in entrypoint
     assert '"$(stat -c %a "$path")" = "$mode"' in entrypoint
-    assert '"/srv/personal-monitor/db/"*' in serve
+    assert '"/srv/personal-monitor/db/monitor.db"' in serve
     assert '"$PERSONAL_MONITOR_PROFILES_ROOT/vault" "700"' in serve
+    assert '"/srv/personal-monitor/logs/monitor.jsonl"' in serve
+    assert '"/srv/personal-monitor/logs/backup-status.json"' in serve
+    assert '"/run/personal-monitor-ai/worker.sock"' in serve
+    assert '"http://egress-proxy:3128"' in serve
+    assert "PERSONAL_MONITOR_LOG_ROOT" not in serve
+    assert "wait_for_worker_socket" in serve
+    assert 'validate_optional_regular "$PERSONAL_MONITOR_LOG_PATH" "600"' in serve
+    assert 'validate_optional_regular "$PERSONAL_MONITOR_BACKUP_STATUS_PATH" "600"' in serve
     init = 'personal-monitor database init --path "$PERSONAL_MONITOR_DATABASE_PATH"'
     assert init in serve
     assert init in serve
@@ -154,6 +166,8 @@ def test_ai_worker_validates_only_its_private_directories() -> None:
     assert "PERSONAL_MONITOR_CODEX_HOME" in worker
     assert "PERSONAL_MONITOR_CODEX_TASK_ROOT" in worker
     assert "/run/personal-monitor-ai" in worker
+    assert '"/run/personal-monitor-ai/worker.sock"' in worker
+    assert "remove_stale_worker_socket" in worker
     assert 'exec "$@"' in worker
     for forbidden in (
         "DATABASE",
@@ -167,6 +181,23 @@ def test_ai_worker_validates_only_its_private_directories() -> None:
         assert forbidden not in worker
 
 
+def test_worker_socket_wait_and_stale_cleanup_are_exact_and_bounded() -> None:
+    entrypoint = _text(ENTRYPOINT)
+    wait = _between(entrypoint, "wait_for_worker_socket()", "remove_stale_worker_socket()")
+    remove = _between(entrypoint, "remove_stale_worker_socket()", "wait_for_display()")
+    socket_validation = _between(entrypoint, "validate_socket()", "wait_for_worker_socket()")
+    assert "socket_path=/run/personal-monitor-ai/worker.sock" in wait
+    assert '"$attempts" -lt 100' in wait
+    assert 'validate_socket "$socket_path"' in wait
+    assert "socket_path=/run/personal-monitor-ai/worker.sock" in remove
+    assert 'validate_socket "$socket_path"' in remove
+    assert 'rm -f "$socket_path"' in remove
+    assert "*" not in remove
+    assert '"$(stat -c %u "$path")" = "10001"' in socket_validation
+    assert '"$(stat -c %g "$path")" = "10001"' in socket_validation
+    assert '"$(stat -c %a "$path")" = "600"' in socket_validation
+
+
 def test_profile_mode_contains_local_ui_lifecycle_and_exec() -> None:
     entrypoint = _text(ENTRYPOINT)
     profile = _between(entrypoint, "profile-bootstrap)")
@@ -178,8 +209,24 @@ def test_profile_mode_contains_local_ui_lifecycle_and_exec() -> None:
     assert "websockify" in profile
     assert "6080" in profile
     assert "trap" in profile
+    assert "wait_for_display" in profile
+    assert 'wait_for_tcp "5900"' in profile
+    assert 'wait_for_tcp "6080"' in profile
+    assert "kill -0" in entrypoint
+    assert "BOOTSTRAP_PID" in profile
     assert "personal-monitor profile bootstrap" in profile
-    assert 'exec "$@"' in profile
+    assert '(exec "$@") <&0 &' in profile
+
+
+def test_profile_readiness_and_cleanup_are_bounded_and_owner_checked() -> None:
+    entrypoint = _text(ENTRYPOINT)
+    display_wait = _between(entrypoint, "wait_for_display()", "tcp_ready()")
+    cleanup = _between(entrypoint, "stop_process()", 'if [ "${1-}" = "personal-monitor" ]')
+    assert '"$(stat -c %u "$display_socket")" = "10001"' in display_wait
+    assert '"$(readlink -f "$display_socket")" = "$display_socket"' in display_wait
+    assert "stop_process()" in entrypoint
+    assert "kill -KILL" in cleanup
+    assert "sleep 0.2" in cleanup
 
 
 def test_entrypoint_has_valid_posix_shell_syntax() -> None:

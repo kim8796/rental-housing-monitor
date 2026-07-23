@@ -82,7 +82,14 @@ class FakeProcess:
 
 
 class SecureHarness:
-    def __init__(self, directory: Path) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        authenticated: bool = True,
+        auth_wait_delay: float = 0,
+    ) -> None:
+        self.auth_calls = 0
         self.exec_calls = 0
         self.active = 0
         self.max_active = 0
@@ -92,7 +99,9 @@ class SecureHarness:
         root.mkdir(mode=0o700)
 
         async def auth_spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
-            return FakeProcess(b"Logged in using ChatGPT\n")
+            self.auth_calls += 1
+            output = b"Logged in using ChatGPT\n" if authenticated else b"Not logged in\n"
+            return FakeProcess(output, wait_delay=auth_wait_delay)
 
         async def exec_spawn(*argv: str, **_kwargs: object) -> FakeProcess:
             self.exec_calls += 1
@@ -121,6 +130,7 @@ class SecureHarness:
             )
 
         guard = CodexAuthGuard("/usr/bin/true", home, process_factory=auth_spawn)
+        self.guard = guard
         self.cli = CodexCli(
             "/usr/bin/true",
             home,
@@ -143,7 +153,11 @@ def intent(index: int = 1) -> IntentRequest:
 async def test_worker_socket_happy_path_permissions_and_busy_rejection() -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    server = CodexWorkerServer(socket_path, harness.cli)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
     await server.start()
     try:
         assert socket_path.stat().st_mode & 0o777 == 0o600
@@ -176,7 +190,11 @@ async def test_worker_socket_happy_path_permissions_and_busy_rejection() -> None
 async def test_worker_rejects_invalid_frame_without_codex(length: int) -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    server = CodexWorkerServer(socket_path, harness.cli)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
     await server.start()
     try:
         reader, writer = await asyncio.open_unix_connection(socket_path)
@@ -196,7 +214,11 @@ async def test_worker_rejects_invalid_frame_without_codex(length: int) -> None:
 async def test_delayed_second_frame_never_invokes_codex() -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    server = CodexWorkerServer(socket_path, harness.cli)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
     await server.start()
     try:
         reader, writer = await asyncio.open_unix_connection(socket_path)
@@ -283,7 +305,11 @@ async def test_client_recursively_rejects_secret_in_safe_shaped_result() -> None
 async def test_server_and_client_reject_parent_rename_replacement() -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    server = CodexWorkerServer(socket_path, harness.cli)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
     await server.start()
     client = CodexWorkerClient(socket_path)
     moved = directory.with_name(directory.name + "-moved")
@@ -304,7 +330,11 @@ async def test_server_and_client_reject_parent_rename_replacement() -> None:
 async def test_client_rejects_same_mode_socket_identity_replacement() -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    secured_server = CodexWorkerServer(socket_path, harness.cli)
+    secured_server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
     await secured_server.start()
     client = CodexWorkerClient(socket_path)
     socket_path.unlink()
@@ -334,6 +364,8 @@ async def test_client_rejects_same_mode_socket_identity_replacement() -> None:
     try:
         with pytest.raises(CodexWorkerError):
             await client.run(intent())
+        with pytest.raises(CodexWorkerError):
+            await client.check()
         assert harness.exec_calls == 0
     finally:
         malicious_server.close()
@@ -347,7 +379,11 @@ async def test_client_rejects_same_mode_socket_identity_replacement() -> None:
 async def test_deep_frame_never_invokes() -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    server = CodexWorkerServer(socket_path, harness.cli)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
     await server.start()
     try:
         reader, writer = await asyncio.open_unix_connection(socket_path)
@@ -376,7 +412,11 @@ async def test_start_failure_removes_only_created_socket(
 ) -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    server = CodexWorkerServer(socket_path, harness.cli)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
 
     async def fail_start(*_args: object, **_kwargs: object):
         raise RuntimeError("private-start-failure")
@@ -397,7 +437,11 @@ async def test_slowloris_header_times_out_without_invocation(
 ) -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    server = CodexWorkerServer(socket_path, harness.cli)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
     monkeypatch.setattr("personal_monitor.ai.worker._READ_TIMEOUT", 0.02)
     await server.start()
     try:
@@ -418,7 +462,11 @@ async def test_slowloris_header_times_out_without_invocation(
 async def test_close_cancels_active_handler_and_clears_bookkeeping() -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
-    server = CodexWorkerServer(socket_path, harness.cli)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
     await server.start()
     _reader, writer = await asyncio.open_unix_connection(socket_path)
     writer.write((100).to_bytes(4, "big"))
@@ -438,3 +486,197 @@ async def test_close_cancels_active_handler_and_clears_bookkeeping() -> None:
     assert not server._connections
     assert not socket_path.exists()
     shutil.rmtree(directory)
+
+
+async def _raw_exchange(socket_path: Path, value: object) -> object:
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+    payload = json.dumps(value, separators=(",", ":")).encode()
+    writer.write(len(payload).to_bytes(4, "big") + payload)
+    writer.write_eof()
+    await writer.drain()
+    data = await reader.read()
+    writer.close()
+    await writer.wait_closed()
+    size = int.from_bytes(data[:4], "big")
+    assert len(data) == size + 4
+    return json.loads(data[4:])
+
+
+@async_test
+async def test_auth_status_uses_guard_without_model_invocation() -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
+    await server.start()
+    try:
+        client = CodexWorkerClient(socket_path)
+        await server._active.acquire()
+        try:
+            assert await client.check() is None
+            assert server._active.locked()
+        finally:
+            server._active.release()
+        assert harness.auth_calls == 1
+        assert harness.exec_calls == 0
+    finally:
+        await server.close()
+        shutil.rmtree(directory)
+
+
+@async_test
+async def test_auth_status_returns_only_fixed_failure_without_model_invocation() -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory, authenticated=False)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
+    await server.start()
+    try:
+        response = await _raw_exchange(socket_path, {"kind": "auth_status"})
+        assert response == {"ok": False, "error_code": "auth_failed"}
+        client = CodexWorkerClient(socket_path)
+        with pytest.raises(CodexWorkerError):
+            await client.check()
+        assert harness.auth_calls == 2
+        assert harness.exec_calls == 0
+    finally:
+        await server.close()
+        shutil.rmtree(directory)
+
+
+@async_test
+@pytest.mark.parametrize(
+    "payload_value",
+    [
+        {"kind": "auth_status", "extra": True},
+        {"kind": "auth_status", "token": "Bearer abcdefghijklmnopqrstuvwxyz"},
+        {"kind": "auth_status", "request": {}},
+        {"kind": "auth-status"},
+    ],
+)
+async def test_auth_status_rejects_malformed_extra_and_secret_requests(
+    payload_value: object,
+) -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
+    await server.start()
+    try:
+        response = await _raw_exchange(socket_path, payload_value)
+        assert response == {"ok": False, "error_code": "invalid_request"}
+        assert harness.auth_calls == 0
+        assert harness.exec_calls == 0
+    finally:
+        await server.close()
+        shutil.rmtree(directory)
+
+
+@async_test
+async def test_auth_client_rejects_extra_secret_response() -> None:
+    directory, socket_path = short_socket_path()
+
+    async def malicious(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read()
+        payload = json.dumps(
+            {
+                "ok": True,
+                "authenticated": True,
+                "detail": "Bearer abcdefghijklmnopqrstuvwxyz",
+            }
+        ).encode()
+        writer.write(len(payload).to_bytes(4, "big") + payload)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(malicious, path=socket_path)
+    socket_path.chmod(0o600)
+    try:
+        client = CodexWorkerClient(socket_path)
+        with pytest.raises(CodexWorkerError):
+            await client.check()
+    finally:
+        server.close()
+        await server.wait_closed()
+        socket_path.unlink(missing_ok=True)
+        shutil.rmtree(directory)
+
+
+@async_test
+async def test_auth_status_cancellation_propagates_without_model_invocation() -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory, auth_wait_delay=30)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
+    reader = asyncio.StreamReader()
+    payload = b'{"kind":"auth_status"}'
+    reader.feed_data(len(payload).to_bytes(4, "big") + payload)
+    reader.feed_eof()
+    task = asyncio.create_task(server._response_for(reader))
+    for _ in range(100):
+        if harness.auth_calls:
+            break
+        await asyncio.sleep(0)
+    assert harness.auth_calls == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert harness.exec_calls == 0
+    shutil.rmtree(directory)
+
+
+def test_worker_rejects_unsealed_auth_capability() -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+
+    class Arbitrary:
+        async def check(self) -> None:
+            raise AssertionError
+
+    try:
+        with pytest.raises(CodexWorkerError):
+            CodexWorkerServer(
+                socket_path,
+                harness.cli,
+                auth_check=Arbitrary().check,
+            )
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_worker_rejects_auth_capability_from_different_guard() -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+    other_home = directory / "other-home"
+    other_home.mkdir(mode=0o700)
+
+    async def auth_spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        return FakeProcess(b"Logged in using ChatGPT\n")
+
+    other_guard = CodexAuthGuard(
+        "/usr/bin/true",
+        other_home,
+        process_factory=auth_spawn,
+    )
+    try:
+        with pytest.raises(CodexWorkerError):
+            CodexWorkerServer(
+                socket_path,
+                harness.cli,
+                auth_check=other_guard.check,
+            )
+    finally:
+        shutil.rmtree(directory)

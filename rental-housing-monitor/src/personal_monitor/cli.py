@@ -318,7 +318,11 @@ async def _run_ai_worker(socket_path: Path) -> int:
         auth_guard=guard,
         node_binary=node_binary,
     )
-    server = CodexWorkerServer(socket_path, cli)
+    server = CodexWorkerServer(
+        socket_path,
+        cli,
+        auth_check=guard.check,
+    )
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
     installed: list[tuple[signal.Signals, object]] = []

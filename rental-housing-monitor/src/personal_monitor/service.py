@@ -12,7 +12,6 @@ from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -700,7 +699,6 @@ def _runtime_components(
 
 def build_service(settings: object) -> PersonalMonitorService:
     """Compose production dependencies; the event-loop mechanism remains independently testable."""
-    from personal_monitor.ai.auth import CodexAuthGuard
     from personal_monitor.ai.worker import CodexWorkerClient
     from personal_monitor.control.actions import PendingActionService
     from personal_monitor.control.intents import IntentRouter
@@ -761,24 +759,13 @@ def build_service(settings: object) -> PersonalMonitorService:
             actions,
             telegram,
         )
-        codex_home = os.environ.get(
-            "PERSONAL_MONITOR_CODEX_HOME",
-            "/srv/personal-monitor/codex-home",
-        )
-        codex_binary = os.environ.get("PERSONAL_MONITOR_CODEX_BINARY", "codex")
-        node_binary = os.environ.get("PERSONAL_MONITOR_NODE_BINARY") or None
-        auth_guard = CodexAuthGuard(
-            codex_binary,
-            Path(codex_home),
-            node_binary=node_binary,
-        )
         state: dict[str, PersonalMonitorService] = {}
         operator_events = OperatorEventRepository(connection)
         heartbeat = HeartbeatMonitor(
             connection=connection,
             database_path=settings.database_path,
             backup_status_path=settings.backup_status_path,
-            auth_guard=auth_guard,
+            auth_guard=worker,
             operator_events=operator_events,
             scheduler_last_loop=lambda: state["service"].scheduler_last_loop,
             telegram_last_poll=lambda: state["service"].telegram_last_poll,

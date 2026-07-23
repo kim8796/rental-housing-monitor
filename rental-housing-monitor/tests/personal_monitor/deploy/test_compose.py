@@ -235,6 +235,11 @@ def test_profile_bootstrap_is_admin_only_loopback_and_data_isolated() -> None:
     assert 'profiles: ["admin"]' in profile
     assert 'restart: "no"' in profile
     assert 'user: "10001:10001"' in profile
+    assert "stdin_open: true" in profile
+    assert "tty: true" in profile
+    assert "depends_on:" in profile
+    assert "egress-proxy:" in profile
+    assert "condition: service_started" in profile
     assert "entrypoint: [/usr/local/bin/personal-monitor-entrypoint, profile-bootstrap]" in profile
     assert "127.0.0.1:6080:6080" in profile
     assert "PERSONAL_MONITOR_EGRESS_PROXY=http://egress-proxy:3128" in profile
@@ -323,6 +328,7 @@ def test_squid_limits_ports_bodies_and_sensitive_logging() -> None:
 
 def test_squid_denies_metadata_private_reserved_and_ipv6_ranges() -> None:
     squid = _text(SQUID)
+    allow_index = squid.index("http_access allow monitor_network safe_ports")
     for value in (
         "metadata.google.internal",
         "169.254.169.254/32",
@@ -340,9 +346,18 @@ def test_squid_denies_metadata_private_reserved_and_ipv6_ranges() -> None:
         "224.0.0.0/4",
         "240.0.0.0/4",
         "::1/128",
+        "::ffff:0:0/96",
+        "64:ff9b::/96",
+        "64:ff9b:1::/48",
+        "100::/64",
+        "2001::/23",
+        "2002::/16",
+        "3fff::/20",
+        "5f00::/16",
         "fc00::/7",
         "fe80::/10",
         "ff00::/8",
         "2001:db8::/32",
     ):
         assert value in squid
+        assert squid.index(value) < allow_index
