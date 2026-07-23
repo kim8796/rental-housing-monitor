@@ -6,22 +6,22 @@ import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
 from personal_monitor.domain.observation import ObservationBatch, ObservedItem, content_hash
-from personal_monitor.domain.rules import RuleMatch, evaluate_rules
-from personal_monitor.domain.spec import RuleKind
+from personal_monitor.domain.rules import evaluate_rules
 from personal_monitor.domain.validator import validate_batch
-from personal_monitor.engine.runner import render_payload
 from personal_monitor.migration.import_rental import (
     IMPORT_MARKER_ID,
     RENTAL_MONITOR_ID,
     RENTAL_VERSION_ID,
-    _outbox_id,
+    RentalImportError,
     _read_legacy_shadow_snapshot,
     _rental_spec,
+    _validate_imported_rental_aggregate,
 )
 from personal_monitor.storage.registry import RegistryRepository
 from personal_monitor.storage.schema import canonical_json, transaction, utc_now
@@ -29,7 +29,8 @@ from personal_monitor.storage.schema import canonical_json, transaction, utc_now
 _AGENCIES = ("LH", "SH", "GH")
 _AGENCY_SET = frozenset(_AGENCIES)
 _STATUS_SET = frozenset({"ok", "failed"})
-_ITEM_ID = re.compile(r"announcement:(LH|SH|GH):[^\s:][^\s]{0,508}\Z")
+_RAW_ITEM_ID = re.compile(r"announcement:(LH|SH|GH):(.+)\Z", re.DOTALL)
+_OPAQUE_ITEM_ID = re.compile(r"announcement:(LH|SH|GH):sha256-[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_ITEMS = 10_000
 _MAX_ID_BYTES = 512
@@ -71,20 +72,36 @@ def _bounded_count(value: object, *, name: str) -> int:
     return value
 
 
-def _item_id(value: object, *, agency: str | None = None) -> str:
+def _raw_item_id(value: object, *, agency: str | None = None) -> str:
     if type(value) is not str:
         raise ValueError("item identity is invalid")
     try:
         encoded = value.encode("utf-8")
     except UnicodeEncodeError:
         raise ValueError("item identity is invalid") from None
-    match = _ITEM_ID.fullmatch(value)
+    match = _RAW_ITEM_ID.fullmatch(value)
     if (
         match is None
         or len(encoded) > _MAX_ID_BYTES
         or "\x00" in value
+        or not match.group(2).strip()
         or (agency is not None and match.group(1) != agency)
     ):
+        raise ValueError("item identity is invalid")
+    return value
+
+
+def _opaque_item_id(value: object, *, agency: str) -> str:
+    raw = _raw_item_id(value, agency=agency)
+    digest = sha256(raw.encode("utf-8")).hexdigest()
+    return f"announcement:{agency}:sha256-{digest}"
+
+
+def _item_id(value: object, *, agency: str | None = None) -> str:
+    if type(value) is not str:
+        raise ValueError("item identity is invalid")
+    match = _OPAQUE_ITEM_ID.fullmatch(value)
+    if match is None or (agency is not None and match.group(1) != agency):
         raise ValueError("item identity is invalid")
     return value
 
@@ -120,7 +137,7 @@ class ShadowItem:
     def __post_init__(self) -> None:
         if type(self.agency) is not str or self.agency not in _AGENCY_SET:
             raise ValueError("agency is invalid")
-        _item_id(self.item_id, agency=self.agency)
+        _raw_item_id(self.item_id, agency=self.agency)
         if type(self.filter_outcome) is not str or self.filter_outcome != "included":
             raise ValueError("filter outcome is invalid")
 
@@ -295,8 +312,18 @@ class ShadowComparator:
         differences = tuple(
             ShadowDifference(
                 agency=agency,
-                missing_ids=tuple(sorted(old_by_agency[agency] - new_by_agency[agency])),
-                extra_ids=tuple(sorted(new_by_agency[agency] - old_by_agency[agency])),
+                missing_ids=tuple(
+                    sorted(
+                        _opaque_item_id(item_id, agency=agency)
+                        for item_id in old_by_agency[agency] - new_by_agency[agency]
+                    )
+                ),
+                extra_ids=tuple(
+                    sorted(
+                        _opaque_item_id(item_id, agency=agency)
+                        for item_id in new_by_agency[agency] - old_by_agency[agency]
+                    )
+                ),
             )
             for agency in sorted(_AGENCIES)
             if old_by_agency[agency] != new_by_agency[agency]
@@ -488,25 +515,29 @@ async def run_duplicate_probe(
         local_today = evidence_time.astimezone(_SEOUL).date()
         if run_date not in {local_today, local_today - timedelta(days=1)}:
             raise ValueError("adapter batch date is invalid")
-        current = _snapshot_from_batch(batch, active.spec, run_date)
-        missing, conflicting, aggregate_ok = _probe_imported_state(
-            repository.connection,
-            batch,
-            active.spec,
-        )
-        complete = not batch.warnings and all(
-            current.source_status[agency] == "ok" for agency in _AGENCIES
-        )
-        result = DuplicateProbeResult(
-            monitor_id=RENTAL_MONITOR_ID,
-            run_date=run_date,
-            current_hash=content_hash(_safe_snapshot(current)),
-            passed=complete and aggregate_ok and not missing and not conflicting,
-            missing_ids=missing,
-            conflicting_ids=conflicting,
-            recorded_at=evidence_time,
-        )
-        repository.record_duplicate_probe(result)
+        with transaction(repository.connection, immediate=True):
+            revalidated = _active_rental(repository)
+            if revalidated.version_id != active.version_id or revalidated.spec != active.spec:
+                raise ValueError("rental monitor changed during probe")
+            current = _snapshot_from_batch(batch, revalidated.spec, run_date)
+            missing, conflicting, aggregate_ok = _probe_imported_state(
+                repository.connection,
+                batch,
+                revalidated.spec,
+            )
+            complete = not batch.warnings and all(
+                current.source_status[agency] == "ok" for agency in _AGENCIES
+            )
+            result = DuplicateProbeResult(
+                monitor_id=RENTAL_MONITOR_ID,
+                run_date=run_date,
+                current_hash=content_hash(_safe_snapshot(current)),
+                passed=complete and aggregate_ok and not missing and not conflicting,
+                missing_ids=missing,
+                conflicting_ids=conflicting,
+                recorded_at=evidence_time,
+            )
+            repository._upsert_duplicate_probe(_probe_values(result))
         return result
     except Exception:
         raise RentalDuplicateProbeError from None
@@ -518,8 +549,9 @@ def _probe_imported_state(
     spec: object,
 ) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
     try:
-        imported = _state_imported(connection)
-    except RuntimeError:
+        _validate_imported_rental_aggregate(connection)
+        imported = True
+    except RentalImportError:
         imported = False
     rows = connection.execute(
         "SELECT item_id, fields_json, content_hash FROM observations "
@@ -532,7 +564,7 @@ def _probe_imported_state(
     aggregate_ok = imported
     for row in rows:
         try:
-            item_id = _item_id(row["item_id"])
+            item_id = _raw_item_id(row["item_id"])
         except (KeyError, TypeError, ValueError, UnicodeError):
             aggregate_ok = False
             continue
@@ -560,65 +592,18 @@ def _probe_imported_state(
         expected = (canonical_json(item.fields), content_hash(item.fields))
         actual = stored.get(item.item_id)
         if actual is None:
-            missing.append(item.item_id)
+            agency = item.fields.get("agency")
+            if type(agency) is not str:
+                aggregate_ok = False
+                continue
+            missing.append(_opaque_item_id(item.item_id, agency=agency))
         elif actual != expected:
-            conflicting.append(item.item_id)
-    if not _delivered_aggregate_consistent(connection, spec):
-        aggregate_ok = False
+            agency = item.fields.get("agency")
+            if type(agency) is not str:
+                aggregate_ok = False
+                continue
+            conflicting.append(_opaque_item_id(item.item_id, agency=agency))
     return tuple(sorted(missing)), tuple(sorted(conflicting)), aggregate_ok
-
-
-def _delivered_aggregate_consistent(connection: sqlite3.Connection, spec: object) -> bool:
-    rows = connection.execute(
-        "SELECT o.id, o.dedupe_key, o.target_id, o.payload_json, o.status, "
-        "o.attempt_count, o.available_at, o.last_error, o.lease_owner, "
-        "o.lease_expires_at, o.created_at, d.target_id AS delivery_target, "
-        "d.external_message_id, d.delivered_at, ob.item_id, ob.fields_json, "
-        "m.owner_id AS monitor_owner, t.owner_id AS target_owner "
-        "FROM outbox AS o "
-        "LEFT JOIN deliveries AS d ON d.outbox_id = o.id "
-        "LEFT JOIN observations AS ob ON ob.monitor_id = o.monitor_id "
-        "AND o.dedupe_key = o.monitor_id || ':' || ob.item_id || ':new_item' "
-        "LEFT JOIN monitors AS m ON m.id = o.monitor_id "
-        "LEFT JOIN delivery_targets AS t ON t.id = o.target_id "
-        "WHERE o.monitor_id = ? ORDER BY o.id LIMIT ?",
-        (RENTAL_MONITOR_ID, _MAX_ITEMS + 1),
-    ).fetchall()
-    if len(rows) > _MAX_ITEMS:
-        return False
-    for row in rows:
-        try:
-            item_id = _item_id(row["item_id"])
-            dedupe_key = f"{RENTAL_MONITOR_ID}:{item_id}:new_item"
-            fields = _unique_json(row["fields_json"])
-            if type(fields) is not dict or canonical_json(fields) != row["fields_json"]:
-                return False
-            payload = render_payload(
-                spec,  # type: ignore[arg-type]
-                ObservedItem(item_id=item_id, fields=fields),
-                RuleMatch(RuleKind.NEW_ITEM, None, None, None),
-            )
-            if (
-                row["dedupe_key"] != dedupe_key
-                or row["id"] != _outbox_id(dedupe_key)
-                or row["payload_json"] != canonical_json(payload)
-                or row["status"] != "delivered"
-                or type(row["attempt_count"]) is not int
-                or row["attempt_count"] != 0
-                or row["available_at"] != row["created_at"]
-                or row["created_at"] != row["delivered_at"]
-                or row["last_error"] is not None
-                or row["lease_owner"] is not None
-                or row["lease_expires_at"] is not None
-                or row["target_id"] != row["delivery_target"]
-                or type(row["external_message_id"]) is not str
-                or not row["external_message_id"]
-                or row["monitor_owner"] != row["target_owner"]
-            ):
-                return False
-        except (KeyError, TypeError, ValueError, UnicodeError):
-            return False
-    return True
 
 
 class ShadowRepository:
@@ -666,80 +651,104 @@ class ShadowRepository:
         values = _probe_values(result)
         try:
             with transaction(self.connection, immediate=True):
-                self.connection.execute(
-                    "INSERT INTO rental_duplicate_probe_results("
-                    "monitor_id, run_date, current_hash, passed, differences_json, recorded_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(monitor_id) DO UPDATE SET "
-                    "run_date=excluded.run_date,current_hash=excluded.current_hash,"
-                    "passed=excluded.passed,differences_json=excluded.differences_json,"
-                    "recorded_at=excluded.recorded_at",
-                    values,
-                )
+                self._upsert_duplicate_probe(values)
         except sqlite3.Error:
             raise RuntimeError("duplicate probe storage failed") from None
 
+    def _upsert_duplicate_probe(self, values: tuple[object, ...]) -> None:
+        self.connection.execute(
+            "INSERT INTO rental_duplicate_probe_results("
+            "monitor_id, run_date, current_hash, passed, differences_json, recorded_at"
+            ") VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(monitor_id) DO UPDATE SET "
+            "run_date=excluded.run_date,current_hash=excluded.current_hash,"
+            "passed=excluded.passed,differences_json=excluded.differences_json,"
+            "recorded_at=excluded.recorded_at",
+            values,
+        )
+
     def status(self, as_of: date) -> MigrationStatus:
         requested = _date(as_of, name="as-of date")
-        now = _aware_time(self._clock(), name="clock").astimezone(_SEOUL).date()
-        if requested > now:
+        evidence_time = _aware_time(self._clock(), name="clock").astimezone(UTC)
+        today = evidence_time.astimezone(_SEOUL).date()
+        if requested > today:
             raise ValueError("as-of date is invalid")
-        rows = self.connection.execute(
-            "SELECT run_date, old_hash, new_hash, matched, differences_json, "
-            "old_status_json, new_status_json, recorded_at "
-            "FROM rental_shadow_results ORDER BY run_date DESC LIMIT ?",
-            (_MAX_STORED_ROWS + 1,),
-        ).fetchall()
-        if len(rows) > _MAX_STORED_ROWS:
-            raise RuntimeError("shadow storage is invalid")
-        results = tuple(_result_from_row(row) for row in rows)
-        if any(result.run_date > now for result in results):
-            raise RuntimeError("shadow storage is invalid")
-        eligible = tuple(result for result in results if result.run_date <= requested)
-        newest = eligible[0] if eligible else None
-        consecutive = 0
-        if newest is not None:
-            expected = newest.run_date
-            for result in eligible:
-                if result.run_date != expected or not result.matched:
-                    break
-                consecutive += 1
-                expected -= timedelta(days=1)
-        unresolved = _unresolved(newest) if newest is not None else 0
-        imported = _state_imported(self.connection)
-        probe = _load_probe(self.connection)
-        if probe is not None and probe.run_date > now:
-            raise RuntimeError("duplicate probe storage is invalid")
-        probe_passed = probe is not None and probe.run_date <= requested and probe.passed
-        recent_shadow = newest is not None and newest.run_date in {
-            requested,
-            requested - timedelta(days=1),
-        }
-        probe_fresh = (
-            probe is not None
-            and newest is not None
-            and probe.run_date >= newest.run_date
-            and probe.run_date in {requested, requested - timedelta(days=1)}
-        )
-        ready = (
-            recent_shadow
-            and consecutive >= 7
-            and unresolved == 0
-            and imported
-            and probe_passed
-            and probe_fresh
-        )
-        return MigrationStatus(
-            consecutive_matches=consecutive,
-            last_match_date=newest.run_date if newest is not None and newest.matched else None,
-            unresolved_differences=unresolved,
-            state_imported=imported,
-            duplicate_probe_passed=probe_passed,
-            cutover_ready=ready,
-        )
+        with transaction(self.connection):
+            return _status_from_snapshot(
+                self.connection,
+                requested,
+                today,
+                evidence_time,
+            )
 
     def cutover_ready(self, as_of: date) -> bool:
         return self.status(as_of).cutover_ready
+
+
+def _status_from_snapshot(
+    connection: sqlite3.Connection,
+    requested: date,
+    today: date,
+    evidence_time: datetime,
+) -> MigrationStatus:
+    rows = connection.execute(
+        "SELECT run_date, old_hash, new_hash, matched, differences_json, "
+        "old_status_json, new_status_json, recorded_at "
+        "FROM rental_shadow_results ORDER BY run_date DESC LIMIT ?",
+        (_MAX_STORED_ROWS + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_STORED_ROWS:
+        raise RuntimeError("shadow storage is invalid")
+    results = tuple(_result_from_row(row) for row in rows)
+    if any(
+        result.run_date > today or result.recorded_at.astimezone(UTC) > evidence_time
+        for result in results
+    ):
+        raise RuntimeError("shadow storage is invalid")
+    eligible = tuple(result for result in results if result.run_date <= requested)
+    newest = eligible[0] if eligible else None
+    consecutive = 0
+    if newest is not None:
+        expected = newest.run_date
+        for result in eligible:
+            if result.run_date != expected or not result.matched:
+                break
+            consecutive += 1
+            expected -= timedelta(days=1)
+    unresolved = _unresolved(newest) if newest is not None else 0
+    imported = _state_imported(connection, evidence_time)
+    probe = _load_probe(connection)
+    if probe is not None and (
+        probe.run_date > today or probe.recorded_at.astimezone(UTC) > evidence_time
+    ):
+        raise RuntimeError("duplicate probe storage is invalid")
+    probe_passed = probe is not None and probe.run_date <= requested and probe.passed
+    recent_shadow = newest is not None and newest.run_date in {
+        requested,
+        requested - timedelta(days=1),
+    }
+    probe_fresh = (
+        probe is not None
+        and newest is not None
+        and probe.run_date >= newest.run_date
+        and probe.run_date in {requested, requested - timedelta(days=1)}
+    )
+    ready = (
+        recent_shadow
+        and consecutive >= 7
+        and unresolved == 0
+        and imported
+        and probe_passed
+        and probe_fresh
+    )
+    return MigrationStatus(
+        consecutive_matches=consecutive,
+        last_match_date=newest.run_date if newest is not None and newest.matched else None,
+        unresolved_differences=unresolved,
+        state_imported=imported,
+        duplicate_probe_passed=probe_passed,
+        cutover_ready=ready,
+    )
 
 
 def _result_values(result: object) -> tuple[object, ...]:
@@ -906,7 +915,7 @@ def _load_probe(connection: sqlite3.Connection) -> DuplicateProbeResult | None:
     return _probe_from_row(rows[0])
 
 
-def _state_imported(connection: sqlite3.Connection) -> bool:
+def _state_imported(connection: sqlite3.Connection, evidence_time: datetime) -> bool:
     row = connection.execute(
         "SELECT monitor_id, version_id, lease_generation, stage, fetch_strategy, status, "
         "started_at, finished_at, error_class, error_detail FROM runs WHERE id = ?",
@@ -933,6 +942,7 @@ def _state_imported(connection: sqlite3.Connection) -> bool:
             and finished.utcoffset() is not None
             and started.astimezone(UTC).isoformat() == values[6]
             and values[6] == values[7]
+            and started.astimezone(UTC) <= evidence_time
         )
     except (TypeError, ValueError):
         valid_time = False

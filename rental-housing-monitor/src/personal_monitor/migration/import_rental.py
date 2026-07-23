@@ -1932,3 +1932,169 @@ def _ensure_marker(
         )
         return True
     return False
+
+
+def _validate_imported_rental_aggregate(connection: sqlite3.Connection) -> None:
+    """Validate the durable Task 2 aggregate through its exact dry-run mapping checks."""
+    try:
+        marker = connection.execute(
+            "SELECT started_at, finished_at FROM runs WHERE id = ?",
+            (IMPORT_MARKER_ID,),
+        ).fetchone()
+        monitor = connection.execute(
+            "SELECT owner_id FROM monitors WHERE id = ?",
+            (RENTAL_MONITOR_ID,),
+        ).fetchone()
+        if marker is None or monitor is None:
+            raise RentalImportError("imported aggregate is incomplete")
+        timestamp = _canonical_timestamp(marker["started_at"])
+        if marker["started_at"] != timestamp or marker["finished_at"] != timestamp:
+            raise RentalImportError("import marker conflicts")
+        owner_id = monitor["owner_id"]
+        telegram_user_id = _telegram_user_id(owner_id)
+        spec = _rental_spec(owner_id)
+        if _ensure_user(connection, owner_id, telegram_user_id, timestamp, True):
+            raise RentalImportError("owner aggregate is incomplete")
+        monitor_created, version_created = _ensure_monitor_version(
+            connection,
+            owner_id,
+            spec,
+            timestamp,
+            True,
+        )
+        if monitor_created or version_created:
+            raise RentalImportError("monitor aggregate is incomplete")
+        if not _ensure_marker(connection, owner_id, timestamp, True):
+            raise RentalImportError("import marker is missing")
+
+        observation_rows = _bounded_rows(
+            connection,
+            "SELECT item_id, fields_json, first_seen_at, last_seen_at "
+            "FROM observations WHERE monitor_id = "
+            f"'{RENTAL_MONITOR_ID}' ORDER BY item_id",
+            "observations",
+        )
+        announcements: dict[str, _AnnouncementRow] = {}
+        for stored in observation_rows:
+            item_id = stored["item_id"]
+            if type(item_id) is not str or not item_id.startswith("announcement:"):
+                raise RentalImportError("observation aggregate conflicts")
+            key = item_id.removeprefix("announcement:")
+            fields_text = stored["fields_json"]
+            if type(fields_text) is not str:
+                raise RentalImportError("observation aggregate conflicts")
+            fields = json.loads(fields_text)
+            if (
+                type(fields) is not dict
+                or canonical_json(fields) != fields_text
+                or set(fields) != set(RENTAL_ANNOUNCEMENT_FIELDS)
+            ):
+                raise RentalImportError("observation aggregate conflicts")
+            announcement = _announcement(
+                {
+                    "announcement_key": key,
+                    **fields,
+                    "first_seen_at": stored["first_seen_at"],
+                    "last_seen_at": stored["last_seen_at"],
+                }  # type: ignore[arg-type]
+            )
+            if _ensure_observation(connection, announcement, True):
+                raise RentalImportError("observation aggregate is incomplete")
+            announcements[item_id] = announcement
+
+        outbox_rows = _bounded_rows(
+            connection,
+            "SELECT id, dedupe_key, target_id FROM outbox WHERE monitor_id = "
+            f"'{RENTAL_MONITOR_ID}' ORDER BY id",
+            "outbox",
+        )
+        target_ids = {row["target_id"] for row in outbox_rows}
+        if any(type(value) is not str for value in target_ids) or len(target_ids) > 1:
+            raise RentalImportError("target aggregate conflicts")
+        if target_ids:
+            target_id = next(iter(target_ids))
+            target = connection.execute(
+                "SELECT address FROM delivery_targets WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        else:
+            targets = connection.execute(
+                "SELECT id, address FROM delivery_targets "
+                "WHERE owner_id = ? AND created_at = ? ORDER BY id",
+                (owner_id, timestamp),
+            ).fetchall()
+            if len(targets) != 1:
+                raise RentalImportError("target aggregate conflicts")
+            target = targets[0]
+            target_id = target["id"]
+        if target is None or not _valid_chat_address(target["address"]):
+            raise RentalImportError("target aggregate conflicts")
+        _validate_target_id(target_id)
+        if _ensure_target(
+            connection,
+            target_id,
+            owner_id,
+            target["address"],
+            timestamp,
+            True,
+        ):
+            raise RentalImportError("target aggregate is incomplete")
+
+        for outbox in outbox_rows:
+            matching = [
+                (item_id, announcement)
+                for item_id, announcement in announcements.items()
+                if outbox["dedupe_key"] == f"{RENTAL_MONITOR_ID}:{item_id}:new_item"
+            ]
+            if len(matching) != 1 or outbox["target_id"] != target_id:
+                raise RentalImportError("outbox aggregate conflicts")
+            item_id, announcement = matching[0]
+            delivery = connection.execute(
+                "SELECT target_id, external_message_id, delivered_at "
+                "FROM deliveries WHERE outbox_id = ?",
+                (outbox["id"],),
+            ).fetchone()
+            if delivery is None or delivery["target_id"] != target_id:
+                raise RentalImportError("delivery aggregate conflicts")
+            message_id = delivery["external_message_id"]
+            if (
+                type(message_id) is not str
+                or not message_id.isascii()
+                or not message_id.isdecimal()
+                or str(int(message_id)) != message_id
+                or not 0 < int(message_id) <= 9_223_372_036_854_775_807
+            ):
+                raise RentalImportError("delivery aggregate conflicts")
+            delivered_at = _canonical_timestamp(delivery["delivered_at"])
+            if delivered_at != delivery["delivered_at"]:
+                raise RentalImportError("delivery aggregate conflicts")
+            row = _DeliveryRow(
+                key=item_id.removeprefix("announcement:"),
+                chat_id=target["address"],
+                delivered_at=delivered_at,
+                message_id=message_id,
+            )
+            expected_outbox_id, created = _ensure_outbox(
+                connection,
+                row,
+                announcement,
+                spec,
+                target_id,
+                True,
+            )
+            if created or expected_outbox_id != outbox["id"]:
+                raise RentalImportError("outbox aggregate conflicts")
+            if _ensure_delivery(connection, expected_outbox_id, target_id, row, True):
+                raise RentalImportError("delivery aggregate is incomplete")
+
+        delivered_count = connection.execute(
+            "SELECT count(*) FROM deliveries AS d JOIN outbox AS o ON o.id = d.outbox_id "
+            "WHERE o.monitor_id = ?",
+            (RENTAL_MONITOR_ID,),
+        ).fetchone()[0]
+        if type(delivered_count) is not int or delivered_count != len(outbox_rows):
+            raise RentalImportError("delivery aggregate conflicts")
+    except RentalImportError:
+        raise
+    except Exception:
+        raise RentalImportError("imported aggregate is invalid") from None

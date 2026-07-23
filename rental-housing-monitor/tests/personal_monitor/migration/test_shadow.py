@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from personal_monitor.domain.observation import (
     SourceWarning,
     content_hash,
 )
-from personal_monitor.migration.import_rental import _rental_spec
+from personal_monitor.migration.import_rental import _rental_spec, import_rental_state
 from personal_monitor.migration.shadow import (
     DuplicateProbeResult,
     ShadowComparator,
@@ -26,7 +27,7 @@ from personal_monitor.migration.shadow import (
     run_duplicate_probe,
     run_shadow_fetch,
 )
-from personal_monitor.storage import open_database
+from personal_monitor.storage import open_database, open_existing_database
 from personal_monitor.storage.schema import canonical_json
 
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
@@ -48,6 +49,12 @@ def snapshot(
         ),
         source_status=STATUSES if statuses is None else statuses,
     )
+
+
+def opaque_item_id(raw_item_id: str) -> str:
+    agency = raw_item_id.removeprefix("announcement:").split(":", 1)[0]
+    digest = sha256(raw_item_id.encode("utf-8")).hexdigest()
+    return f"announcement:{agency}:sha256-{digest}"
 
 
 def result_for(
@@ -82,6 +89,11 @@ def seed_exact_import_marker(connection: sqlite3.Connection) -> None:
         "('rental-housing-seoul-gyeonggi:v1', 'rental-housing-seoul-gyeonggi', 1, ?, "
         "'telegram-user:1', ?, 'telegram-user:1', ?)",
         (canonical_json(spec.model_dump(mode="json")), timestamp, timestamp),
+    )
+    connection.execute(
+        "INSERT INTO delivery_targets(id, owner_id, kind, address, created_at) "
+        "VALUES ('target-1', 'telegram-user:1', 'telegram', '1', ?)",
+        (timestamp,),
     )
     connection.execute(
         "INSERT INTO runs(id, monitor_id, version_id, lease_generation, stage, fetch_strategy, "
@@ -307,6 +319,40 @@ def create_shadow_source(path: Path, *keys: str) -> None:
     connection.close()
 
 
+def imported_delivered_repository(
+    tmp_path: Path,
+) -> tuple[ShadowRepository, ObservedItem]:
+    source = tmp_path / "legacy-import.db"
+    database = tmp_path / "personal-import.db"
+    connection = create_legacy(source)
+    insert_announcement(
+        connection,
+        "LH:one",
+        last_seen_at="2026-07-29T12:00:00+09:00",
+    )
+    insert_run(
+        connection,
+        started_at="2026-07-29T12:00:00+09:00",
+        finished_at="2026-07-29T12:30:00+09:00",
+    )
+    connection.execute(
+        "INSERT INTO deliveries(announcement_key, chat_id, delivered_at, message_id) "
+        "VALUES ('LH:one', '12345', '2026-07-29T12:15:00+09:00', 77)"
+    )
+    connection.commit()
+    connection.close()
+    import_rental_state(
+        source,
+        database,
+        "telegram-user:1",
+        "target-1",
+    )
+    return (
+        ShadowRepository(open_existing_database(database), clock=lambda: NOW),
+        rental_item(),
+    )
+
+
 @pytest.fixture
 def shadow_repo() -> ShadowRepository:
     connection = open_database(":memory:")
@@ -353,8 +399,8 @@ def test_comparator_hashes_only_safe_normalized_identifiers_and_status() -> None
         (difference.agency, difference.missing_ids, difference.extra_ids)
         for difference in result.differences
     ] == [
-        ("GH", (), ("announcement:GH:three",)),
-        ("SH", ("announcement:SH:two",), ()),
+        ("GH", (), (opaque_item_id("announcement:GH:three"),)),
+        ("SH", (opaque_item_id("announcement:SH:two"),), ()),
     ]
     rendered = repr((old, new, result, *result.differences))
     assert "announcement:" not in rendered
@@ -394,6 +440,62 @@ def test_shadow_item_rejects_unknown_conflicting_or_unsafe_identity_redacted(
 
     assert item_id not in str(caught.value)
     assert item_id not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    "raw_item_id",
+    (
+        "announcement:LH:credential-MARKER-plain",
+        "announcement:LH:https://user:password@secret.example/path?token=MARKER",
+        "announcement:LH:notice%3Ftoken%3DMARKER",
+        "announcement:LH:비밀-MARKER",
+        "announcement:LH:line\nMARKER",
+    ),
+)
+def test_differences_always_use_opaque_aliases_and_never_reveal_raw_identity(
+    shadow_repo: ShadowRepository,
+    raw_item_id: str,
+) -> None:
+    result = ShadowComparator(clock=lambda: NOW).compare(
+        snapshot(raw_item_id),
+        snapshot(),
+        SEOUL_TODAY,
+    )
+
+    shadow_repo.record(result)
+
+    expected = opaque_item_id(raw_item_id)
+    assert result.differences[0].missing_ids == (expected,)
+    stored = shadow_repo.connection.execute(
+        "SELECT differences_json FROM rental_shadow_results"
+    ).fetchone()[0]
+    rendered = canonical_json(
+        {
+            "differences": tuple(
+                {
+                    "agency": difference.agency,
+                    "missing_ids": difference.missing_ids,
+                    "extra_ids": difference.extra_ids,
+                }
+                for difference in result.differences
+            )
+        }
+    )
+    for output in (stored, rendered, repr(result), repr(result.differences[0])):
+        assert expected in output or output.startswith("<")
+        assert "MARKER" not in output
+        assert "secret.example" not in output
+        assert "password" not in output
+
+
+def test_oversized_raw_identity_is_rejected_without_revealing_marker() -> None:
+    raw_item_id = "announcement:LH:" + ("MARKER" * 100)
+
+    with pytest.raises(ValueError) as caught:
+        ShadowItem("LH", raw_item_id)
+
+    assert "MARKER" not in str(caught.value)
+    assert "MARKER" not in repr(caught.value)
 
 
 def test_snapshot_rejects_conflicting_duplicate_and_nonexact_status_map() -> None:
@@ -445,6 +547,42 @@ def test_seven_consecutive_matches_ending_yesterday_are_ready(
     assert shadow_repo.cutover_ready(SEOUL_TODAY) is True
 
 
+def test_status_uses_one_snapshot_across_concurrent_marker_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import personal_monitor.migration.shadow as shadow_module
+
+    database = tmp_path / "status-snapshot.db"
+    connection = open_database(database)
+    seed_exact_import_marker(connection)
+    repository = ShadowRepository(connection, clock=lambda: NOW)
+    start = SEOUL_TODAY - timedelta(days=6)
+    for offset in range(7):
+        repository.record(result_for(start + timedelta(days=offset)))
+    seed_passing_probe(repository, SEOUL_TODAY)
+    replacement = open_existing_database(database)
+    replacement.execute("PRAGMA busy_timeout = 0")
+    original = shadow_module._state_imported
+
+    def replace_then_read(
+        active: sqlite3.Connection,
+        evidence_time: datetime,
+    ) -> bool:
+        replacement.execute("DELETE FROM runs WHERE id = 'migration:rental-housing:v1'")
+        return original(active, evidence_time)
+
+    monkeypatch.setattr(shadow_module, "_state_imported", replace_then_read)
+    try:
+        status = repository.status(SEOUL_TODAY)
+
+        assert status.state_imported is True
+        assert status.cutover_ready is True
+    finally:
+        replacement.close()
+        connection.close()
+
+
 @pytest.mark.parametrize("fault", ("gap", "mismatch", "stale", "stale_probe"))
 def test_gap_mismatch_or_stale_evidence_is_not_ready(
     shadow_repo: ShadowRepository,
@@ -475,7 +613,7 @@ def test_rerun_replaces_date_and_later_clean_streak_resolves_old_mismatch(
     start = SEOUL_TODAY - timedelta(days=6)
     for offset in range(7):
         shadow_repo.record(result_for(start + timedelta(days=offset)))
-    replacement = result_for(SEOUL_TODAY, matched=True, recorded_at=NOW + timedelta(seconds=1))
+    replacement = result_for(SEOUL_TODAY, matched=True)
     shadow_repo.record(replacement)
     seed_passing_probe(shadow_repo, SEOUL_TODAY)
 
@@ -507,9 +645,14 @@ def test_repository_serializes_only_safe_canonical_json(
         "FROM rental_shadow_results WHERE run_date = ?",
         (SEOUL_TODAY.isoformat(),),
     ).fetchone()
-    assert row["differences_json"] == (
-        '[{"agency":"LH","extra_ids":["announcement:LH:new-secret"],'
-        '"missing_ids":["announcement:LH:old-secret"]}]'
+    assert row["differences_json"] == canonical_json(
+        [
+            {
+                "agency": "LH",
+                "extra_ids": [opaque_item_id("announcement:LH:new-secret")],
+                "missing_ids": [opaque_item_id("announcement:LH:old-secret")],
+            }
+        ]
     )
     assert row["old_status_json"] == '{"GH":"ok","LH":"ok","SH":"ok"}'
     assert row["new_status_json"] == '{"GH":"ok","LH":"ok","SH":"ok"}'
@@ -547,7 +690,7 @@ def test_duplicate_probe_record_is_atomic_and_redacts_storage_failure(
         run_date=SEOUL_TODAY,
         current_hash="a" * 64,
         passed=False,
-        missing_ids=("announcement:LH:one",),
+        missing_ids=(opaque_item_id("announcement:LH:one"),),
         conflicting_ids=(),
         recorded_at=NOW,
     )
@@ -578,7 +721,12 @@ def test_duplicate_probe_record_is_atomic_and_redacts_storage_failure(
     assert tuple(stored) == (
         original.current_hash,
         0,
-        '{"conflicting_ids":[],"missing_ids":["announcement:LH:one"]}',
+        canonical_json(
+            {
+                "conflicting_ids": [],
+                "missing_ids": [opaque_item_id("announcement:LH:one")],
+            }
+        ),
     )
 
 
@@ -619,6 +767,42 @@ def test_status_rejects_future_probe_evidence(
         shadow_repo.status(SEOUL_TODAY)
 
 
+@pytest.mark.parametrize(
+    ("evidence", "error"),
+    (
+        ("shadow", "shadow storage"),
+        ("probe", "probe storage"),
+        ("marker", "import marker"),
+    ),
+)
+def test_status_rejects_future_recorded_evidence_relative_to_injected_clock(
+    shadow_repo: ShadowRepository,
+    evidence: str,
+    error: str,
+) -> None:
+    shadow_repo.record(result_for(SEOUL_TODAY))
+    seed_passing_probe(shadow_repo, SEOUL_TODAY)
+    future = (NOW + timedelta(seconds=1)).isoformat()
+    if evidence == "shadow":
+        shadow_repo.connection.execute(
+            "UPDATE rental_shadow_results SET recorded_at = ?",
+            (future,),
+        )
+    elif evidence == "probe":
+        shadow_repo.connection.execute(
+            "UPDATE rental_duplicate_probe_results SET recorded_at = ?",
+            (future,),
+        )
+    else:
+        shadow_repo.connection.execute(
+            "UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?",
+            (future, future, "migration:rental-housing:v1"),
+        )
+
+    with pytest.raises(RuntimeError, match=error):
+        shadow_repo.status(SEOUL_TODAY)
+
+
 def test_public_results_reject_bool_counts_and_hide_all_values() -> None:
     with pytest.raises(ValueError):
         DuplicateProbeResult(
@@ -635,7 +819,7 @@ def test_public_results_reject_bool_counts_and_hide_all_values() -> None:
         run_date=SEOUL_TODAY,
         current_hash="a" * 64,
         passed=False,
-        missing_ids=("announcement:LH:private-value",),
+        missing_ids=(opaque_item_id("announcement:LH:private-value"),),
         conflicting_ids=(),
         recorded_at=NOW,
     )
@@ -1017,6 +1201,163 @@ def test_duplicate_probe_passes_without_runtime_persistence_or_sender(
     )
 
 
+def test_duplicate_probe_passes_with_real_task2_delivered_aggregate(
+    tmp_path: Path,
+) -> None:
+    repository, item = imported_delivered_repository(tmp_path)
+    sender = FailingSender()
+    before = runtime_snapshot(repository.connection)
+    try:
+        result = asyncio.run(
+            run_duplicate_probe(
+                repository,
+                "rental-housing-seoul-gyeonggi",
+                adapter=FakeAdapter(make_batch(items=(item,))),
+                sender=sender,
+                now=NOW,
+            )
+        )
+
+        assert result.passed is True
+        assert sender.calls == 0
+        assert runtime_snapshot(repository.connection) == before
+    finally:
+        repository.connection.close()
+
+
+def test_duplicate_probe_validation_and_record_share_one_immediate_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import personal_monitor.migration.shadow as shadow_module
+
+    repository, item = imported_delivered_repository(tmp_path)
+    original = shadow_module._probe_imported_state
+
+    def require_transaction(connection, batch, spec):
+        assert connection.in_transaction
+        return original(connection, batch, spec)
+
+    monkeypatch.setattr(
+        shadow_module,
+        "_probe_imported_state",
+        require_transaction,
+    )
+    try:
+        result = asyncio.run(
+            run_duplicate_probe(
+                repository,
+                "rental-housing-seoul-gyeonggi",
+                adapter=FakeAdapter(make_batch(items=(item,))),
+                sender=FailingSender(),
+                now=NOW,
+            )
+        )
+
+        assert result.passed is True
+    finally:
+        repository.connection.close()
+
+
+def test_duplicate_probe_revalidates_active_version_after_fetch(
+    tmp_path: Path,
+) -> None:
+    repository, item = imported_delivered_repository(tmp_path)
+    database = tmp_path / "personal-import.db"
+    replacement = open_existing_database(database)
+
+    class ReplacingAdapter(FakeAdapter):
+        async def fetch(self, monitor_id, spec) -> ObservationBatch:
+            batch = await super().fetch(monitor_id, spec)
+            replacement.execute(
+                "UPDATE monitors SET active_version_id = NULL "
+                "WHERE id = 'rental-housing-seoul-gyeonggi'"
+            )
+            return batch
+
+    try:
+        with pytest.raises(RuntimeError, match="duplicate probe failed"):
+            asyncio.run(
+                run_duplicate_probe(
+                    repository,
+                    "rental-housing-seoul-gyeonggi",
+                    adapter=ReplacingAdapter(make_batch(items=(item,))),
+                    sender=FailingSender(),
+                    now=NOW,
+                )
+            )
+
+        assert (
+            repository.connection.execute(
+                "SELECT count(*) FROM rental_duplicate_probe_results"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        replacement.close()
+        repository.connection.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "observation-order",
+        "observation-time-format",
+        "outbox-time-format",
+        "message-id-format",
+        "target-kind",
+        "target-address",
+        "target-created-at",
+        "missing-owner",
+    ),
+)
+def test_duplicate_probe_fails_malformed_task2_aggregate(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    repository, item = imported_delivered_repository(tmp_path)
+    connection = repository.connection
+    if mutation == "observation-order":
+        connection.execute("UPDATE observations SET first_seen_at = '2026-07-30T00:00:00+00:00'")
+    elif mutation == "observation-time-format":
+        connection.execute("UPDATE observations SET last_seen_at = '2026-07-29T12:00:00+09:00'")
+    elif mutation == "outbox-time-format":
+        timestamp = "2026-07-29T12:15:00+09:00"
+        connection.execute(
+            "UPDATE outbox SET available_at = ?, created_at = ?",
+            (timestamp, timestamp),
+        )
+        connection.execute("UPDATE deliveries SET delivered_at = ?", (timestamp,))
+    elif mutation == "message-id-format":
+        connection.execute("UPDATE deliveries SET external_message_id = '01'")
+    elif mutation == "target-kind":
+        connection.execute("UPDATE delivery_targets SET kind = 'email'")
+    elif mutation == "target-address":
+        connection.execute("UPDATE delivery_targets SET address = ' bad address '")
+    elif mutation == "missing-owner":
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DELETE FROM users WHERE id = 'telegram-user:1'")
+        connection.execute("PRAGMA foreign_keys = ON")
+    else:
+        connection.execute("UPDATE delivery_targets SET created_at = '2026-07-29T12:30:00+09:00'")
+    before = runtime_snapshot(connection)
+    try:
+        result = asyncio.run(
+            run_duplicate_probe(
+                repository,
+                "rental-housing-seoul-gyeonggi",
+                adapter=FakeAdapter(make_batch(items=(item,))),
+                sender=FailingSender(),
+                now=NOW,
+            )
+        )
+
+        assert result.passed is False
+        assert runtime_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "fault",
     ("missing", "conflict", "missing-marker", "forged-marker", "partial"),
@@ -1055,8 +1396,12 @@ def test_duplicate_probe_records_safe_failure_without_runtime_changes(
     )
 
     assert result.passed is False
-    assert result.missing_ids == (("announcement:LH:one",) if fault == "missing" else ())
-    assert result.conflicting_ids == (("announcement:LH:one",) if fault == "conflict" else ())
+    assert result.missing_ids == (
+        (opaque_item_id("announcement:LH:one"),) if fault == "missing" else ()
+    )
+    assert result.conflicting_ids == (
+        (opaque_item_id("announcement:LH:one"),) if fault == "conflict" else ()
+    )
     assert sender.calls == 0
     assert runtime_snapshot(shadow_repo.connection) == before
     stored = shadow_repo.connection.execute(
@@ -1072,11 +1417,6 @@ def test_duplicate_probe_fails_inconsistent_delivered_aggregate_safely(
     item = rental_item()
     seed_observation(shadow_repo.connection, item)
     timestamp = "2026-07-01T00:00:00+00:00"
-    shadow_repo.connection.execute(
-        "INSERT INTO delivery_targets(id, owner_id, kind, address, created_at) "
-        "VALUES ('target-1', 'telegram-user:1', 'telegram', 'secret-chat', ?)",
-        (timestamp,),
-    )
     shadow_repo.connection.execute(
         "INSERT INTO outbox(id, dedupe_key, monitor_id, target_id, payload_json, status, "
         "available_at, created_at) VALUES "
@@ -1123,6 +1463,89 @@ def test_duplicate_probe_wrong_monitor_is_fixed_and_records_nothing(
 
     assert str(caught.value) == "rental duplicate probe failed"
     assert "sensitive" not in repr(caught.value)
+    assert sender.calls == 0
+    assert runtime_snapshot(shadow_repo.connection) == before
+    assert (
+        shadow_repo.connection.execute(
+            "SELECT count(*) FROM rental_duplicate_probe_results"
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_duplicate_probe_propagates_real_cancellation_without_any_write(
+    shadow_repo: ShadowRepository,
+) -> None:
+    sender = FailingSender()
+    before = runtime_snapshot(shadow_repo.connection)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            run_duplicate_probe(
+                shadow_repo,
+                "rental-housing-seoul-gyeonggi",
+                adapter=FakeAdapter(asyncio.CancelledError()),
+                sender=sender,
+                now=NOW,
+            )
+        )
+
+    assert sender.calls == 0
+    assert runtime_snapshot(shadow_repo.connection) == before
+    assert (
+        shadow_repo.connection.execute(
+            "SELECT count(*) FROM rental_duplicate_probe_results"
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_duplicate_probe_redacts_ordinary_failure_without_any_write(
+    shadow_repo: ShadowRepository,
+) -> None:
+    sender = FailingSender()
+    before = runtime_snapshot(shadow_repo.connection)
+
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(
+            run_duplicate_probe(
+                shadow_repo,
+                "rental-housing-seoul-gyeonggi",
+                adapter=FakeAdapter(ValueError("secret adapter response")),
+                sender=sender,
+                now=NOW,
+            )
+        )
+
+    assert str(caught.value) == "rental duplicate probe failed"
+    assert "secret" not in repr(caught.value)
+    assert sender.calls == 0
+    assert runtime_snapshot(shadow_repo.connection) == before
+    assert (
+        shadow_repo.connection.execute(
+            "SELECT count(*) FROM rental_duplicate_probe_results"
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_duplicate_probe_propagates_fatal_failure_without_any_write(
+    shadow_repo: ShadowRepository,
+) -> None:
+    sender = FailingSender()
+    before = runtime_snapshot(shadow_repo.connection)
+
+    with pytest.raises(FatalShadowFailure):
+        asyncio.run(
+            run_duplicate_probe(
+                shadow_repo,
+                "rental-housing-seoul-gyeonggi",
+                adapter=FakeAdapter(FatalShadowFailure()),
+                sender=sender,
+                now=NOW,
+            )
+        )
+
     assert sender.calls == 0
     assert runtime_snapshot(shadow_repo.connection) == before
     assert (
