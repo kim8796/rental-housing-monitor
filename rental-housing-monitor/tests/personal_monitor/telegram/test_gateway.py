@@ -8,6 +8,8 @@ from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -77,8 +79,25 @@ def _message(*, user_id: int = 7, chat_id: int = 42, text: str = "모니터해�
     return TelegramUpdate(1, TelegramMessage(31, chat_id, user_id, text), None)
 
 
-def _callback(data: str, *, user_id: int = 7, chat_id: int = 42) -> TelegramUpdate:
-    return TelegramUpdate(2, None, CallbackQuery("cb-1", user_id, chat_id, 31, data))
+def _callback(
+    data: object,
+    *,
+    user_id: object = 7,
+    chat_id: object = 42,
+    callback_id: object = "cb-1",
+    message_id: object = 31,
+) -> TelegramUpdate:
+    return TelegramUpdate(
+        2,
+        None,
+        CallbackQuery(
+            callback_id,  # type: ignore[arg-type]
+            user_id,  # type: ignore[arg-type]
+            chat_id,  # type: ignore[arg-type]
+            message_id,  # type: ignore[arg-type]
+            data,  # type: ignore[arg-type]
+        ),
+    )
 
 
 def run(value: object) -> object:
@@ -186,19 +205,29 @@ def test_cancel_consumes_without_routing(gateway_parts) -> None:
         "confirm:" + "x" * 32 + ":extra",
     ],
 )
-def test_malformed_callbacks_fail_without_lookup_or_response(
-    gateway_parts, data: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    gateway, router, api, actions, _ = gateway_parts
-
-    def forbidden(*args: object, **kwargs: object) -> object:
-        raise AssertionError("action lookup must not happen")
-
-    monkeypatch.setattr(type(actions), "consume", forbidden)
+def test_malformed_callbacks_fail_without_lookup_or_response(gateway_parts, data: str) -> None:
+    gateway, router, api, _, connection = gateway_parts
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
     run(gateway.handle_update(_callback(data), now=NOW))
+    connection.set_trace_callback(None)
 
     assert router.calls == []
     assert api.answers == []
+    assert not any("pending_actions" in statement for statement in statements)
+
+
+def test_huge_callback_data_is_rejected_before_lookup_or_response(gateway_parts) -> None:
+    gateway, router, api, _, connection = gateway_parts
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    run(gateway.handle_update(_callback("x" * 1_000_000), now=NOW))
+    connection.set_trace_callback(None)
+
+    assert router.calls == []
+    assert api.answers == []
+    assert not any("pending_actions" in statement for statement in statements)
 
 
 def test_unknown_valid_token_and_replay_produce_no_response_or_dispatch(gateway_parts) -> None:
@@ -213,20 +242,58 @@ def test_unknown_valid_token_and_replay_produce_no_response_or_dispatch(gateway_
     assert api.answers == [("cb-1", "처리되었습니다", False)]
 
 
-def test_callback_identity_is_checked_before_action_lookup(
-    gateway_parts, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    gateway, router, api, actions, _ = gateway_parts
-
-    def forbidden(*args: object, **kwargs: object) -> object:
-        raise AssertionError("action lookup must not happen")
-
-    monkeypatch.setattr(type(actions), "consume", forbidden)
+def test_callback_identity_is_checked_before_action_lookup(gateway_parts) -> None:
+    gateway, router, api, _, connection = gateway_parts
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
     run(gateway.handle_update(_callback("confirm:" + "x" * 32, user_id=999), now=NOW))
     run(gateway.handle_update(_callback("confirm:" + "x" * 32, chat_id=999), now=NOW))
+    connection.set_trace_callback(None)
 
     assert router.calls == []
     assert api.answers == []
+    assert not any("pending_actions" in statement for statement in statements)
+
+
+@pytest.mark.parametrize("operation", ["confirm", "cancel"])
+@pytest.mark.parametrize(
+    ("callback_id", "message_id"),
+    [
+        ("", 31),
+        ("x" * 257, 31),
+        ("bad\x00id", 31),
+        ("bad\ud800id", 31),
+        (4, 31),
+        ("cb-1", True),
+        ("cb-1", 0),
+        ("cb-1", -1),
+        ("cb-1", 2**63),
+    ],
+)
+def test_entire_callback_boundary_is_validated_before_consumption(
+    gateway_parts,
+    operation: str,
+    callback_id: object,
+    message_id: object,
+) -> None:
+    gateway, router, api, actions, connection = gateway_parts
+    pending = actions.create(OWNER, "create", {"version_id": "v1"}, now=NOW)
+    invalid_data = pending.confirm_callback if operation == "confirm" else pending.cancel_callback
+
+    run(
+        gateway.handle_update(
+            _callback(invalid_data, callback_id=callback_id, message_id=message_id),
+            now=NOW,
+        )
+    )
+
+    assert connection.execute("SELECT consumed_at FROM pending_actions").fetchone()[0] is None
+    assert router.calls == []
+    assert api.answers == []
+
+    run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+    assert len(router.calls) == 1
+    assert api.answers == [("cb-1", "처리되었습니다", False)]
 
 
 def test_router_failure_does_not_resurrect_consumed_action(gateway_parts) -> None:
@@ -312,6 +379,156 @@ def test_gateway_composition_is_sealed_and_repr_redacted(gateway_parts) -> None:
     assert repr(gateway) == "<TelegramGateway redacted>"
     with pytest.raises(AttributeError, match="sealed"):
         gateway.router = router  # type: ignore[attr-defined]
+
+
+def test_instance_level_async_callables_are_supported(
+    gateway_parts,
+) -> None:
+    _, _, _, actions, _ = gateway_parts
+    route = AsyncMock()
+    answer = AsyncMock()
+    router = SimpleNamespace(route=route)
+    api = SimpleNamespace(answer_callback=answer)
+    gateway = TelegramGateway(7, 42, router, actions, api)
+
+    run(gateway.handle_update(_message()))
+    pending = actions.create(OWNER, "delete", {"monitor_id": "m1"}, now=NOW)
+    run(gateway.handle_update(_callback(pending.cancel_callback), now=NOW))
+
+    assert route.await_count == 1
+    assert route.await_args.args == (ControlRequest(OWNER, "42", "모니터해줘"),)
+    answer.assert_awaited_once_with("cb-1", text="취소되었습니다", show_alert=False)
+
+
+@pytest.mark.parametrize("boundary", ["router", "api"])
+def test_hostile_callable_descriptors_raise_one_fixed_constructor_error(
+    gateway_parts,
+    boundary: str,
+) -> None:
+    _, router, api, actions, _ = gateway_parts
+
+    class HostileRouter:
+        @property
+        def route(self):  # type: ignore[no-untyped-def]
+            raise RuntimeError("private-router-descriptor-secret")
+
+    class HostileApi:
+        @property
+        def answer_callback(self):  # type: ignore[no-untyped-def]
+            raise RuntimeError("private-api-descriptor-secret")
+
+    selected_router = HostileRouter() if boundary == "router" else router
+    selected_api = HostileApi() if boundary == "api" else api
+
+    with pytest.raises(ValueError) as caught:
+        TelegramGateway(7, 42, selected_router, actions, selected_api)
+
+    assert str(caught.value) == "invalid Telegram gateway configuration"
+    assert "private" not in repr(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_constructor_retrieves_each_protocol_callable_exactly_once(gateway_parts) -> None:
+    _, _, _, actions, _ = gateway_parts
+
+    class CountingRouter:
+        def __init__(self) -> None:
+            self.accesses = 0
+            self.call = AsyncMock()
+
+        @property
+        def route(self):  # type: ignore[no-untyped-def]
+            self.accesses += 1
+            return self.call
+
+    class CountingApi:
+        def __init__(self) -> None:
+            self.accesses = 0
+            self.call = AsyncMock()
+
+        @property
+        def answer_callback(self):  # type: ignore[no-untyped-def]
+            self.accesses += 1
+            return self.call
+
+    router = CountingRouter()
+    api = CountingApi()
+
+    TelegramGateway(7, 42, router, actions, api)
+
+    assert router.accesses == 1
+    assert api.accesses == 1
+
+
+def test_unauthorized_and_unsupported_updates_do_not_retrieve_protocol_callables(
+    gateway_parts,
+) -> None:
+    _, _, _, actions, _ = gateway_parts
+
+    class CountingBoundary:
+        def __init__(self, attribute: str) -> None:
+            self.attribute = attribute
+            self.accesses = 0
+            self.call = AsyncMock()
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            if name != self.attribute:
+                raise AttributeError(name)
+            self.accesses += 1
+            return self.call
+
+    router = CountingBoundary("route")
+    api = CountingBoundary("answer_callback")
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    assert (router.accesses, api.accesses) == (1, 1)
+
+    run(gateway.handle_update(_message(user_id=999)))
+    run(gateway.handle_update(TelegramUpdate(3, None, None)))
+
+    assert (router.accesses, api.accesses) == (1, 1)
+    assert router.call.await_count == 0
+    assert api.call.await_count == 0
+
+
+@pytest.mark.parametrize("boundary", ["router", "api"])
+def test_changing_callable_descriptor_fails_closed_on_use(gateway_parts, boundary: str) -> None:
+    _, stable_router, stable_api, actions, _ = gateway_parts
+
+    class ChangingRouter:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        @property
+        def route(self):  # type: ignore[no-untyped-def]
+            async def changing(value: object) -> None:
+                self.calls.append(value)
+
+            return changing
+
+    class ChangingApi:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        @property
+        def answer_callback(self):  # type: ignore[no-untyped-def]
+            async def changing(*args: object, **kwargs: object) -> None:
+                self.calls.append((args, kwargs))
+
+            return changing
+
+    changing_router = ChangingRouter()
+    changing_api = ChangingApi()
+    router = changing_router if boundary == "router" else stable_router
+    api = changing_api if boundary == "api" else stable_api
+    gateway = TelegramGateway(7, 42, router, actions, api)
+
+    run(gateway.handle_update(_message()))
+
+    assert changing_router.calls == []
+    assert changing_api.calls == []
+    assert stable_router.calls == []
+    assert stable_api.answers == []
 
 
 @pytest.mark.parametrize("text", ["", " \n", "bad\x00", "x" * 4097])
