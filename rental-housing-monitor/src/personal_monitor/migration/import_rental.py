@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
-import time
+import tempfile
+import threading
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -32,8 +34,9 @@ from personal_monitor.domain.spec import (
 )
 from personal_monitor.engine.runner import render_payload
 from personal_monitor.engine.scheduler import next_run_at
-from personal_monitor.storage import open_database
 from personal_monitor.storage.schema import (
+    _apply_migrations,
+    _configure_connection,
     _validate_existing_schema,
     canonical_json,
     transaction,
@@ -53,6 +56,46 @@ _FIXED_TIME = datetime(2000, 1, 1, tzinfo=UTC)
 _EXPECTED_TABLES = frozenset({"announcements", "deliveries", "runs"})
 _ALLOWED_RUN_STATUS = frozenset({"running", "success", "partial_failure", "telegram_failure"})
 _ALLOWED_SOURCE_STATUS = frozenset({"ok", "failed"})
+_EXPECTED_LEGACY_SQL = {
+    "announcements": """
+        CREATE TABLE announcements (
+            announcement_key TEXT PRIMARY KEY,
+            source_id TEXT,
+            title TEXT NOT NULL,
+            agency TEXT NOT NULL,
+            region TEXT NOT NULL,
+            housing_type TEXT NOT NULL,
+            target TEXT NOT NULL,
+            announcement_date TEXT NOT NULL,
+            application_start_date TEXT,
+            application_end_date TEXT,
+            url TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )
+    """,
+    "deliveries": """
+        CREATE TABLE deliveries (
+            announcement_key TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            delivered_at TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            PRIMARY KEY (announcement_key, chat_id),
+            FOREIGN KEY (announcement_key) REFERENCES announcements(announcement_key)
+        )
+    """,
+    "runs": """
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            new_count INTEGER NOT NULL DEFAULT 0,
+            agency_status TEXT NOT NULL DEFAULT '{}'
+        )
+    """,
+}
+_IMPORT_LOCK = threading.RLock()
 
 
 class RentalImportError(RuntimeError):
@@ -128,6 +171,90 @@ class _SourceSnapshot:
     evidence_time: str
 
 
+@dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(slots=True)
+class _TargetHandle:
+    connection: sqlite3.Connection
+    anchor_fd: int | None
+    identity: _FileIdentity | None
+    staging_path: Path | None
+    destination: Path
+    dry_run: bool
+    snapshot_directory: tempfile.TemporaryDirectory[str] | None = None
+
+    def abort(self) -> None:
+        try:
+            self.connection.close()
+        finally:
+            self._close_anchor()
+            self._remove_staging()
+            self._remove_snapshot()
+
+    def finish(self) -> bool:
+        """Close safely; return False when a concurrent publisher requires a retry."""
+        try:
+            self.connection.close()
+        except BaseException:
+            self._close_anchor()
+            self._remove_staging()
+            self._remove_snapshot()
+            raise
+        self._close_anchor()
+        if self.staging_path is None:
+            try:
+                if self.identity is not None:
+                    _require_path_identity(self.destination, self.identity)
+                return True
+            finally:
+                self._remove_snapshot()
+        staging = self.staging_path
+        try:
+            metadata = staging.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or self.identity is None
+                or _identity(metadata) != self.identity
+            ):
+                raise RentalImportError("target staging identity changed")
+            try:
+                os.link(staging, self.destination, follow_symlinks=False)
+            except FileExistsError:
+                return False
+            return True
+        finally:
+            self._remove_staging()
+            self._remove_snapshot()
+
+    def _close_anchor(self) -> None:
+        if self.anchor_fd is not None:
+            os.close(self.anchor_fd)
+            self.anchor_fd = None
+
+    def _remove_staging(self) -> None:
+        if self.staging_path is None:
+            return
+        staging = self.staging_path
+        self.staging_path = None
+        for candidate in (
+            staging,
+            Path(f"{staging}-wal"),
+            Path(f"{staging}-shm"),
+            Path(f"{staging}-journal"),
+        ):
+            with suppress(FileNotFoundError):
+                candidate.unlink()
+
+    def _remove_snapshot(self) -> None:
+        if self.snapshot_directory is not None:
+            self.snapshot_directory.cleanup()
+            self.snapshot_directory = None
+
+
 @dataclass(slots=True)
 class _ImportCounts:
     imported_observations: int = 0
@@ -152,25 +279,55 @@ def import_rental_state(
     dry_run: bool = False,
 ) -> ImportReport:
     """Validate and atomically import the fixed legacy rental monitor aggregate."""
+    with _IMPORT_LOCK:
+        return _import_rental_state_locked(
+            old_path,
+            new_path,
+            owner_id,
+            target_id,
+            dry_run=dry_run,
+        )
+
+
+def _import_rental_state_locked(
+    old_path: str | Path,
+    new_path: str | Path,
+    owner_id: str,
+    target_id: str,
+    *,
+    dry_run: bool,
+) -> ImportReport:
     try:
         if type(dry_run) is not bool:
             raise RentalImportError("dry-run mode is invalid")
-        source_path, target_path = _validated_paths(old_path, new_path)
+        source_path, target_path, source_identity = _validated_paths(old_path, new_path)
         telegram_user_id = _telegram_user_id(owner_id)
         _validate_target_id(target_id)
-        source = _read_source(source_path)
-        target, _target_exists = _open_target(target_path, dry_run=dry_run)
-        try:
-            counts = _map_target(
-                target,
-                source,
-                owner_id,
-                telegram_user_id,
-                target_id,
+        source = _read_source(source_path, source_identity)
+        counts: _ImportCounts | None = None
+        for _attempt in range(4):
+            target = _open_target(
+                target_path,
+                source_identity=source_identity,
                 dry_run=dry_run,
             )
-        finally:
-            target.close()
+            try:
+                counts = _map_target(
+                    target.connection,
+                    source,
+                    owner_id,
+                    telegram_user_id,
+                    target_id,
+                    dry_run=dry_run,
+                )
+            except BaseException:
+                target.abort()
+                raise
+            if target.finish():
+                break
+            counts = None
+        if counts is None:
+            raise RentalImportError("target changed concurrently")
         status = (
             "complete" if counts.import_complete else ("validated" if dry_run else "incomplete")
         )
@@ -198,7 +355,9 @@ def import_rental_state(
         raise RentalImportError("rental import failed") from None
 
 
-def _validated_paths(old_path: str | Path, new_path: str | Path) -> tuple[Path, Path]:
+def _validated_paths(
+    old_path: str | Path, new_path: str | Path
+) -> tuple[Path, Path, _FileIdentity]:
     source = _normalized_absolute_path(old_path)
     target = _normalized_absolute_path(new_path)
     source_stat = _regular_file_stat(source, required=True)
@@ -212,7 +371,7 @@ def _validated_paths(old_path: str | Path, new_path: str | Path) -> tuple[Path, 
     for suffix in ("-wal", "-shm", "-journal"):
         if Path(f"{source}{suffix}").exists():
             raise RentalImportError("legacy database is not a closed snapshot")
-    return source, target
+    return source, target, _identity(source_stat)
 
 
 def _normalized_absolute_path(value: str | Path) -> Path:
@@ -253,6 +412,10 @@ def _regular_file_stat(path: Path, *, required: bool) -> os.stat_result | None:
     return metadata
 
 
+def _identity(metadata: os.stat_result) -> _FileIdentity:
+    return _FileIdentity(metadata.st_dev, metadata.st_ino)
+
+
 def _telegram_user_id(owner_id: str) -> int:
     if type(owner_id) is not str:
         raise RentalImportError("owner identity is invalid")
@@ -282,8 +445,9 @@ def _valid_opaque_identifier(value: object) -> bool:
     )
 
 
-def _read_only_connection(path: Path) -> sqlite3.Connection:
-    uri = f"file:{quote(os.fspath(path), safe='/')}?mode=ro&immutable=1"
+def _read_only_connection(path: Path, *, immutable: bool) -> sqlite3.Connection:
+    immutable_parameter = "&immutable=1" if immutable else ""
+    uri = f"file:{quote(os.fspath(path), safe='/')}?mode=ro{immutable_parameter}"
     connection = sqlite3.connect(uri, uri=True, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only = ON")
@@ -291,10 +455,21 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _read_source(path: Path) -> _SourceSnapshot:
+def _read_source(path: Path, expected_identity: _FileIdentity) -> _SourceSnapshot:
     connection: sqlite3.Connection | None = None
+    descriptor: int | None = None
     try:
-        connection = _read_only_connection(path)
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        if _identity(os.fstat(descriptor)) != expected_identity:
+            raise RentalImportError("legacy database identity changed")
+        descriptor_count = _descriptor_identity_count(expected_identity)
+        connection = _read_only_connection(path, immutable=True)
+        connection.execute("PRAGMA schema_version").fetchone()
+        if (
+            _identity(path.lstat()) != expected_identity
+            or _descriptor_identity_count(expected_identity) != descriptor_count + 1
+        ):
+            raise RentalImportError("legacy database identity changed")
         connection.execute("BEGIN")
         _validate_source_schema(connection)
         _validate_source_integrity(connection)
@@ -342,51 +517,79 @@ def _read_source(path: Path) -> _SourceSnapshot:
     except sqlite3.Error:
         raise RentalImportError("legacy database validation failed") from None
     finally:
-        if connection is not None:
-            connection.close()
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _validate_source_schema(connection: sqlite3.Connection) -> None:
     objects = connection.execute(
-        "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
     ).fetchall()
     if {(row["type"], row["name"]) for row in objects} != {
         ("table", name) for name in _EXPECTED_TABLES
     }:
         raise RentalImportError("legacy database schema is unsupported")
+    for row in objects:
+        expected_sql = _EXPECTED_LEGACY_SQL.get(row["name"])
+        if (
+            row["tbl_name"] != row["name"]
+            or type(row["sql"]) is not str
+            or expected_sql is None
+            or _canonical_schema_sql(row["sql"]) != _canonical_schema_sql(expected_sql)
+        ):
+            raise RentalImportError("legacy database schema is unsupported")
+    sequence = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name = 'sqlite_sequence'"
+    ).fetchall()
+    if len(sequence) != 1 or (
+        sequence[0]["type"],
+        sequence[0]["name"],
+        sequence[0]["tbl_name"],
+        _canonical_schema_sql(sequence[0]["sql"]),
+    ) != (
+        "table",
+        "sqlite_sequence",
+        "sqlite_sequence",
+        _canonical_schema_sql("CREATE TABLE sqlite_sequence(name,seq)"),
+    ):
+        raise RentalImportError("legacy database schema is unsupported")
     expected_columns = {
         "announcements": (
-            ("announcement_key", "TEXT", 0, None, 1),
-            ("source_id", "TEXT", 0, None, 0),
-            ("title", "TEXT", 1, None, 0),
-            ("agency", "TEXT", 1, None, 0),
-            ("region", "TEXT", 1, None, 0),
-            ("housing_type", "TEXT", 1, None, 0),
-            ("target", "TEXT", 1, None, 0),
-            ("announcement_date", "TEXT", 1, None, 0),
-            ("application_start_date", "TEXT", 0, None, 0),
-            ("application_end_date", "TEXT", 0, None, 0),
-            ("url", "TEXT", 1, None, 0),
-            ("first_seen_at", "TEXT", 1, None, 0),
-            ("last_seen_at", "TEXT", 1, None, 0),
+            ("announcement_key", "TEXT", 0, None, 1, 0),
+            ("source_id", "TEXT", 0, None, 0, 0),
+            ("title", "TEXT", 1, None, 0, 0),
+            ("agency", "TEXT", 1, None, 0, 0),
+            ("region", "TEXT", 1, None, 0, 0),
+            ("housing_type", "TEXT", 1, None, 0, 0),
+            ("target", "TEXT", 1, None, 0, 0),
+            ("announcement_date", "TEXT", 1, None, 0, 0),
+            ("application_start_date", "TEXT", 0, None, 0, 0),
+            ("application_end_date", "TEXT", 0, None, 0, 0),
+            ("url", "TEXT", 1, None, 0, 0),
+            ("first_seen_at", "TEXT", 1, None, 0, 0),
+            ("last_seen_at", "TEXT", 1, None, 0, 0),
         ),
         "deliveries": (
-            ("announcement_key", "TEXT", 1, None, 1),
-            ("chat_id", "TEXT", 1, None, 2),
-            ("delivered_at", "TEXT", 1, None, 0),
-            ("message_id", "INTEGER", 1, None, 0),
+            ("announcement_key", "TEXT", 1, None, 1, 0),
+            ("chat_id", "TEXT", 1, None, 2, 0),
+            ("delivered_at", "TEXT", 1, None, 0, 0),
+            ("message_id", "INTEGER", 1, None, 0, 0),
         ),
         "runs": (
-            ("id", "INTEGER", 0, None, 1),
-            ("started_at", "TEXT", 1, None, 0),
-            ("finished_at", "TEXT", 0, None, 0),
-            ("status", "TEXT", 1, None, 0),
-            ("new_count", "INTEGER", 1, "0", 0),
-            ("agency_status", "TEXT", 1, "'{}'", 0),
+            ("id", "INTEGER", 0, None, 1, 0),
+            ("started_at", "TEXT", 1, None, 0, 0),
+            ("finished_at", "TEXT", 0, None, 0, 0),
+            ("status", "TEXT", 1, None, 0, 0),
+            ("new_count", "INTEGER", 1, "0", 0, 0),
+            ("agency_status", "TEXT", 1, "'{}'", 0, 0),
         ),
     }
     for table, expected in expected_columns.items():
-        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        rows = connection.execute(f"PRAGMA table_xinfo({table})").fetchall()
         actual = tuple(
             (
                 row["name"],
@@ -394,6 +597,7 @@ def _validate_source_schema(connection: sqlite3.Connection) -> None:
                 row["notnull"],
                 row["dflt_value"],
                 row["pk"],
+                row["hidden"],
             )
             for row in rows
         )
@@ -433,6 +637,18 @@ def _validate_source_schema(connection: sqlite3.Connection) -> None:
     for table in ("announcements", "runs"):
         if connection.execute(f"PRAGMA foreign_key_list({table})").fetchall():
             raise RentalImportError("legacy database foreign keys are unsupported")
+
+
+def _canonical_schema_sql(value: object) -> str:
+    if type(value) is not str:
+        raise RentalImportError("legacy database schema is unsupported")
+    tokens = re.findall(
+        r"'(?:''|[^'])*'|[A-Za-z_][A-Za-z0-9_]*|\d+|[(),]",
+        value,
+    )
+    if not tokens:
+        raise RentalImportError("legacy database schema is unsupported")
+    return " ".join(token.upper() if not token.startswith("'") else token for token in tokens)
 
 
 def _validate_source_integrity(connection: sqlite3.Connection) -> None:
@@ -641,26 +857,334 @@ def _row_error(table: str, key: object) -> RentalImportError:
     return RentalImportError(f"legacy {table} row is invalid ({code})")
 
 
-def _open_target(path: Path, *, dry_run: bool) -> tuple[sqlite3.Connection, bool]:
-    exists = path.exists()
+def _open_target(
+    path: Path,
+    *,
+    source_identity: _FileIdentity,
+    dry_run: bool,
+) -> _TargetHandle:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if dry_run:
+            connection = sqlite3.connect(":memory:", isolation_level=None)
+            _configure_connection(connection)
+            _apply_migrations(connection)
+            return _TargetHandle(connection, None, None, None, path, True)
+        return _open_staged_target(path, source_identity)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RentalImportError("target database is not a regular file")
+    if _identity(metadata) == source_identity:
+        raise RentalImportError("source and target must differ")
     if dry_run:
-        if not exists:
-            return open_database(":memory:"), False
-        connection = _read_only_connection(path)
+        snapshot_directory, snapshot_path = _copy_target_snapshot(
+            path,
+            expected_identity=_identity(metadata),
+        )
+        connection = _read_only_connection(snapshot_path, immutable=False)
         try:
             _validate_existing_schema(connection)
         except BaseException:
             connection.close()
+            snapshot_directory.cleanup()
             raise
-        return connection, True
-    deadline = time.monotonic() + 5.0
-    while True:
+        return _TargetHandle(
+            connection,
+            None,
+            _identity(metadata),
+            None,
+            path,
+            True,
+            snapshot_directory,
+        )
+    return _open_existing_target(path, source_identity)
+
+
+def _copy_target_snapshot(
+    path: Path, *, expected_identity: _FileIdentity
+) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    temporary = tempfile.TemporaryDirectory(prefix="personal-monitor-dry-run-")
+    snapshot = Path(temporary.name) / "target.sqlite3"
+    try:
+        for _attempt in range(3):
+            descriptors = _open_target_snapshot_files(path, expected_identity)
+            try:
+                before = {
+                    suffix: _stat_fingerprint(os.fstat(descriptor))
+                    for suffix, descriptor in descriptors.items()
+                }
+                for suffix, descriptor in descriptors.items():
+                    _copy_descriptor_private(
+                        descriptor,
+                        Path(f"{snapshot}{suffix}"),
+                    )
+                if _target_snapshot_is_stable(
+                    path,
+                    snapshot,
+                    descriptors,
+                    before,
+                ):
+                    return temporary, snapshot
+            finally:
+                for descriptor in descriptors.values():
+                    os.close(descriptor)
+            for suffix in ("", "-wal", "-shm"):
+                with suppress(FileNotFoundError):
+                    Path(f"{snapshot}{suffix}").unlink()
+        raise RentalImportError("target database changed during dry-run snapshot")
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
+def _open_target_snapshot_files(path: Path, expected_identity: _FileIdentity) -> dict[str, int]:
+    descriptors: dict[str, int] = {}
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{path}{suffix}")
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+            except FileNotFoundError:
+                if not suffix:
+                    raise RentalImportError("target database is missing") from None
+                continue
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or (
+                not suffix and _identity(metadata) != expected_identity
+            ):
+                os.close(descriptor)
+                raise RentalImportError("target database sidecar is invalid")
+            descriptors[suffix] = descriptor
+        return descriptors
+    except BaseException:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+        raise
+
+
+def _copy_descriptor_private(descriptor: int, destination: Path) -> None:
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with (
+            os.fdopen(os.dup(descriptor), "rb") as source,
+            os.fdopen(destination_fd, "wb") as target,
+        ):
+            destination_fd = -1
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+
+
+def _target_snapshot_is_stable(
+    path: Path,
+    snapshot: Path,
+    descriptors: Mapping[str, int],
+    before: Mapping[str, tuple[int, int, int, int, int]],
+) -> bool:
+    expected_suffixes = set(descriptors)
+    actual_suffixes = {
+        suffix for suffix in ("", "-wal", "-shm") if Path(f"{path}{suffix}").exists()
+    }
+    if actual_suffixes != expected_suffixes:
+        return False
+    for suffix, descriptor in descriptors.items():
+        metadata = os.fstat(descriptor)
+        if _stat_fingerprint(metadata) != before[suffix]:
+            return False
         try:
-            return open_database(path), exists
-        except sqlite3.OperationalError as error:
-            if "locked" not in str(error).casefold() or time.monotonic() >= deadline:
-                raise
-            time.sleep(0.025)
+            path_identity = _identity(Path(f"{path}{suffix}").lstat())
+        except FileNotFoundError:
+            return False
+        if path_identity != _identity(metadata):
+            return False
+        if _digest_descriptor(descriptor) != _digest_path(Path(f"{snapshot}{suffix}")):
+            return False
+        if _stat_fingerprint(os.fstat(descriptor)) != before[suffix]:
+            return False
+    return True
+
+
+def _stat_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _digest_descriptor(descriptor: int) -> bytes:
+    digest = sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(descriptor), "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.digest()
+
+
+def _digest_path(path: Path) -> bytes:
+    digest = sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.digest()
+
+
+def _open_staged_target(destination: Path, source_identity: _FileIdentity) -> _TargetHandle:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _reject_symlink_components(destination.parent)
+    descriptor, raw_staging = tempfile.mkstemp(
+        prefix=".personal-monitor-import-",
+        suffix=".sqlite3",
+        dir=destination.parent,
+    )
+    staging = Path(raw_staging)
+    os.fchmod(descriptor, 0o600)
+    try:
+        identity = _verified_regular_identity(descriptor, source_identity)
+        connection = _connect_verified_writable(
+            staging,
+            anchor_fd=descriptor,
+            expected_identity=identity,
+            source_identity=source_identity,
+        )
+        try:
+            _before_target_schema_write(staging)
+            _require_path_identity(staging, identity)
+            _configure_connection(connection)
+            _require_path_identity(staging, identity)
+            _apply_migrations(connection)
+        except BaseException:
+            connection.close()
+            raise
+        return _TargetHandle(
+            connection,
+            descriptor,
+            identity,
+            staging,
+            destination,
+            False,
+        )
+    except BaseException:
+        os.close(descriptor)
+        _remove_database_files(staging)
+        raise
+
+
+def _open_existing_target(path: Path, source_identity: _FileIdentity) -> _TargetHandle:
+    descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        identity = _verified_regular_identity(descriptor, source_identity)
+        connection = _connect_verified_writable(
+            path,
+            anchor_fd=descriptor,
+            expected_identity=identity,
+            source_identity=source_identity,
+        )
+        try:
+            _before_target_schema_write(path)
+            _require_path_identity(path, identity)
+            _configure_connection(connection)
+            _require_path_identity(path, identity)
+            _apply_migrations(connection)
+        except BaseException:
+            connection.close()
+            raise
+        return _TargetHandle(connection, descriptor, identity, None, path, False)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verified_regular_identity(descriptor: int, source_identity: _FileIdentity) -> _FileIdentity:
+    metadata = os.fstat(descriptor)
+    identity = _identity(metadata)
+    if not stat.S_ISREG(metadata.st_mode) or identity == source_identity:
+        raise RentalImportError("source and target must differ")
+    return identity
+
+
+def _before_target_schema_write(_path: Path) -> None:
+    """Test seam immediately before SQLite journal/schema configuration."""
+
+
+def _require_path_identity(path: Path, expected: _FileIdentity) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        raise RentalImportError("target path identity changed") from None
+    if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != expected:
+        raise RentalImportError("target path identity changed")
+
+
+def _connect_verified_writable(
+    path: Path,
+    *,
+    anchor_fd: int,
+    expected_identity: _FileIdentity,
+    source_identity: _FileIdentity,
+) -> sqlite3.Connection:
+    expected_before = _descriptor_identity_count(expected_identity)
+    source_before = _descriptor_identity_count(source_identity)
+    uri = f"file:{quote(os.fspath(path), safe='/')}?mode=rw"
+    connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        connection.execute("PRAGMA schema_version").fetchone()
+        anchored = _identity(os.fstat(anchor_fd))
+        try:
+            current = _identity(path.lstat())
+        except FileNotFoundError:
+            current = None
+        if (
+            anchored != expected_identity
+            or current != expected_identity
+            or _descriptor_identity_count(expected_identity) != expected_before + 1
+            or _descriptor_identity_count(source_identity) != source_before
+        ):
+            raise RentalImportError("target connection identity changed")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _descriptor_identity_count(identity: _FileIdentity) -> int:
+    root = Path("/dev/fd")
+    try:
+        count = 0
+        for entry in root.iterdir():
+            if not entry.name.isascii() or not entry.name.isdigit():
+                continue
+            try:
+                metadata = os.fstat(int(entry.name))
+            except OSError:
+                continue
+            if stat.S_ISREG(metadata.st_mode) and _identity(metadata) == identity:
+                count += 1
+        return count
+    except OSError:
+        raise RentalImportError("target connection identity unavailable") from None
+
+
+def _remove_database_files(path: Path) -> None:
+    for candidate in (
+        path,
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+        Path(f"{path}-journal"),
+    ):
+        with suppress(FileNotFoundError):
+            candidate.unlink()
 
 
 def _rental_spec(owner_id: str) -> MonitorSpec:
@@ -780,7 +1304,9 @@ def _target_address(
         ):
             raise RentalImportError("target aggregate conflicts")
         address = existing["address"]
-        if chat_ids and address not in chat_ids:
+        if (chat_ids and address not in chat_ids) or (
+            not chat_ids and address != str(telegram_user_id)
+        ):
             raise RentalImportError("legacy delivery target conflicts")
         return address
     if len(chat_ids) > 1:
@@ -814,7 +1340,7 @@ def _ensure_user(
         if (
             row["telegram_user_id"] != telegram_user_id
             or row["status"] != "active"
-            or not _valid_stored_timestamp(row["created_at"])
+            or row["created_at"] != timestamp
         ):
             raise RentalImportError("owner aggregate conflicts")
         return False
@@ -849,7 +1375,7 @@ def _ensure_target(
             row["owner_id"],
             row["kind"],
             row["address"],
-        ) != (owner_id, "telegram", address) or not _valid_stored_timestamp(row["created_at"]):
+        ) != (owner_id, "telegram", address) or row["created_at"] != timestamp:
             raise RentalImportError("target aggregate conflicts")
         return False
     collision = connection.execute(
@@ -896,7 +1422,7 @@ def _ensure_monitor_version(
             RENTAL_VERSION_ID,
             None,
         )
-        or not _valid_stored_timestamp(monitor["created_at"])
+        or monitor["created_at"] != timestamp
         or not _valid_stored_timestamp(monitor["updated_at"])
     ):
         raise RentalImportError("monitor aggregate conflicts")
@@ -923,8 +1449,8 @@ def _ensure_monitor_version(
             owner_id,
             None,
         )
-        or not _valid_stored_timestamp(version["created_at"])
-        or not _valid_stored_timestamp(version["approved_at"])
+        or version["created_at"] != timestamp
+        or version["approved_at"] != timestamp
     ):
         raise RentalImportError("monitor version conflicts")
     if monitor_created != version_created:

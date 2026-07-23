@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -337,20 +338,21 @@ def test_failure_at_each_mapping_phase_rolls_back_all_domain_rows(
     with pytest.raises(RuntimeError):
         import_rental_state(old_path, new_path, OWNER, TARGET)
 
-    with sqlite3.connect(new_path) as connection:
-        assert all(
-            connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
-            for table in (
-                "users",
-                "delivery_targets",
-                "monitors",
-                "monitor_versions",
-                "observations",
-                "outbox",
-                "deliveries",
-                "runs",
+    if new_path.exists():
+        with sqlite3.connect(new_path) as connection:
+            assert all(
+                connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+                for table in (
+                    "users",
+                    "delivery_targets",
+                    "monitors",
+                    "monitor_versions",
+                    "observations",
+                    "outbox",
+                    "deliveries",
+                    "runs",
+                )
             )
-        )
 
 
 def test_rejects_extra_legacy_schema_without_mutating_target(tmp_path: Path) -> None:
@@ -409,7 +411,7 @@ def test_rejects_malformed_agency_status_json(tmp_path: Path, agency_status: str
     old_path = tmp_path / f"legacy-{sha256(agency_status.encode()).hexdigest()[:8]}.db"
     new_path = tmp_path / "personal.db"
     legacy = _create_legacy(old_path)
-    now = datetime(2026, 7, 20, 3, tzinfo=UTC).isoformat()
+    now = datetime(2026, 7, 21, 5, tzinfo=UTC).isoformat()
     legacy.execute(
         "INSERT INTO runs(started_at, finished_at, status, agency_status) "
         "VALUES (?, ?, 'success', ?)",
@@ -456,7 +458,7 @@ def test_existing_owned_target_disambiguates_multiple_legacy_chats(
     legacy.commit()
     legacy.close()
     target = open_database(new_path)
-    now = datetime(2026, 7, 20, 3, tzinfo=UTC).isoformat()
+    now = datetime(2026, 7, 21, 5, tzinfo=UTC).isoformat()
     target.execute("INSERT INTO users VALUES (?, ?, 'active', ?)", (OWNER, 12345, now))
     target.execute(
         "INSERT INTO delivery_targets VALUES (?, ?, 'telegram', ?, ?)",
@@ -580,3 +582,341 @@ def test_cli_failure_is_fixed_and_redacts_all_arguments(tmp_path: Path, capsys) 
     assert captured.err == "rental import failed\n"
     assert "private" not in captured.err
     assert "998877" not in captured.err
+
+
+def test_target_absence_race_cannot_turn_source_hardlink_into_write_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import personal_monitor.migration.import_rental as module
+
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    source_before = old_path.read_bytes()
+    original_open_target = module._open_target
+
+    def raced_open_target(path: Path, *, source_identity, dry_run: bool):
+        new_path.hardlink_to(old_path)
+        return original_open_target(
+            path,
+            source_identity=source_identity,
+            dry_run=dry_run,
+        )
+
+    monkeypatch.setattr(module, "_open_target", raced_open_target)
+
+    with pytest.raises(RuntimeError):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert old_path.read_bytes() == source_before
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(f"{old_path}{suffix}").exists()
+
+
+def test_source_path_swap_after_validation_is_rejected_by_read_fd_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import personal_monitor.migration.import_rental as module
+
+    old_path = tmp_path / "legacy.db"
+    original_anchor = tmp_path / "legacy-original.db"
+    replacement = tmp_path / "legacy-replacement.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    original_anchor.hardlink_to(old_path)
+    _create_legacy(replacement).close()
+    source_before = original_anchor.read_bytes()
+    original_read_source = module._read_source
+
+    def raced_read_source(path: Path, expected_identity):
+        old_path.unlink()
+        old_path.hardlink_to(replacement)
+        return original_read_source(path, expected_identity)
+
+    monkeypatch.setattr(module, "_read_source", raced_read_source)
+
+    with pytest.raises(RuntimeError):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert original_anchor.read_bytes() == source_before
+    assert not new_path.exists()
+
+
+def test_existing_target_swap_to_source_hardlink_is_rejected_before_schema_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import personal_monitor.migration.import_rental as module
+
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    source_before = old_path.read_bytes()
+    original_open_target = module._open_target
+
+    def raced_open_target(path: Path, *, source_identity, dry_run: bool):
+        new_path.unlink()
+        new_path.hardlink_to(old_path)
+        return original_open_target(
+            path,
+            source_identity=source_identity,
+            dry_run=dry_run,
+        )
+
+    monkeypatch.setattr(module, "_open_target", raced_open_target)
+
+    with pytest.raises(RuntimeError):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert old_path.read_bytes() == source_before
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(f"{old_path}{suffix}").exists()
+
+
+def test_existing_target_swap_after_fd_proof_is_rejected_before_sidecar_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import personal_monitor.migration.import_rental as module
+
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    source_before = old_path.read_bytes()
+
+    def swap_after_proof(path: Path) -> None:
+        assert path == new_path
+        new_path.unlink()
+        new_path.hardlink_to(old_path)
+
+    monkeypatch.setattr(module, "_before_target_schema_write", swap_after_proof)
+
+    with pytest.raises(RuntimeError):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert old_path.read_bytes() == source_before
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(f"{old_path}{suffix}").exists()
+
+
+def test_dry_run_reads_committed_target_wal_without_creating_sidecars(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    writer = open_database(new_path)
+    writer.execute("PRAGMA wal_autocheckpoint = 0")
+    writer.execute(
+        "UPDATE delivery_targets SET address = 'committed-wal-conflict' WHERE id = ?",
+        (TARGET,),
+    )
+    wal_path = Path(f"{new_path}-wal")
+    shm_path = Path(f"{new_path}-shm")
+    assert wal_path.exists()
+    assert shm_path.exists()
+    before_database = new_path.read_bytes()
+    before_presence = (wal_path.exists(), shm_path.exists())
+    before_sidecars = (wal_path.read_bytes(), shm_path.read_bytes())
+    try:
+        with pytest.raises(RuntimeError, match="conflict"):
+            import_rental_state(old_path, new_path, OWNER, TARGET, dry_run=True)
+        assert new_path.read_bytes() == before_database
+        assert (wal_path.exists(), shm_path.exists()) == before_presence
+        assert (wal_path.read_bytes(), shm_path.read_bytes()) == before_sidecars
+    finally:
+        writer.close()
+
+
+def test_dry_run_snapshot_is_private_and_unstable_copy_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import personal_monitor.migration.import_rental as module
+
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    identity = module._identity(new_path.lstat())
+    temporary, snapshot = module._copy_target_snapshot(
+        new_path,
+        expected_identity=identity,
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        assert stat.S_IMODE(temporary_path.lstat().st_mode) == 0o700
+        assert stat.S_IMODE(snapshot.lstat().st_mode) == 0o600
+    finally:
+        temporary.cleanup()
+    assert not temporary_path.exists()
+    target_before = new_path.read_bytes()
+    monkeypatch.setattr(
+        module,
+        "_target_snapshot_is_stable",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError):
+        import_rental_state(old_path, new_path, OWNER, TARGET, dry_run=True)
+
+    assert new_path.read_bytes() == target_before
+
+
+def test_generated_legacy_column_is_rejected_even_when_table_info_hides_it(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    legacy = _create_legacy(old_path)
+    legacy.execute(
+        "ALTER TABLE announcements ADD COLUMN hidden_title TEXT GENERATED ALWAYS AS (title) VIRTUAL"
+    )
+    legacy.commit()
+    legacy.close()
+
+    with pytest.raises(RuntimeError, match="schema"):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert not new_path.exists()
+
+
+def test_runs_table_without_autoincrement_is_rejected(tmp_path: Path) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    legacy = _create_legacy(old_path)
+    legacy.execute("ALTER TABLE runs RENAME TO runs_old")
+    legacy.execute(
+        "CREATE TABLE runs("
+        "id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, "
+        "status TEXT NOT NULL, new_count INTEGER NOT NULL DEFAULT 0, "
+        "agency_status TEXT NOT NULL DEFAULT '{}')"
+    )
+    legacy.execute("DROP TABLE runs_old")
+    legacy.commit()
+    legacy.close()
+
+    with pytest.raises(RuntimeError, match="schema"):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert not new_path.exists()
+
+
+def test_empty_source_requires_existing_target_to_use_owner_private_chat(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    target = open_database(new_path)
+    evidence = "2000-01-01T00:00:00+00:00"
+    target.execute(
+        "INSERT INTO users(id, telegram_user_id, status, created_at) "
+        "VALUES (?, 12345, 'active', ?)",
+        (OWNER, evidence),
+    )
+    target.execute(
+        "INSERT INTO delivery_targets(id, owner_id, kind, address, created_at) "
+        "VALUES (?, ?, 'telegram', 'not-the-private-chat', ?)",
+        (TARGET, OWNER, evidence),
+    )
+    target.close()
+
+    with pytest.raises(RuntimeError, match="conflict"):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "where"),
+    [
+        ("users", "created_at", "id = 'telegram-user:12345'"),
+        ("delivery_targets", "created_at", "id = 'rental-private'"),
+        ("monitors", "created_at", "id = 'rental-housing-seoul-gyeonggi'"),
+        (
+            "monitor_versions",
+            "created_at",
+            "id = 'rental-housing-seoul-gyeonggi:v1'",
+        ),
+        (
+            "monitor_versions",
+            "approved_at",
+            "id = 'rental-housing-seoul-gyeonggi:v1'",
+        ),
+    ],
+)
+def test_existing_aggregate_creation_and_approval_times_match_source_evidence(
+    tmp_path: Path, table: str, column: str, where: str
+) -> None:
+    old_path = tmp_path / f"legacy-{table}-{column}.db"
+    new_path = tmp_path / f"personal-{table}-{column}.db"
+    _create_legacy(old_path).close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    target = open_database(new_path)
+    target.execute(f"UPDATE {table} SET {column} = '2001-01-01T00:00:00+00:00' WHERE {where}")
+    target.close()
+
+    with pytest.raises(RuntimeError, match="conflict"):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+
+@pytest.mark.parametrize("message_id", (0, -1, "not-an-integer"))
+def test_invalid_legacy_message_ids_abort_without_target_mutation(
+    tmp_path: Path, message_id: int | str
+) -> None:
+    old_path = tmp_path / f"legacy-{sha256(str(message_id).encode()).hexdigest()[:8]}.db"
+    new_path = tmp_path / "personal.db"
+    legacy = _create_legacy(old_path)
+    _seed_three_agencies(legacy)
+    legacy.execute("UPDATE deliveries SET message_id = ?", (message_id,))
+    legacy.commit()
+    legacy.close()
+
+    with pytest.raises(RuntimeError):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert not new_path.exists()
+
+
+def test_legacy_foreign_key_violation_aborts_without_target_mutation(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    legacy = _create_legacy(old_path)
+    legacy.execute("PRAGMA foreign_keys = OFF")
+    legacy.execute(
+        "INSERT INTO deliveries VALUES ('LH:missing', '12345', ?, 10)",
+        (datetime(2026, 7, 21, 5, tzinfo=UTC).isoformat(),),
+    )
+    legacy.commit()
+    legacy.close()
+
+    with pytest.raises(RuntimeError, match="foreign key"):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert not new_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value"),
+    [
+        ("observations", "content_hash", "conflicting-hash"),
+        ("outbox", "payload_json", '{"text":"conflicting"}'),
+        ("deliveries", "external_message_id", "999"),
+    ],
+)
+def test_existing_observation_outbox_and_delivery_conflicts_abort_atomically(
+    tmp_path: Path, table: str, column: str, value: str
+) -> None:
+    old_path = tmp_path / f"legacy-{table}.db"
+    new_path = tmp_path / f"personal-{table}.db"
+    legacy = _create_legacy(old_path)
+    _seed_three_agencies(legacy)
+    legacy.close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    target = open_database(new_path)
+    target.execute(f"UPDATE {table} SET {column} = ?", (value,))
+    target.close()
+
+    with pytest.raises(RuntimeError, match="conflict"):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
