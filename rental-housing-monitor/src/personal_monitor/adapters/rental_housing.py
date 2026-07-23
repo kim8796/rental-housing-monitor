@@ -134,15 +134,29 @@ class RentalHousingAdapter:
         except Exception:
             raise _validation_error("collector construction failed") from None
         try:
-            with context as collectors:
-                ordered = _ordered_collectors(collectors)
-                results = await _collect_all(ordered)
-        except asyncio.CancelledError:
-            raise
-        except MonitorError:
-            raise
+            exit_context = context.__exit__
+            collectors = context.__enter__()
         except Exception:
             raise _validation_error("collector construction failed") from None
+        pending_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        results: tuple[list[ObservedItem] | _CollectionFailure, ...] | None = None
+        try:
+            ordered = _ordered_collectors(collectors)
+            results = await _collect_all(ordered)
+        except BaseException as error:
+            pending_error = _safe_execution_error(error)
+        try:
+            exit_context(
+                type(pending_error) if pending_error is not None else None,
+                pending_error,
+                pending_error.__traceback__ if pending_error is not None else None,
+            )
+        except BaseException as error:
+            cleanup_error = error
+        _raise_context_outcome(pending_error, cleanup_error)
+        if results is None:
+            raise _validation_error("collector execution failed")
 
         statuses: dict[str, str] = {}
         warnings: list[SourceWarning] = []
@@ -198,6 +212,30 @@ def production_rental_housing_adapter(
     clock: Clock = lambda: datetime.now(UTC),
 ) -> RentalHousingAdapter:
     return RentalHousingAdapter.production(data_go_kr_service_key, clock=clock)
+
+
+def _safe_execution_error(error: BaseException) -> BaseException:
+    if isinstance(error, MonitorError) or not isinstance(error, Exception):
+        return error
+    return _validation_error("collector execution failed")
+
+
+def _raise_context_outcome(
+    pending_error: BaseException | None,
+    cleanup_error: BaseException | None,
+) -> None:
+    if pending_error is not None:
+        if cleanup_error is not None and not isinstance(cleanup_error, Exception):
+            raise BaseExceptionGroup(
+                "rental collector execution and cleanup failed",
+                (pending_error, cleanup_error),
+            )
+        raise pending_error
+    if cleanup_error is None:
+        return
+    if isinstance(cleanup_error, Exception):
+        raise _validation_error("collector cleanup failed") from None
+    raise cleanup_error
 
 
 @contextmanager

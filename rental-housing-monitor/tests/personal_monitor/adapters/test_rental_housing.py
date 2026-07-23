@@ -426,6 +426,208 @@ def test_fatal_collector_error_wins_over_concurrent_fetch_cancellation() -> None
     assert context_exited is True
 
 
+def test_cancelled_fetch_outranks_ordinary_secret_cleanup_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "cleanup-secret-marker"
+    started = threading.Event()
+    release = threading.Event()
+    finished = 0
+    cleanup_calls = 0
+    lock = threading.Lock()
+
+    class BlockingCollector(FakeCollector):
+        def collect(self) -> object:
+            nonlocal finished
+            started.set()
+            release.wait(timeout=5)
+            with lock:
+                finished += 1
+            return []
+
+    collectors = tuple(BlockingCollector(agency, []) for agency in Agency)
+
+    @contextmanager
+    def factory():
+        nonlocal cleanup_calls
+        try:
+            yield collectors
+        finally:
+            cleanup_calls += 1
+            with lock:
+                assert finished == 3
+            raise RuntimeError(marker)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            RentalHousingAdapter(factory, clock=lambda: NOW).fetch("m", rental_spec())
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert marker not in str(caught.value)
+        assert marker not in repr(caught.value)
+
+    caplog.set_level(logging.DEBUG)
+    asyncio.run(scenario())
+    assert cleanup_calls == 1
+    assert finished == 3
+    assert marker not in caplog.text
+
+
+def test_fatal_collector_outranks_ordinary_secret_cleanup_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "cleanup-secret-marker"
+    cleanup_calls = 0
+
+    class Fatal(BaseException):
+        pass
+
+    collectors = (
+        FakeCollector(Agency.LH, []),
+        FakeCollector(Agency.SH, Fatal()),
+        FakeCollector(Agency.GH, []),
+    )
+
+    @contextmanager
+    def factory():
+        nonlocal cleanup_calls
+        try:
+            yield collectors
+        finally:
+            cleanup_calls += 1
+            raise RuntimeError(marker)
+
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(Fatal):
+        asyncio.run(RentalHousingAdapter(factory, clock=lambda: NOW).fetch("m", rental_spec()))
+
+    assert cleanup_calls == 1
+    assert marker not in caplog.text
+
+
+def test_ordinary_enter_and_normal_cleanup_failures_are_safely_translated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "context-secret-marker"
+    cleanup_calls = 0
+
+    @contextmanager
+    def enter_failure():
+        raise RuntimeError(marker)
+        yield ()
+
+    @contextmanager
+    def cleanup_failure():
+        nonlocal cleanup_calls
+        try:
+            yield tuple(FakeCollector(agency, []) for agency in Agency)
+        finally:
+            cleanup_calls += 1
+            raise RuntimeError(marker)
+
+    caplog.set_level(logging.DEBUG)
+    for factory in (enter_failure, cleanup_failure):
+        with pytest.raises(MonitorError) as caught:
+            asyncio.run(RentalHousingAdapter(factory, clock=lambda: NOW).fetch("m", rental_spec()))
+        assert caught.value.error_class is ErrorClass.VALIDATION
+        assert marker not in str(caught.value)
+        assert marker not in repr(caught.value)
+
+    assert cleanup_calls == 1
+    assert marker not in caplog.text
+
+
+def test_pending_and_cleanup_fatal_errors_are_both_preserved() -> None:
+    class CollectorFatal(BaseException):
+        pass
+
+    class CleanupFatal(BaseException):
+        pass
+
+    cleanup_calls = 0
+    collectors = (
+        FakeCollector(Agency.LH, []),
+        FakeCollector(Agency.SH, CollectorFatal()),
+        FakeCollector(Agency.GH, []),
+    )
+
+    @contextmanager
+    def factory():
+        nonlocal cleanup_calls
+        try:
+            yield collectors
+        finally:
+            cleanup_calls += 1
+            raise CleanupFatal
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        asyncio.run(RentalHousingAdapter(factory, clock=lambda: NOW).fetch("m", rental_spec()))
+
+    assert any(isinstance(error, CollectorFatal) for error in caught.value.exceptions)
+    assert any(isinstance(error, CleanupFatal) for error in caught.value.exceptions)
+    assert cleanup_calls == 1
+
+
+def test_cancelled_fetch_and_fatal_cleanup_are_both_preserved() -> None:
+    class CleanupFatal(BaseException):
+        pass
+
+    started = threading.Event()
+    release = threading.Event()
+    cleanup_calls = 0
+
+    class BlockingCollector(FakeCollector):
+        def collect(self) -> object:
+            started.set()
+            release.wait(timeout=5)
+            return []
+
+    @contextmanager
+    def factory():
+        nonlocal cleanup_calls
+        try:
+            yield tuple(BlockingCollector(agency, []) for agency in Agency)
+        finally:
+            cleanup_calls += 1
+            raise CleanupFatal
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            RentalHousingAdapter(factory, clock=lambda: NOW).fetch("m", rental_spec())
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        release.set()
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await task
+        assert any(isinstance(error, asyncio.CancelledError) for error in caught.value.exceptions)
+        assert any(isinstance(error, CleanupFatal) for error in caught.value.exceptions)
+
+    asyncio.run(scenario())
+    assert cleanup_calls == 1
+
+
+def test_fatal_cleanup_without_pending_error_propagates() -> None:
+    class CleanupFatal(BaseException):
+        pass
+
+    @contextmanager
+    def factory():
+        try:
+            yield tuple(FakeCollector(agency, []) for agency in Agency)
+        finally:
+            raise CleanupFatal
+
+    with pytest.raises(CleanupFatal):
+        asyncio.run(RentalHousingAdapter(factory, clock=lambda: NOW).fetch("m", rental_spec()))
+
+
 @pytest.mark.parametrize(
     "url",
     [
