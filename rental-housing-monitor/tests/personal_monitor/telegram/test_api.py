@@ -549,6 +549,21 @@ class _ObservingLogFilter(logging.Filter):
         return True
 
 
+class _TrackingResponseStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes = b"", *, cancel: bool = False) -> None:
+        self._body = body
+        self._cancel = cancel
+        self.close_calls = 0
+
+    async def __aiter__(self):
+        if self._cancel:
+            raise asyncio.CancelledError
+        yield self._body
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
 def test_review_preexisting_httpx_filter_never_observes_tokenized_url() -> None:
     logger = logging.getLogger("httpx")
     original_filters = list(logger.filters)
@@ -681,7 +696,14 @@ def test_review_photo_message_and_inline_callback_advance_offset_as_unsupported(
         "message_id": 31,
         "chat": {"id": 42},
         "from": {"id": 7},
-        "photo": [{"file_id": "opaque", "width": 1, "height": 1}],
+        "photo": [
+            {
+                "file_id": "opaque",
+                "file_unique_id": "opaque-unique",
+                "width": 1,
+                "height": 1,
+            }
+        ],
     }
     inline_callback = {
         "id": "callback-query-id",
@@ -1006,20 +1028,51 @@ def test_final_review_malformed_or_unknown_no_text_message_is_rejected(
     [
         unsupported_message(
             photo=[
-                {"file_id": "photo-small", "width": 320, "height": 240},
-                {"file_id": "photo-large", "width": 1280, "height": 960},
+                {
+                    "file_id": "photo-small",
+                    "file_unique_id": "photo-small-unique",
+                    "width": 320,
+                    "height": 240,
+                    "file_size": 2048,
+                },
+                {
+                    "file_id": "photo-large",
+                    "file_unique_id": "photo-large-unique",
+                    "width": 1280,
+                    "height": 960,
+                    "file_size": 8192,
+                },
             ],
             caption="사진 설명",
         ),
         unsupported_message(
             video={
                 "file_id": "video-id",
+                "file_unique_id": "video-unique-id",
                 "width": 1280,
                 "height": 720,
                 "duration": 5,
+                "file_name": "clip.mp4",
+                "mime_type": "video/mp4",
+                "file_size": 8192,
+                "supports_streaming": True,
             }
         ),
-        unsupported_message(document={"file_id": "document-id"}),
+        unsupported_message(
+            document={
+                "file_id": "document-id",
+                "file_unique_id": "document-unique-id",
+                "file_name": "notice.pdf",
+                "mime_type": "application/pdf",
+                "file_size": 4096,
+                "thumbnail": {
+                    "file_id": "thumb-id",
+                    "file_unique_id": "thumb-unique-id",
+                    "width": 80,
+                    "height": 80,
+                },
+            }
+        ),
     ],
 )
 def test_final_review_valid_bounded_media_message_advances_offset(message: object) -> None:
@@ -1053,3 +1106,269 @@ def test_final_review_cancellation_propagates_and_owned_transport_still_closes()
     run(api.aclose())
 
     assert close_calls == 1
+
+
+def test_second_final_review_response_metadata_is_sanitized_before_httpx_logging() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+    stream = _TrackingResponseStream(b'{"ok":false,"description":"body-secret"}')
+
+    def malicious_response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            stream=stream,
+            extensions={
+                "http_version": b"123:VERSION_SECRET",
+                "reason_phrase": b"123:REASON_SECRET",
+            },
+        )
+
+    logger.filters.insert(0, observer)
+    logger.setLevel(logging.INFO)
+    harness = TelegramHarness([malicious_response])
+    try:
+        with pytest.raises(TelegramApiError, match="Telegram request failed") as caught:
+            run(harness.api.get_updates(offset=0, timeout=30))
+        run(harness.close())
+
+        observed = " ".join(observer.messages)
+        assert "VERSION_SECRET" not in observed
+        assert "REASON_SECRET" not in observed
+        assert "body-secret" not in observed
+        assert "HTTP/1.1" in observed
+        assert "Telegram" in observed
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert stream.close_calls == 1
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+def test_second_final_review_cancelled_stream_closes_once_without_metadata_leak() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+    stream = _TrackingResponseStream(cancel=True)
+
+    def malicious_response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=stream,
+            extensions={
+                "http_version": b"123:CANCEL_VERSION_SECRET",
+                "reason_phrase": b"123:CANCEL_REASON_SECRET",
+            },
+        )
+
+    logger.filters.insert(0, observer)
+    logger.setLevel(logging.INFO)
+    harness = TelegramHarness([malicious_response])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            run(harness.api.get_updates(offset=0, timeout=30))
+        run(harness.close())
+
+        observed = " ".join(observer.messages)
+        assert "CANCEL_VERSION_SECRET" not in observed
+        assert "CANCEL_REASON_SECRET" not in observed
+        assert stream.close_calls == 1
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+def test_second_final_review_httpcore_diagnostics_are_suppressed_without_muting_other_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    parent_logger = logging.getLogger("httpcore")
+    probe_logger = logging.getLogger("httpcore.http11")
+    unrelated_logger = logging.getLogger("personal_monitor.telegram_unrelated_probe")
+    original_parent = (parent_logger.disabled, parent_logger.level)
+    original_probe = (probe_logger.disabled, probe_logger.level, probe_logger.propagate)
+    original_unrelated = (
+        unrelated_logger.disabled,
+        unrelated_logger.level,
+        unrelated_logger.propagate,
+    )
+
+    def response_with_transport_diagnostic(_request: httpx.Request) -> httpx.Response:
+        probe_logger.debug(
+            "receive_response_headers %r",
+            [
+                (b"authorization", b"123:HEADER_SECRET"),
+                (b"x-message", b"callback-secret"),
+            ],
+        )
+        unrelated_logger.warning("unrelated-log-marker")
+        return json_response({"ok": True, "result": []})
+
+    parent_logger.disabled = False
+    parent_logger.setLevel(logging.DEBUG)
+    probe_logger.disabled = False
+    probe_logger.setLevel(logging.DEBUG)
+    probe_logger.propagate = True
+    unrelated_logger.disabled = False
+    unrelated_logger.setLevel(logging.DEBUG)
+    unrelated_logger.propagate = True
+    caplog.set_level(logging.DEBUG)
+    harness = TelegramHarness([response_with_transport_diagnostic])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert all("HEADER_SECRET" not in message for message in messages)
+        assert all("callback-secret" not in message for message in messages)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert any(message == "unrelated-log-marker" for message in messages)
+    finally:
+        parent_logger.disabled, parent_logger.level = original_parent
+        probe_logger.disabled, probe_logger.level, probe_logger.propagate = original_probe
+        (
+            unrelated_logger.disabled,
+            unrelated_logger.level,
+            unrelated_logger.propagate,
+        ) = original_unrelated
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        unsupported_message(
+            video={
+                "file_id": "video-id",
+                "file_unique_id": "video-unique",
+                "width": True,
+                "height": 0,
+                "duration": "bad",
+            }
+        ),
+        unsupported_message(
+            audio={
+                "file_id": "audio-id",
+                "file_unique_id": "audio-unique",
+                "duration": False,
+            }
+        ),
+        unsupported_message(
+            document={
+                "file_id": "document-id",
+                "file_unique_id": "document-unique",
+                "thumbnail": [[] for _ in range(10_000)],
+            }
+        ),
+        unsupported_message(
+            photo=[
+                {
+                    "file_id": "photo-id",
+                    "file_unique_id": None,
+                    "width": 10,
+                    "height": 10,
+                }
+            ]
+        ),
+        unsupported_message(
+            animation={
+                "file_id": "animation-id",
+                "file_unique_id": "animation-unique",
+                "width": 10,
+                "height": 10,
+                "duration": 1,
+                "file_size": -1,
+            }
+        ),
+        unsupported_message(
+            sticker={
+                "file_id": "sticker-id",
+                "file_unique_id": "sticker-unique",
+                "type": "regular",
+                "width": 10,
+                "height": 10,
+                "is_animated": 1,
+                "is_video": False,
+            }
+        ),
+        unsupported_message(
+            sticker={
+                "file_id": "sticker-id",
+                "file_unique_id": "sticker-unique",
+                "type": ["regular"],
+                "width": 10,
+                "height": 10,
+                "is_animated": False,
+                "is_video": False,
+            }
+        ),
+        unsupported_message(
+            sticker={
+                "file_id": "sticker-id",
+                "file_unique_id": "sticker-unique",
+                "type": "mask",
+                "width": 10,
+                "height": 10,
+                "is_animated": False,
+                "is_video": False,
+                "mask_position": {
+                    "point": ["eyes"],
+                    "x_shift": 0,
+                    "y_shift": 0,
+                    "scale": 1,
+                },
+            }
+        ),
+        unsupported_message(
+            video_note={
+                "file_id": "note-id",
+                "file_unique_id": "note-unique",
+                "length": 0,
+                "duration": "bad",
+            }
+        ),
+        unsupported_message(
+            voice={
+                "file_id": "voice-id",
+                "file_unique_id": "voice-unique",
+                "duration": False,
+            }
+        ),
+        unsupported_message(
+            document={
+                "file_id": "document-id",
+                "file_unique_id": "document-unique",
+                **{f"extra_{index}": index for index in range(40)},
+            }
+        ),
+        unsupported_message(
+            video={
+                "file_id": "video-id",
+                "file_unique_id": "video-unique",
+                "width": 640,
+                "height": 480,
+                "duration": 1,
+                "cover": [
+                    {
+                        "file_id": f"cover-{index}",
+                        "file_unique_id": f"cover-unique-{index}",
+                        "width": 10,
+                        "height": 10,
+                    }
+                    for index in range(21)
+                ],
+            }
+        ),
+    ],
+)
+def test_second_final_review_media_fields_require_exact_bounded_per_type_shapes(
+    message: object,
+) -> None:
+    harness = TelegramHarness(
+        [json_response({"ok": True, "result": [{"update_id": 102, "message": message}]})]
+    )
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.get_updates(offset=102, timeout=30))
+    run(harness.close())

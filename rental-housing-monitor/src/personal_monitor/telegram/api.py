@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -29,6 +32,14 @@ MAX_JSON_INTEGER_DIGITS: Final = 19
 MAX_MEDIA_FILE_ID_CHARS: Final = 512
 MAX_PHOTO_SIZES: Final = 20
 MAX_MEDIA_CAPTION_CHARS: Final = 1024
+MAX_MEDIA_OBJECT_KEYS: Final = 32
+MAX_MEDIA_FILE_SIZE: Final = 2**50
+MAX_MEDIA_DURATION: Final = 10 * 365 * 24 * 60 * 60
+MAX_MEDIA_DIMENSION: Final = 100_000
+MAX_MEDIA_FILE_NAME_CHARS: Final = 255
+MAX_MEDIA_MIME_TYPE_CHARS: Final = 127
+MAX_MEDIA_TEXT_CHARS: Final = 512
+_HTTP_CORE_SUPPRESS_LEVEL: Final = logging.CRITICAL + 1
 
 _INVALID: Final = object()
 _UNSUPPORTED: Final = object()
@@ -45,6 +56,28 @@ _TELEGRAM_ENDPOINTS: Final = frozenset(
 _UNSUPPORTED_MEDIA_FIELDS: Final = frozenset(
     {"animation", "audio", "document", "photo", "sticker", "video", "video_note", "voice"}
 )
+_SAFE_CONTENT_ENCODINGS: Final = frozenset({"br", "deflate", "gzip", "identity", "zstd"})
+
+
+def _suppress_httpcore_diagnostics() -> bool:
+    """Disable httpcore's process-wide raw wire diagnostics, without muting other loggers."""
+    try:
+        parent = logging.getLogger("httpcore")
+        parent.disabled = True
+        parent.setLevel(_HTTP_CORE_SUPPRESS_LEVEL)
+        for name, candidate in list(logging.Logger.manager.loggerDict.items()):
+            if name.startswith("httpcore.") and isinstance(candidate, logging.Logger):
+                candidate.disabled = True
+                candidate.setLevel(_HTTP_CORE_SUPPRESS_LEVEL)
+        return parent.disabled and parent.level == _HTTP_CORE_SUPPRESS_LEVEL
+    except Exception:
+        return False
+
+
+# httpcore renders raw response headers and reason phrases inside the transport,
+# before this module can sanitize a response. Its diagnostic namespace therefore
+# stays disabled for the process; application and HTTPX request logs remain live.
+_HTTPCORE_DIAGNOSTICS_SUPPRESSED: Final = _suppress_httpcore_diagnostics()
 
 
 class _SanitizingTransport(httpx.AsyncBaseTransport):
@@ -78,7 +111,21 @@ class _SanitizingTransport(httpx.AsyncBaseTransport):
             extensions=request.extensions,
         )
         try:
-            return await self._inner_anchor.handle_async_request(raw_request)
+            inner_response = await self._inner_anchor.handle_async_request(raw_request)
+            try:
+                return httpx.Response(
+                    inner_response.status_code,
+                    headers=_safe_response_headers(inner_response),
+                    stream=inner_response.stream,
+                    extensions={
+                        "http_version": b"HTTP/1.1",
+                        "reason_phrase": b"Telegram",
+                    },
+                )
+            except BaseException:
+                with suppress(BaseException):
+                    await inner_response.aclose()
+                raise
         finally:
             request.url = _sanitized_request_url(request.url)
 
@@ -91,6 +138,16 @@ def _sanitized_request_url(value: httpx.URL) -> httpx.URL:
     if endpoint not in _TELEGRAM_ENDPOINTS:
         endpoint = "request"
     return httpx.URL(f"https://api.telegram.org/bot-redacted/{endpoint}")
+
+
+def _safe_response_headers(response: httpx.Response) -> list[tuple[bytes, bytes]]:
+    try:
+        encoding = response.headers.get("content-encoding", "").strip().lower()
+    except Exception:
+        return []
+    if encoding in _SAFE_CONTENT_ENCODINGS:
+        return [(b"content-encoding", encoding.encode("ascii"))]
+    return []
 
 
 class TelegramApiError(RuntimeError):
@@ -318,6 +375,8 @@ class TelegramApi:
     ) -> dict[str, Any]:
         if not self._client_integrity_ok() or self._client.is_closed:
             raise TelegramApiError("Telegram client integrity failure")
+        if not _HTTPCORE_DIAGNOSTICS_SUPPRESSED or not _suppress_httpcore_diagnostics():
+            raise TelegramApiError("Telegram logging integrity failure")
 
         request_failed = False
         status_code = 0
@@ -608,26 +667,306 @@ def _is_valid_unsupported_media_message(value: Mapping[str, object]) -> bool:
     media = value.get(field)
     if field == "photo":
         return _is_valid_photo_sizes(media)
-    return _is_valid_media_object(media)
+    validators = {
+        "animation": _is_valid_animation,
+        "audio": _is_valid_audio,
+        "document": _is_valid_document,
+        "sticker": _is_valid_sticker,
+        "video": _is_valid_video,
+        "video_note": _is_valid_video_note,
+        "voice": _is_valid_voice,
+    }
+    return validators[field](media)
 
 
 def _is_valid_photo_sizes(value: object) -> bool:
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_PHOTO_SIZES:
         return False
-    for item in value:
-        if not isinstance(item, dict):
-            return False
-        if not _is_valid_media_file_id(item.get("file_id")):
-            return False
-        if not _is_int_in_range(item.get("width"), minimum=1, maximum=100_000):
-            return False
-        if not _is_int_in_range(item.get("height"), minimum=1, maximum=100_000):
-            return False
-    return True
+    return all(_is_valid_photo_size(item) for item in value)
 
 
-def _is_valid_media_object(value: object) -> bool:
-    return isinstance(value, dict) and _is_valid_media_file_id(value.get("file_id"))
+def _is_valid_photo_size(value: object) -> bool:
+    allowed = {"file_id", "file_unique_id", "width", "height", "file_size"}
+    return (
+        _is_bounded_media_mapping(value, allowed)
+        and _has_valid_media_file_ids(value)
+        and _required_media_int(value, "width", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and _required_media_int(value, "height", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and _optional_media_int(value, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+    )
+
+
+def _is_valid_animation(value: object) -> bool:
+    allowed = {
+        "file_id",
+        "file_unique_id",
+        "width",
+        "height",
+        "duration",
+        "thumbnail",
+        "file_name",
+        "mime_type",
+        "file_size",
+    }
+    return (
+        _is_bounded_media_mapping(value, allowed)
+        and _has_valid_media_file_ids(value)
+        and _required_media_int(value, "width", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and _required_media_int(value, "height", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and _required_media_int(value, "duration", minimum=0, maximum=MAX_MEDIA_DURATION)
+        and _optional_thumbnail(value)
+        and _optional_media_file_name(value)
+        and _optional_media_mime_type(value)
+        and _optional_media_int(value, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+    )
+
+
+def _is_valid_audio(value: object) -> bool:
+    allowed = {
+        "file_id",
+        "file_unique_id",
+        "duration",
+        "performer",
+        "title",
+        "file_name",
+        "mime_type",
+        "file_size",
+        "thumbnail",
+    }
+    return (
+        _is_bounded_media_mapping(value, allowed)
+        and _has_valid_media_file_ids(value)
+        and _required_media_int(value, "duration", minimum=0, maximum=MAX_MEDIA_DURATION)
+        and _optional_media_text(value, "performer")
+        and _optional_media_text(value, "title")
+        and _optional_media_file_name(value)
+        and _optional_media_mime_type(value)
+        and _optional_media_int(value, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+        and _optional_thumbnail(value)
+    )
+
+
+def _is_valid_document(value: object) -> bool:
+    allowed = {
+        "file_id",
+        "file_unique_id",
+        "thumbnail",
+        "file_name",
+        "mime_type",
+        "file_size",
+    }
+    return (
+        _is_bounded_media_mapping(value, allowed)
+        and _has_valid_media_file_ids(value)
+        and _optional_thumbnail(value)
+        and _optional_media_file_name(value)
+        and _optional_media_mime_type(value)
+        and _optional_media_int(value, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+    )
+
+
+def _is_valid_sticker(value: object) -> bool:
+    allowed = {
+        "file_id",
+        "file_unique_id",
+        "type",
+        "width",
+        "height",
+        "is_animated",
+        "is_video",
+        "thumbnail",
+        "emoji",
+        "set_name",
+        "premium_animation",
+        "mask_position",
+        "custom_emoji_id",
+        "needs_repainting",
+        "file_size",
+    }
+    sticker_type = value.get("type") if isinstance(value, dict) else None
+    return (
+        _is_bounded_media_mapping(value, allowed)
+        and _has_valid_media_file_ids(value)
+        and type(sticker_type) is str
+        and sticker_type in {"regular", "mask", "custom_emoji"}
+        and _required_media_int(value, "width", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and _required_media_int(value, "height", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and type(value.get("is_animated")) is bool
+        and type(value.get("is_video")) is bool
+        and _optional_thumbnail(value)
+        and _optional_media_text(value, "emoji", max_chars=32)
+        and _optional_media_text(value, "set_name")
+        and _optional_media_file(value, "premium_animation")
+        and _optional_mask_position(value)
+        and _optional_media_text(value, "custom_emoji_id")
+        and _optional_media_bool(value, "needs_repainting")
+        and _optional_media_int(value, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+    )
+
+
+def _is_valid_video(value: object) -> bool:
+    allowed = {
+        "file_id",
+        "file_unique_id",
+        "width",
+        "height",
+        "duration",
+        "thumbnail",
+        "cover",
+        "start_timestamp",
+        "file_name",
+        "mime_type",
+        "file_size",
+        "supports_streaming",
+    }
+    if not (
+        _is_bounded_media_mapping(value, allowed)
+        and _has_valid_media_file_ids(value)
+        and _required_media_int(value, "width", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and _required_media_int(value, "height", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and _required_media_int(value, "duration", minimum=0, maximum=MAX_MEDIA_DURATION)
+        and _optional_thumbnail(value)
+        and _optional_photo_sizes(value, "cover")
+        and _optional_media_file_name(value)
+        and _optional_media_mime_type(value)
+        and _optional_media_int(value, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+        and _optional_media_bool(value, "supports_streaming")
+    ):
+        return False
+    duration = value["duration"]
+    return _optional_media_int(value, "start_timestamp", minimum=0, maximum=duration)
+
+
+def _is_valid_video_note(value: object) -> bool:
+    allowed = {
+        "file_id",
+        "file_unique_id",
+        "length",
+        "duration",
+        "thumbnail",
+        "file_size",
+    }
+    return (
+        _is_bounded_media_mapping(value, allowed)
+        and _has_valid_media_file_ids(value)
+        and _required_media_int(value, "length", minimum=1, maximum=MAX_MEDIA_DIMENSION)
+        and _required_media_int(value, "duration", minimum=0, maximum=MAX_MEDIA_DURATION)
+        and _optional_thumbnail(value)
+        and _optional_media_int(value, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+    )
+
+
+def _is_valid_voice(value: object) -> bool:
+    allowed = {"file_id", "file_unique_id", "duration", "mime_type", "file_size"}
+    return (
+        _is_bounded_media_mapping(value, allowed)
+        and _has_valid_media_file_ids(value)
+        and _required_media_int(value, "duration", minimum=0, maximum=MAX_MEDIA_DURATION)
+        and _optional_media_mime_type(value)
+        and _optional_media_int(value, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+    )
+
+
+def _is_bounded_media_mapping(value: object, allowed: set[str]) -> bool:
+    return (
+        isinstance(value, dict)
+        and 1 <= len(value) <= MAX_MEDIA_OBJECT_KEYS
+        and set(value).issubset(allowed)
+    )
+
+
+def _has_valid_media_file_ids(value: Mapping[str, object]) -> bool:
+    return _is_valid_media_file_id(value.get("file_id")) and _is_valid_media_file_id(
+        value.get("file_unique_id")
+    )
+
+
+def _required_media_int(
+    value: Mapping[str, object], key: str, *, minimum: int, maximum: int
+) -> bool:
+    return _is_int_in_range(value.get(key), minimum=minimum, maximum=maximum)
+
+
+def _optional_media_int(
+    value: Mapping[str, object], key: str, *, minimum: int, maximum: int
+) -> bool:
+    return key not in value or _is_int_in_range(value[key], minimum=minimum, maximum=maximum)
+
+
+def _optional_media_bool(value: Mapping[str, object], key: str) -> bool:
+    return key not in value or type(value[key]) is bool
+
+
+def _optional_media_text(
+    value: Mapping[str, object], key: str, *, max_chars: int = MAX_MEDIA_TEXT_CHARS
+) -> bool:
+    return key not in value or (
+        _bounded_string(
+            value[key],
+            min_chars=1,
+            max_chars=max_chars,
+            max_bytes=max_chars * 4,
+            allow_layout_controls=False,
+        )
+        is not None
+    )
+
+
+def _optional_media_file_name(value: Mapping[str, object]) -> bool:
+    return _optional_media_text(value, "file_name", max_chars=MAX_MEDIA_FILE_NAME_CHARS)
+
+
+def _optional_media_mime_type(value: Mapping[str, object]) -> bool:
+    if "mime_type" not in value:
+        return True
+    mime_type = _bounded_string(
+        value["mime_type"],
+        min_chars=1,
+        max_chars=MAX_MEDIA_MIME_TYPE_CHARS,
+        max_bytes=MAX_MEDIA_MIME_TYPE_CHARS,
+        allow_layout_controls=False,
+    )
+    return mime_type is not None and mime_type.isascii()
+
+
+def _optional_thumbnail(value: Mapping[str, object]) -> bool:
+    return "thumbnail" not in value or _is_valid_photo_size(value["thumbnail"])
+
+
+def _optional_photo_sizes(value: Mapping[str, object], key: str) -> bool:
+    return key not in value or _is_valid_photo_sizes(value[key])
+
+
+def _optional_media_file(value: Mapping[str, object], key: str) -> bool:
+    if key not in value:
+        return True
+    item = value[key]
+    allowed = {"file_id", "file_unique_id", "file_size"}
+    return (
+        _is_bounded_media_mapping(item, allowed)
+        and _has_valid_media_file_ids(item)
+        and _optional_media_int(item, "file_size", minimum=0, maximum=MAX_MEDIA_FILE_SIZE)
+    )
+
+
+def _optional_mask_position(value: Mapping[str, object]) -> bool:
+    if "mask_position" not in value:
+        return True
+    position = value["mask_position"]
+    allowed = {"point", "x_shift", "y_shift", "scale"}
+    if not _is_bounded_media_mapping(position, allowed) or set(position) != allowed:
+        return False
+    point = position["point"]
+    if type(point) is not str or point not in {"forehead", "eyes", "mouth", "chin"}:
+        return False
+    return all(
+        _is_finite_number(position[key], minimum=-100_000, maximum=100_000)
+        for key in ("x_shift", "y_shift")
+    ) and _is_finite_number(position["scale"], minimum=0, maximum=100_000)
+
+
+def _is_finite_number(value: object, *, minimum: float, maximum: float) -> bool:
+    return type(value) in {int, float} and math.isfinite(value) and minimum <= value <= maximum
 
 
 def _is_valid_media_file_id(value: object) -> bool:
