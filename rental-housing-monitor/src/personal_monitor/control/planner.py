@@ -11,7 +11,7 @@ import unicodedata
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Final
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from personal_monitor.ai.contracts import IntentKind, IntentResult, PlanRequest, PlanResult
 from personal_monitor.ai.worker import CodexWorkerError
 from personal_monitor.control.actions import ConsumedAction, PendingAction, PendingActionService
-from personal_monitor.domain.observation import ObservedItem, Scalar
+from personal_monitor.domain.observation import ObservedItem, Scalar, stable_item_id
 from personal_monitor.domain.spec import (
     SENSITIVE_QUERY_PARAMETER_NAMES,
     FetchStrategy,
@@ -61,6 +61,23 @@ _FEEDBACK_SCHEMA: Final = "candidate_schema_invalid"
 _FEEDBACK_BINDING: Final = "candidate_binding_invalid"
 _FEEDBACK_EXTRACT: Final = "candidate_extract_invalid"
 _FEEDBACK_WORKER: Final = "worker_unavailable"
+_SENSITIVE_ASSIGNMENT_RE: Final = re.compile(
+    r"(?:authorization|bearer|cookie|set-cookie|session(?:id)?|access[_-]?token|"
+    r"api[_-]?key|client[_-]?secret|credential|passwd|password|secret|token)"
+    r"\s*[:=]",
+    re.IGNORECASE,
+)
+_BEARER_RE: Final = re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
+_JWT_RE: Final = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")
+_SK_TOKEN_RE: Final = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE)
+_CREDENTIAL_QUERY_NAMES: Final = frozenset(
+    {
+        *SENSITIVE_QUERY_PARAMETER_NAMES,
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-amz-signature",
+    }
+)
 
 
 class PlanningFailed(RuntimeError):
@@ -246,11 +263,22 @@ class MonitorPlanner:
         safe_request, safe_intent = validated_input
         target = await self._validate_target(safe_intent.target_url)
         result = await self._probe_once(safe_request.owner_id, target)
-        sanitized = self._sanitize(result, target)
+        projection = _project_worker_input(safe_request, safe_intent, result)
+        if projection is None:
+            raise PlanningFailed
+        projected_message, projected_intent, secrets_to_remove = projection
+        sanitized = self._sanitize(result, secrets_to_remove)
 
         feedback: list[str] = []
         for model, effort in _ATTEMPTS:
-            plan_request = self._plan_request(safe_request, safe_intent, sanitized, feedback)
+            plan_request = self._plan_request(
+                owner_id=safe_request.owner_id,
+                message=projected_message,
+                intent=projected_intent,
+                sanitized=sanitized,
+                feedback=feedback,
+                forbidden=secrets_to_remove,
+            )
             worker_result: object | None = None
             worker_failed = False
             local_failed = False
@@ -281,7 +309,9 @@ class MonitorPlanner:
                 worker_result,
                 request=safe_request,
                 intent=safe_intent,
+                projected_intent=projected_intent,
                 probe=result,
+                forbidden=secrets_to_remove,
             )
             if candidate is None:
                 feedback.append(category)
@@ -322,7 +352,7 @@ class MonitorPlanner:
             raise PlanningFailed
         return result
 
-    def _sanitize(self, probe: ProbeResult, target: ResolvedTarget) -> str:
+    def _sanitize(self, probe: ProbeResult, secrets_to_remove: tuple[str, ...]) -> str:
         if not _dependency_intact(self._sanitizer, self._sanitizer_anchor):
             raise PlanningFailed
         decoded: str | None = None
@@ -335,9 +365,6 @@ class MonitorPlanner:
                 decoded = probe.document.body.decode("utf-8", errors="replace")
         if decoded is None:
             raise PlanningFailed
-        secrets_to_remove = _query_values(target.normalized_url)
-        if probe.auth_profile_ref is not None:
-            secrets_to_remove += (probe.auth_profile_ref,)
         sanitized: object | None = None
         failed = False
         try:
@@ -357,29 +384,35 @@ class MonitorPlanner:
                 allow_empty=True,
                 allow_layout_controls=True,
             )
+            or not _worker_text_is_clean(sanitized, secrets_to_remove)
         ):
             raise PlanningFailed
         return sanitized
 
     def _plan_request(
         self,
-        request: ControlRequest,
+        *,
+        owner_id: str,
+        message: str,
         intent: IntentResult,
         sanitized: str,
         feedback: list[str],
+        forbidden: tuple[str, ...],
     ) -> PlanRequest:
         request_id = self._new_id()
         value: PlanRequest | None = None
         with suppress(Exception):
             value = PlanRequest(
                 request_id=request_id,
-                owner_id=request.owner_id,
-                message=request.text,
+                owner_id=owner_id,
+                message=message,
                 intent=intent,
                 sanitized_document=sanitized,
                 observed_preview_values=list(feedback),
             )
         if value is None:
+            raise PlanningFailed
+        if not _worker_request_is_clean(value, forbidden):
             raise PlanningFailed
         return value
 
@@ -405,7 +438,9 @@ class MonitorPlanner:
         *,
         request: ControlRequest,
         intent: IntentResult,
+        projected_intent: IntentResult,
         probe: ProbeResult,
+        forbidden: tuple[str, ...],
     ) -> tuple[tuple[MonitorSpec, tuple[ObservedItem, ...]] | None, str]:
         fresh = _fresh_plan_result(raw)
         if fresh is None:
@@ -413,12 +448,13 @@ class MonitorPlanner:
         spec = fresh.spec
         if (
             spec.owner_id != request.owner_id
-            or spec.target_url != intent.target_url
+            or spec.target_url != projected_intent.target_url
             or spec.source_adapter is not SourceAdapterKind.SCRAPLING
             or spec.adapter_ref is not None
-            or spec.auth_profile_ref != probe.auth_profile_ref
+            or spec.auth_profile_ref is not None
             or spec.fetch_strategy not in {FetchStrategy.AUTO, probe.document.strategy}
             or len(spec.extract.fields) > _MAX_FIELDS
+            or _contains_forbidden_value(spec.model_dump(mode="python"), forbidden)
         ):
             return None, _FEEDBACK_BINDING
         if not _dependency_intact(
@@ -463,7 +499,19 @@ class MonitorPlanner:
             or any(type(item) is not ObservedItem for item in validated)
         ):
             return None, _FEEDBACK_EXTRACT
-        return (spec, validated), ""
+        bound = _bind_application_spec(
+            spec,
+            owner_id=request.owner_id,
+            target_url=intent.target_url,
+            strategy=probe.document.strategy,
+            auth_profile_ref=probe.auth_profile_ref,
+        )
+        if bound is None:
+            return None, _FEEDBACK_BINDING
+        fresh_items = _fresh_observations(validated, bound)
+        if fresh_items is None:
+            return None, _FEEDBACK_EXTRACT
+        return (bound, fresh_items), ""
 
     def _persist_proposal(
         self,
@@ -485,15 +533,27 @@ class MonitorPlanner:
             "binding_hash": _proposal_binding(spec.owner_id, candidate_version_id, digest),
             "spec": spec_json,
         }
+        runtime_material = _runtime_material(
+            spec.owner_id,
+            candidate_version_id,
+            digest,
+            previews,
+            probe.document.strategy,
+            probe.robots,
+            probe.warnings,
+            _SAFE_EXPLANATION,
+        )
         if not self._all_dependencies_intact() or not _dependency_intact(
             self._now_source, self._now_source_anchor
         ):
             raise PlanningFailed
-        now: object | None = None
+        now: datetime | None = None
         pending: object | None = None
         failed = False
         try:
-            now = self._now_source_anchor.call()
+            now = _fresh_action_time(self._now_source_anchor.call())
+            if now is None:
+                raise ValueError
             pending = self._actions_anchor.call(
                 spec.owner_id,
                 "create",
@@ -514,17 +574,7 @@ class MonitorPlanner:
             candidate_version_id=candidate_version_id,
             spec_hash=digest,
             pending_action=pending,
-            _runtime_binding_hash=_runtime_binding(
-                spec.owner_id,
-                candidate_version_id,
-                digest,
-                pending,
-                previews,
-                probe.document.strategy,
-                probe.robots,
-                probe.warnings,
-                _SAFE_EXPLANATION,
-            ),
+            _runtime_binding_hash=_complete_runtime_binding(runtime_material, pending),
         )
         if not _valid_proposal(proposal):
             raise PlanningFailed
@@ -655,6 +705,208 @@ def _validate_input(
             raise ValueError
         value = fresh_request, fresh_intent
     return value
+
+
+def _project_worker_input(
+    request: ControlRequest,
+    intent: IntentResult,
+    probe: ProbeResult,
+) -> tuple[str, IntentResult, tuple[str, ...]] | None:
+    result: tuple[str, IntentResult, tuple[str, ...]] | None = None
+    with suppress(Exception):
+        original_url = intent.target_url
+        if type(original_url) is not str:
+            raise ValueError
+        safe_url = _redact_url(original_url)
+        parts = urlsplit(original_url)
+        secrets_to_remove: list[str] = []
+        if parts.query:
+            secrets_to_remove.append(original_url)
+        for name, value in parse_qsl(parts.query, keep_blank_values=True):
+            if value:
+                secrets_to_remove.append(value)
+            normalized_name = name.casefold()
+            if normalized_name in _CREDENTIAL_QUERY_NAMES or normalized_name.startswith("x-amz-"):
+                secrets_to_remove.append(name)
+        for pair in parts.query.split("&"):
+            if "=" in pair:
+                _, raw_value = pair.split("=", 1)
+                if raw_value:
+                    secrets_to_remove.append(raw_value)
+        if probe.auth_profile_ref is not None:
+            secrets_to_remove.append(probe.auth_profile_ref)
+        forbidden = tuple(
+            sorted(
+                {value for value in secrets_to_remove if value},
+                key=lambda value: (-len(value), value),
+            )
+        )
+        message = _project_text(request.text, original_url, safe_url, forbidden)
+        condition = _project_optional_text(
+            intent.condition_text,
+            original_url,
+            safe_url,
+            forbidden,
+        )
+        schedule = _project_optional_text(
+            intent.schedule_text,
+            original_url,
+            safe_url,
+            forbidden,
+        )
+        projected = IntentResult(
+            kind=IntentKind.CREATE,
+            target_monitor_ids=[],
+            target_url=safe_url,
+            condition_text=condition,
+            schedule_text=schedule,
+            clarification=None,
+            confidence=intent.confidence,
+        )
+        if (
+            not _worker_text_is_clean(message, forbidden)
+            or not _worker_text_is_clean(projected.target_url, forbidden)
+            or (condition is not None and not _worker_text_is_clean(condition, forbidden))
+            or (schedule is not None and not _worker_text_is_clean(schedule, forbidden))
+        ):
+            raise ValueError
+        result = message, projected, forbidden
+    return result
+
+
+def _project_optional_text(
+    value: str | None,
+    original_url: str,
+    safe_url: str,
+    forbidden: tuple[str, ...],
+) -> str | None:
+    if value is None:
+        return None
+    return _project_text(value, original_url, safe_url, forbidden)
+
+
+def _project_text(
+    value: str,
+    original_url: str,
+    safe_url: str,
+    forbidden: tuple[str, ...],
+) -> str:
+    projected = value.replace(original_url, safe_url)
+    for secret in forbidden:
+        projected = projected.replace(secret, "[숨김]")
+    if _contains_established_secret(projected):
+        return "[숨김]"
+    if not _safe_unicode(projected, max_chars=2_000):
+        raise ValueError
+    return projected
+
+
+def _worker_request_is_clean(value: PlanRequest, forbidden: tuple[str, ...]) -> bool:
+    try:
+        return all(
+            _worker_text_is_clean(item, forbidden)
+            for item in _nested_strings(value.model_dump(mode="python"))
+        )
+    except Exception:
+        return False
+
+
+def _nested_strings(value: object) -> tuple[str, ...]:
+    if isinstance(value, Mapping):
+        return tuple(item for nested in value.values() for item in _nested_strings(nested))
+    if isinstance(value, list | tuple):
+        return tuple(item for nested in value for item in _nested_strings(nested))
+    return (value,) if type(value) is str else ()
+
+
+def _worker_text_is_clean(value: str, forbidden: tuple[str, ...]) -> bool:
+    try:
+        folded = value.casefold()
+        return not _contains_established_secret(value) and all(
+            secret.casefold() not in folded for secret in forbidden
+        )
+    except Exception:
+        return False
+
+
+def _contains_forbidden_value(value: object, forbidden: tuple[str, ...]) -> bool:
+    try:
+        return any(
+            secret.casefold() in item.casefold()
+            for item in _nested_strings(value)
+            for secret in forbidden
+        )
+    except Exception:
+        return True
+
+
+def _contains_established_secret(value: str) -> bool:
+    return any(
+        pattern.search(value) is not None
+        for pattern in (
+            _SENSITIVE_ASSIGNMENT_RE,
+            _BEARER_RE,
+            _JWT_RE,
+            _SK_TOKEN_RE,
+        )
+    )
+
+
+def _bind_application_spec(
+    candidate: MonitorSpec,
+    *,
+    owner_id: str,
+    target_url: str | None,
+    strategy: FetchStrategy,
+    auth_profile_ref: str | None,
+) -> MonitorSpec | None:
+    result: MonitorSpec | None = None
+    with suppress(Exception):
+        if type(candidate) is not MonitorSpec or type(target_url) is not str:
+            raise TypeError
+        payload = candidate.model_dump(mode="json")
+        payload.update(
+            {
+                "owner_id": owner_id,
+                "target_url": target_url,
+                "source_adapter": SourceAdapterKind.SCRAPLING.value,
+                "adapter_ref": None,
+                "fetch_strategy": strategy.value,
+                "auth_profile_ref": auth_profile_ref,
+            }
+        )
+        result = MonitorSpec.model_validate(payload)
+    return result
+
+
+def _fresh_observations(
+    values: object,
+    spec: MonitorSpec,
+) -> tuple[ObservedItem, ...] | None:
+    result: tuple[ObservedItem, ...] | None = None
+    with suppress(Exception):
+        if type(values) is not tuple:
+            raise TypeError
+        independently_validated = ObservationValidator().validate(
+            values,
+            spec.extract,
+            spec.validators,
+        )
+        copied: list[ObservedItem] = []
+        for item in independently_validated:
+            if type(item) is not ObservedItem or not isinstance(item.fields, Mapping):
+                raise TypeError
+            fields = dict(item.fields)
+            expected_id = stable_item_id(fields)
+            if type(item.item_id) is not str or item.item_id != expected_id:
+                raise ValueError
+            copied.append(ObservedItem(expected_id, fields))
+        result = ObservationValidator().validate(
+            tuple(copied),
+            spec.extract,
+            spec.validators,
+        )
+    return result
 
 
 def _fresh_target(value: object, *, expected_url: str) -> ResolvedTarget | None:
@@ -873,16 +1125,18 @@ def _valid_proposal(value: object) -> bool:
             and value.pending_action.cancel_callback == f"cancel:{value.pending_action.token}"
             and type(value._runtime_binding_hash) is str
             and value._runtime_binding_hash
-            == _runtime_binding(
-                fresh_spec.owner_id,
-                value.candidate_version_id,
-                value.spec_hash,
+            == _complete_runtime_binding(
+                _runtime_material(
+                    fresh_spec.owner_id,
+                    value.candidate_version_id,
+                    value.spec_hash,
+                    value.preview_items,
+                    value.resolved_strategy,
+                    value.robots,
+                    value.warnings,
+                    value.explanation,
+                ),
                 value.pending_action,
-                value.preview_items,
-                value.resolved_strategy,
-                value.robots,
-                value.warnings,
-                value.explanation,
             )
         )
     except Exception:
@@ -1027,11 +1281,10 @@ def _proposal_binding(owner_id: str, candidate_version_id: str, spec_hash: str) 
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _runtime_binding(
+def _runtime_material(
     owner_id: str,
     candidate_version_id: str,
     spec_hash: str,
-    pending: PendingAction,
     preview_items: tuple[PreviewItem, ...],
     resolved_strategy: FetchStrategy,
     robots: RobotsDecision,
@@ -1043,8 +1296,6 @@ def _runtime_binding(
             "owner_id": owner_id,
             "candidate_version_id": candidate_version_id,
             "spec_hash": spec_hash,
-            "pending_token": pending.token,
-            "expires_at": pending.expires_at.isoformat(),
             "preview_items": [dict(item.fields) for item in preview_items],
             "resolved_strategy": resolved_strategy.value,
             "robots": {
@@ -1058,3 +1309,19 @@ def _runtime_binding(
         }
     )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _complete_runtime_binding(material: str, pending: PendingAction) -> str:
+    value = f"{material}:{pending.token}:{pending.expires_at.isoformat()}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _fresh_action_time(value: object) -> datetime | None:
+    result: datetime | None = None
+    with suppress(Exception):
+        if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+            raise TypeError
+        normalized = value.astimezone(UTC)
+        normalized + timedelta(minutes=10)
+        result = normalized
+    return result

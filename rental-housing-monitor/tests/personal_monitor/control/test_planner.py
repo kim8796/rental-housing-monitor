@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
@@ -22,6 +24,7 @@ from personal_monitor.domain.spec import FetchStrategy, MonitorSpec
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.extractor import DeclarativeExtractor
+from personal_monitor.scraping.validator import ObservationValidator
 from personal_monitor.security.robots import RobotsDecision
 from personal_monitor.security.url_policy import PolicyError, ResolvedTarget
 from personal_monitor.storage import open_database
@@ -85,6 +88,11 @@ class IdSource:
 
 def target(url: str = TARGET_URL) -> ResolvedTarget:
     return ResolvedTarget(url, "example.com", 443, frozenset({"93.184.216.34"}))
+
+
+def projected_url(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", "", ""))
 
 
 def document(
@@ -253,7 +261,7 @@ def test_policy_precedes_single_probe_and_closed_attempt_sequence(
         "candidate_schema_invalid",
         "candidate_extract_invalid",
     ]
-    assert proposal.spec == spec()
+    assert proposal.spec == spec(strategy=FetchStrategy.HTTP)
     assert proposal.preview_items[0].fields == {"name": "상품 A", "price": 99000}
     assert proposal.resolved_strategy is FetchStrategy.HTTP
     assert pending_count(connection) == 1
@@ -325,7 +333,7 @@ def test_exact_worker_failures_retry_but_arbitrary_errors_do_not(
         connection,
         [CodexWorkerError(), CodexWorkerError(), plan()],
     )
-    assert run(retrying.propose(request(), intent())).spec == spec()
+    assert run(retrying.propose(request(), intent())).spec == spec(strategy=FetchStrategy.HTTP)
     assert len(retry_worker.calls) == 3
 
     immediate, _, _, immediate_worker = planner(
@@ -421,7 +429,7 @@ def test_bound_method_and_callable_probe_are_supported(connection: sqlite3.Conne
         now_source=lambda: NOW,
     )
 
-    assert run(value.propose(request(), intent())).spec == spec()
+    assert run(value.propose(request(), intent())).spec == spec(strategy=FetchStrategy.HTTP)
 
 
 @pytest.mark.parametrize(
@@ -550,7 +558,7 @@ def test_bounded_sanitized_layout_whitespace_is_allowed(
 
     proposal = run(value.propose(request(), intent()))
 
-    assert proposal.spec == spec()
+    assert proposal.spec == spec(strategy=FetchStrategy.HTTP)
     assert worker.calls[0][0].sanitized_document == "<pre>safe\nlayout\ttext</pre>"
 
 
@@ -643,20 +651,181 @@ def test_profile_and_strategy_mismatch_are_candidate_failures(
     connection: sqlite3.Connection,
 ) -> None:
     page_probe = FakeProbe(probe_result(profile="owner-profile"))
-    wrong_profile = plan(spec(profile=None))
-    wrong_strategy = plan(spec(profile="owner-profile", strategy=FetchStrategy.DYNAMIC))
-    valid = plan(spec(profile="owner-profile"))
+    disclosed_profile = plan(spec(profile="owner-profile"))
+    wrong_strategy = plan(spec(strategy=FetchStrategy.DYNAMIC))
+    valid = plan()
     value, _, _, worker = planner(
         connection,
-        [wrong_profile, wrong_strategy, valid],
+        [disclosed_profile, wrong_strategy, valid],
         probe=page_probe,
     )
 
     proposal = run(value.propose(request(), intent()))
 
     assert proposal.spec.auth_profile_ref == "owner-profile"
+    assert proposal.spec.fetch_strategy is FetchStrategy.HTTP
+    assert all("owner-profile" not in call[0].model_dump_json() for call in worker.calls)
     assert len(worker.calls) == 3
     assert pending_count(connection) == 1
+
+
+def _all_strings(value: object) -> list[str]:
+    if isinstance(value, dict | MappingProxyType):
+        return [item for nested in value.values() for item in _all_strings(nested)]
+    if isinstance(value, list | tuple):
+        return [item for nested in value for item in _all_strings(nested)]
+    return [value] if isinstance(value, str) else []
+
+
+def test_worker_projection_removes_original_url_all_query_values_and_profile(
+    connection: sqlite3.Connection,
+) -> None:
+    original = (
+        "https://example.com/product/7?ref=opaque-private-query-value"
+        "&X-Amz-Signature=aws-private-signature"
+    )
+    safe = projected_url(original)
+    profile = "owner-private-profile"
+    projected_candidate = spec(url=safe)
+    page_probe = FakeProbe(
+        probe_result(
+            value=target(original),
+            source=document(final_url=original),
+            profile=profile,
+        )
+    )
+    worker = FakeWorker([plan(projected_candidate)])
+    value = MonitorPlanner(
+        FakePolicy(target(original)),
+        page_probe,
+        worker,
+        PendingActionService(connection),
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+    )
+    control = request(f"{original} opaque-private-query-value aws-private-signature 감시")
+    create = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=original,
+        condition_text="ref=opaque-private-query-value 이하",
+        schedule_text="X-Amz-Signature=aws-private-signature 매일",
+        clarification=None,
+        confidence=0.96,
+    )
+
+    proposal = run(value.propose(control, create))
+
+    sent = worker.calls[0][0]
+    all_values = _all_strings(sent.model_dump(mode="python"))
+    forbidden = {
+        original,
+        "opaque-private-query-value",
+        "aws-private-signature",
+        "X-Amz-Signature",
+        profile,
+    }
+    assert sent.intent.target_url == safe
+    assert all(secret not in item for secret in forbidden for item in all_values)
+    assert proposal.spec.target_url == original
+    assert proposal.spec.auth_profile_ref == profile
+    assert proposal.spec.fetch_strategy is FetchStrategy.HTTP
+    consumed = PendingActionService(connection).consume(
+        proposal.pending_action.token,
+        OWNER,
+        now=NOW,
+    )
+    assert consumed.payload["spec"]["target_url"] == original  # type: ignore[index]
+    assert consumed.payload["spec"]["auth_profile_ref"] == profile  # type: ignore[index]
+
+
+def test_sanitizer_that_retains_established_query_secret_fails_before_worker(
+    connection: sqlite3.Connection,
+) -> None:
+    original = "https://example.com/product/7?ref=opaque-private-query-value"
+    worker = FakeWorker([plan(spec(url=projected_url(original)))])
+    value = MonitorPlanner(
+        FakePolicy(target(original)),
+        FakeProbe(
+            probe_result(
+                value=target(original),
+                source=document(final_url=original),
+            )
+        ),
+        worker,
+        PendingActionService(connection),
+        sanitizer=lambda _html, *, secret_values: "<main>opaque-private-query-value</main>",
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+    )
+
+    with pytest.raises(PlanningFailed):
+        run(value.propose(request(original), intent(original)))
+
+    assert worker.calls == []
+    assert pending_count(connection) == 0
+
+
+@pytest.mark.parametrize("dependency", ["extractor", "validator", "observation"])
+def test_hostile_dependency_post_validation_mutation_never_writes_pending_action(
+    connection: sqlite3.Connection,
+    dependency: str,
+) -> None:
+    class MutatingExtractor:
+        def extract(self, source: SourceDocument, extract_spec: object):
+            values = DeclarativeExtractor().extract(source, extract_spec)  # type: ignore[arg-type]
+            object.__setattr__(extract_spec, "item_scope", "bad;selector")
+            return values
+
+    class MutatingValidator:
+        def validate(self, items: object, extract_spec: object, validators: object):
+            values = ObservationValidator().validate(  # type: ignore[arg-type]
+                items,
+                extract_spec,
+                validators,
+            )
+            object.__setattr__(extract_spec, "item_scope", "bad;selector")
+            return values
+
+    class MutatingObservationValidator:
+        def validate(self, items: object, extract_spec: object, validators: object):
+            values = ObservationValidator().validate(  # type: ignore[arg-type]
+                items,
+                extract_spec,
+                validators,
+            )
+            object.__setattr__(
+                values[0],
+                "fields",
+                MappingProxyType({"name": "상품 A", "price": "not-a-number"}),
+            )
+            return values
+
+    kwargs: dict[str, object] = {}
+    if dependency == "extractor":
+        kwargs["extractor"] = MutatingExtractor()
+    elif dependency == "validator":
+        kwargs["validator"] = MutatingValidator()
+    else:
+        kwargs["validator"] = MutatingObservationValidator()
+    worker = FakeWorker([plan(), plan(), plan()])
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        worker,
+        PendingActionService(connection),
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+        **kwargs,
+    )
+
+    with pytest.raises(PlanningFailed) as caught:
+        run(value.propose(request("private-message"), intent()))
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert len(worker.calls) == 3
+    assert pending_count(connection) == 0
 
 
 def test_field_count_bound_and_invalid_preview_never_leave_orphan_action(

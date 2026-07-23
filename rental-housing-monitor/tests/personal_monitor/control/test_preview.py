@@ -26,6 +26,7 @@ from tests.personal_monitor.control.test_planner import (
     intent,
     plan,
     probe_result,
+    projected_url,
     request,
     spec,
     target,
@@ -128,8 +129,17 @@ def _custom_proposal(
     resolved: ResolvedTarget | None = None,
     profile: str | None = None,
     warnings: tuple[str, ...] = (),
+    sanitizer: object | None = None,
 ):
     safe_target = resolved or target(candidate.target_url)
+    model_payload = candidate.model_dump(mode="json")
+    model_payload["target_url"] = projected_url(candidate.target_url)
+    model_payload["auth_profile_ref"] = None
+    model_payload["fetch_strategy"] = "auto"
+    model_candidate = MonitorSpec.model_validate(model_payload)
+    optional: dict[str, object] = {}
+    if sanitizer is not None:
+        optional["sanitizer"] = sanitizer
     planner = MonitorPlanner(
         FakePolicy(safe_target),
         FakeProbe(
@@ -140,10 +150,11 @@ def _custom_proposal(
                 warnings=warnings,
             )
         ),
-        FakeWorker([plan(candidate)]),
+        FakeWorker([plan(model_candidate)]),
         PendingActionService(connection),
         id_source=IdSource(),
         now_source=lambda: NOW,
+        **optional,
     )
     return asyncio.run(planner.propose(request(), intent(candidate.target_url)))
 
@@ -227,7 +238,12 @@ def test_long_credential_like_values_are_bounded_and_hidden(
         + ("긴값" * 500)
         + "</h1><span class='price'>99,000원</span></main>"
     ).encode()
-    value = _custom_proposal(connection, spec(), document(body=body))
+    value = _custom_proposal(
+        connection,
+        spec(),
+        document(body=body),
+        sanitizer=lambda _html, *, secret_values: "<main>safe projection</main>",
+    )
 
     preview = render_preview(value)
 
@@ -305,6 +321,81 @@ def test_preview_callback_shapes_and_total_output_are_bounded(
     assert callbacks[1].startswith("edit:")
     assert callbacks[2].startswith("cancel:")
     assert all(len(item.encode("utf-8")) <= 64 for item in callbacks)
+    assert len(preview.text) <= 3_500
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "Bearer abcdefghijklmnop",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature",
+        "sk-privateOpenAIKey123456",
+        "authorization: private-auth-value",
+        "Cookie=session-private-value",
+        "Set-Cookie: sid=private-cookie",
+        "sessionid=private-session",
+        "access_token=private-access",
+        "api_key=private-api",
+    ],
+)
+def test_every_secret_pattern_is_hidden_in_direct_rendered_strings(
+    connection: sqlite3.Connection,
+    secret: str,
+) -> None:
+    candidate = MonitorSpec.model_validate(
+        {
+            **spec().model_dump(mode="json"),
+            "name": secret,
+        }
+    )
+    value = _custom_proposal(connection, candidate, document())
+
+    preview = render_preview(value)
+
+    assert secret not in preview.text
+    assert "[숨김]" in preview.text
+
+
+def test_planner_integrated_observed_jwt_is_hidden_from_preview(
+    connection: sqlite3.Connection,
+) -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature"
+    body = f"<main><h1>{jwt}</h1><span class='price'>99,000원</span></main>".encode()
+    value = _custom_proposal(
+        connection,
+        spec(),
+        document(body=body),
+        sanitizer=lambda _html, *, secret_values: "<main>safe projection</main>",
+    )
+
+    preview = render_preview(value)
+
+    assert jwt not in preview.text
+    assert "[숨김]" in preview.text
+
+
+@pytest.mark.parametrize(
+    ("schedule", "expected"),
+    [
+        ("*/15 * * * *", "15분마다"),
+        ("30 8 * * *", "매일 08:30"),
+        ("0 9 * * 1-5", "평일 09:00"),
+        ("0 9 * * 1", "매주 월요일 09:00"),
+        ("0 9 1 * *", "매월 1일 09:00"),
+        ("5 4 * * 2,4", "cron: 5 4 * * 2,4"),
+    ],
+)
+def test_common_and_unsupported_valid_cron_schedules_preserve_fidelity(
+    connection: sqlite3.Connection,
+    schedule: str,
+    expected: str,
+) -> None:
+    candidate = MonitorSpec.model_validate({**spec().model_dump(mode="json"), "schedule": schedule})
+    value = _custom_proposal(connection, candidate, document())
+
+    preview = render_preview(value)
+
+    assert f"확인 주기: {expected}" in preview.text
     assert len(preview.text) <= 3_500
 
 
