@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -27,60 +26,71 @@ MAX_CALLBACK_ID_CHARS: Final = 256
 MAX_CALLBACK_ANSWER_CHARS: Final = 200
 MAX_JSON_NESTING: Final = 64
 MAX_JSON_INTEGER_DIGITS: Final = 19
+MAX_MEDIA_FILE_ID_CHARS: Final = 512
+MAX_PHOTO_SIZES: Final = 20
+MAX_MEDIA_CAPTION_CHARS: Final = 1024
 
 _INVALID: Final = object()
 _UNSUPPORTED: Final = object()
-_TELEGRAM_BOT_PATH_RE: Final = re.compile(r"^/bot[^/]+(?P<endpoint>/.*)?$")
+_TELEGRAM_TOKEN_RE: Final = re.compile(r"[A-Za-z0-9:_-]+")
+_TELEGRAM_ENDPOINTS: Final = frozenset(
+    {
+        "answerCallbackQuery",
+        "editMessageText",
+        "getUpdates",
+        "getWebhookInfo",
+        "sendMessage",
+    }
+)
+_UNSUPPORTED_MEDIA_FIELDS: Final = frozenset(
+    {"animation", "audio", "document", "photo", "sticker", "video", "video_note", "voice"}
+)
 
 
-class _TelegramUrlRedactionFilter(logging.Filter):
-    _personal_monitor_telegram_redactor = True
+class _SanitizingTransport(httpx.AsyncBaseTransport):
+    __slots__ = ("_inner", "_inner_anchor")
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not isinstance(record.args, tuple):
-            return True
-        redacted: list[object] = []
-        changed = False
-        for value in record.args:
-            replacement = _redacted_telegram_url(value)
-            redacted.append(replacement)
-            changed = changed or replacement is not value
-        if changed:
-            record.args = tuple(redacted)
-        return True
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_inner_anchor", inner)
 
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("Telegram transport composition is sealed")
 
-_HTTPX_LOGGER = logging.getLogger("httpx")
-_HTTPX_REDACTOR = _TelegramUrlRedactionFilter()
+    def integrity_ok(self) -> bool:
+        try:
+            inner = self._inner
+            return inner is self._inner_anchor and type(inner) in {
+                httpx.AsyncHTTPTransport,
+                httpx.MockTransport,
+            }
+        except Exception:
+            return False
 
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if not self.integrity_ok():
+            raise RuntimeError("Telegram transport integrity failure")
+        raw_request = httpx.Request(
+            request.method,
+            request.url,
+            headers=request.headers,
+            stream=request.stream,
+            extensions=request.extensions,
+        )
+        try:
+            return await self._inner_anchor.handle_async_request(raw_request)
+        finally:
+            request.url = _sanitized_request_url(request.url)
 
-def _redacted_telegram_url(value: object) -> object:
-    if not isinstance(value, httpx.URL) or value.host != "api.telegram.org":
-        return value
-    matched = _TELEGRAM_BOT_PATH_RE.fullmatch(value.path)
-    if matched is None:
-        return value
-    endpoint = matched.group("endpoint") or ""
-    return f"https://api.telegram.org/bot<redacted>{endpoint}"
-
-
-def _ensure_httpx_redactor_first() -> bool:
-    filters = _HTTPX_LOGGER.filters
-    if type(filters) is not list:
-        return False
-    try:
-        retained = [
-            item
-            for item in filters
-            if not getattr(item, "_personal_monitor_telegram_redactor", False)
-        ]
-        filters[:] = [_HTTPX_REDACTOR, *retained]
-    except Exception:
-        return False
-    return bool(filters) and filters[0] is _HTTPX_REDACTOR
+    async def aclose(self) -> None:
+        await self._inner_anchor.aclose()
 
 
-_ensure_httpx_redactor_first()
+def _sanitized_request_url(value: httpx.URL) -> httpx.URL:
+    endpoint = value.path.rpartition("/")[2]
+    if endpoint not in _TELEGRAM_ENDPOINTS:
+        endpoint = "request"
+    return httpx.URL(f"https://api.telegram.org/bot-redacted/{endpoint}")
 
 
 class TelegramApiError(RuntimeError):
@@ -96,6 +106,7 @@ class TelegramApi:
         "_client",
         "_client_anchor",
         "_hooks_anchor",
+        "_inner_transport_anchor",
         "_mounts_anchor",
         "_transport_anchor",
     )
@@ -113,11 +124,15 @@ class TelegramApi:
             max_bytes=2048,
             allow_layout_controls=False,
         )
-        if token is None or not token.strip():
+        if token is None or _TELEGRAM_TOKEN_RE.fullmatch(token) is None:
             raise ValueError("invalid Telegram bot token")
         if transport is not None and type(transport) is not httpx.MockTransport:
             raise ValueError("invalid Telegram test transport")
-        client = httpx.AsyncClient(transport=transport, trust_env=False)
+        inner_transport: httpx.AsyncBaseTransport = (
+            transport if transport is not None else httpx.AsyncHTTPTransport()
+        )
+        wrapped_transport = _SanitizingTransport(inner_transport)
+        client = httpx.AsyncClient(transport=wrapped_transport, trust_env=False)
         hooks = MappingProxyType({"request": (), "response": ()})
         mounts = MappingProxyType(dict(client._mounts))
         object.__setattr__(client, "_event_hooks", hooks)
@@ -125,8 +140,9 @@ class TelegramApi:
         object.__setattr__(self, "_client", client)
         object.__setattr__(self, "_client_anchor", client)
         object.__setattr__(self, "_hooks_anchor", hooks)
+        object.__setattr__(self, "_inner_transport_anchor", inner_transport)
         object.__setattr__(self, "_mounts_anchor", mounts)
-        object.__setattr__(self, "_transport_anchor", client._transport)
+        object.__setattr__(self, "_transport_anchor", wrapped_transport)
         object.__setattr__(self, "_base_url", f"https://api.telegram.org/bot{token}")
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -153,6 +169,9 @@ class TelegramApi:
                 and client._event_hooks is self._hooks_anchor
                 and client._mounts is self._mounts_anchor
                 and client._transport is self._transport_anchor
+                and type(client._transport) is _SanitizingTransport
+                and client._transport.integrity_ok()
+                and client._transport._inner_anchor is self._inner_transport_anchor
                 and client.event_hooks == {"request": (), "response": ()}
             )
         except Exception:
@@ -299,8 +318,6 @@ class TelegramApi:
     ) -> dict[str, Any]:
         if not self._client_integrity_ok() or self._client.is_closed:
             raise TelegramApiError("Telegram client integrity failure")
-        if not _ensure_httpx_redactor_first():
-            raise TelegramApiError("Telegram logging integrity failure")
 
         request_failed = False
         status_code = 0
@@ -559,7 +576,7 @@ def _parse_message(value: object) -> TelegramMessage | object | None:
     ):
         return None
     if "text" not in value:
-        return _UNSUPPORTED
+        return _UNSUPPORTED if _is_valid_unsupported_media_message(value) else None
     text = _bounded_string(
         value.get("text"),
         min_chars=1,
@@ -570,6 +587,60 @@ def _parse_message(value: object) -> TelegramMessage | object | None:
     if text is None:
         return None
     return TelegramMessage(message_id, chat_id, from_user_id, text)
+
+
+def _is_valid_unsupported_media_message(value: Mapping[str, object]) -> bool:
+    media_fields = _UNSUPPORTED_MEDIA_FIELDS.intersection(value)
+    if len(media_fields) != 1:
+        return False
+    if "caption" in value:
+        caption = _bounded_string(
+            value.get("caption"),
+            min_chars=1,
+            max_chars=MAX_MEDIA_CAPTION_CHARS,
+            max_bytes=MAX_MEDIA_CAPTION_CHARS * 4,
+            allow_layout_controls=True,
+        )
+        if caption is None:
+            return False
+
+    field = next(iter(media_fields))
+    media = value.get(field)
+    if field == "photo":
+        return _is_valid_photo_sizes(media)
+    return _is_valid_media_object(media)
+
+
+def _is_valid_photo_sizes(value: object) -> bool:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_PHOTO_SIZES:
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            return False
+        if not _is_valid_media_file_id(item.get("file_id")):
+            return False
+        if not _is_int_in_range(item.get("width"), minimum=1, maximum=100_000):
+            return False
+        if not _is_int_in_range(item.get("height"), minimum=1, maximum=100_000):
+            return False
+    return True
+
+
+def _is_valid_media_object(value: object) -> bool:
+    return isinstance(value, dict) and _is_valid_media_file_id(value.get("file_id"))
+
+
+def _is_valid_media_file_id(value: object) -> bool:
+    return (
+        _bounded_string(
+            value,
+            min_chars=1,
+            max_chars=MAX_MEDIA_FILE_ID_CHARS,
+            max_bytes=MAX_MEDIA_FILE_ID_CHARS * 4,
+            allow_layout_controls=False,
+        )
+        is not None
+    )
 
 
 def _parse_callback(value: object) -> CallbackQuery | object | None:

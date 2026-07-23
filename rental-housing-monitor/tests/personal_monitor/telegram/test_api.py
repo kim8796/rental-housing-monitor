@@ -562,7 +562,7 @@ def test_review_preexisting_httpx_filter_never_observes_tokenized_url() -> None:
         run(harness.close())
         assert observer.messages
         assert all(TOKEN not in message for message in observer.messages)
-        assert any("/bot<redacted>/getUpdates" in message for message in observer.messages)
+        assert any("/bot-redacted/getUpdates" in message for message in observer.messages)
     finally:
         logger.filters[:] = original_filters
         logger.setLevel(original_level)
@@ -734,15 +734,14 @@ def test_review_api_composition_rejects_normal_attribute_swap() -> None:
     run(harness.close())
 
 
-def test_review_unrestorable_logger_filter_order_fails_before_network() -> None:
+def test_review_logger_filter_container_is_not_a_request_dependency() -> None:
     logger = logging.getLogger("httpx")
     original_filters = logger.filters
-    harness = TelegramHarness([])
+    harness = TelegramHarness([json_response({"ok": True, "result": []})])
     logger.filters = tuple(reversed(original_filters))  # type: ignore[assignment]
     try:
-        with pytest.raises(TelegramApiError, match="Telegram logging integrity failure"):
-            run(harness.api.get_updates(offset=0, timeout=30))
-        assert harness.requests == []
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        assert len(harness.requests) == 1
     finally:
         logger.filters = original_filters
         run(harness.close())
@@ -773,7 +772,7 @@ def test_review_concurrent_clients_redact_each_token_before_other_filters() -> N
         assert observer.messages
         assert all(first_token not in message for message in observer.messages)
         assert all(second_token not in message for message in observer.messages)
-        assert sum("/bot<redacted>/getUpdates" in item for item in observer.messages) == 2
+        assert sum("/bot-redacted/getUpdates" in item for item in observer.messages) == 2
     finally:
         logger.filters[:] = original_filters
         logger.setLevel(original_level)
@@ -847,3 +846,210 @@ def test_review_malformed_unsupported_subtypes_remain_strictly_rejected(
     with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
         run(harness.api.get_updates(offset=0, timeout=30))
     run(harness.close())
+
+
+def test_final_review_filter_installed_in_flight_observes_only_sanitized_url() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+
+    def install_filter(_request: httpx.Request) -> httpx.Response:
+        logger.filters.insert(0, observer)
+        return json_response({"ok": True, "result": []})
+
+    logger.setLevel(logging.INFO)
+    harness = TelegramHarness([install_filter])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+        assert observer.messages
+        assert all(TOKEN not in message for message in observer.messages)
+        assert any("/bot-redacted/getUpdates" in message for message in observer.messages)
+        assert all("allowed_updates" not in message for message in observer.messages)
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+def test_final_review_concurrent_in_flight_filter_changes_never_observe_tokens() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+
+    def install_filter(_request: httpx.Request) -> httpx.Response:
+        if observer in logger.filters:
+            logger.filters.remove(observer)
+        logger.filters.insert(0, observer)
+        return json_response({"ok": True, "result": []})
+
+    logger.setLevel(logging.INFO)
+    first_token = "first-race-token"
+    second_token = "second-race-token"
+    first = TelegramHarness([install_filter], token=first_token)
+    second = TelegramHarness([install_filter], token=second_token)
+
+    async def exercise() -> None:
+        await asyncio.gather(
+            first.api.get_updates(offset=0, timeout=30),
+            second.api.get_updates(offset=0, timeout=30),
+        )
+        await first.close()
+        await second.close()
+
+    try:
+        run(exercise())
+        assert observer.messages
+        assert all(first_token not in message for message in observer.messages)
+        assert all(second_token not in message for message in observer.messages)
+        assert all("allowed_updates" not in message for message in observer.messages)
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "raw/slash",
+        "raw?query",
+        "raw#fragment",
+        "raw\\backslash",
+        "percent%2Fslash",
+        "percent%3Fquery",
+        "percent%23fragment",
+        "dot.segment",
+        "space token",
+        "nonascii-토큰",
+    ],
+)
+def test_final_review_token_rejects_path_query_and_encoding_delimiters(token: str) -> None:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(500))
+    api: TelegramApi | None = None
+    try:
+        with pytest.raises(ValueError, match="invalid Telegram bot token") as caught:
+            api = TelegramApi(token, transport=transport)
+        assert token not in str(caught.value)
+        assert token not in repr(caught.value)
+    finally:
+        if api is not None:
+            run(api.aclose())
+
+
+def test_final_review_transport_wrapper_and_inner_identity_are_sealed() -> None:
+    harness = TelegramHarness([])
+    wrapper = harness.api._transport_anchor
+    replacement_calls = 0
+
+    def replacement_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal replacement_calls
+        replacement_calls += 1
+        return json_response({"ok": True, "result": []})
+
+    replacement = httpx.MockTransport(replacement_handler)
+    with pytest.raises(AttributeError, match="sealed"):
+        wrapper._inner = replacement  # type: ignore[attr-defined]
+    object.__setattr__(wrapper, "_inner", replacement)
+
+    with pytest.raises(TelegramApiError, match="Telegram client integrity failure"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert replacement_calls == 0
+    assert harness.requests == []
+
+
+def unsupported_message(**content: object) -> dict[str, object]:
+    return {
+        "message_id": 31,
+        "chat": {"id": 42},
+        "from": {"id": 7},
+        **content,
+    }
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        unsupported_message(),
+        unsupported_message(made_up={"value": "unknown"}),
+        unsupported_message(photo=[]),
+        unsupported_message(photo={"file_id": "not-a-list"}),
+        unsupported_message(photo=[{}]),
+        unsupported_message(
+            photo=[{"file_id": f"photo-{index}", "width": 1, "height": 1} for index in range(21)]
+        ),
+        unsupported_message(photo=[{"file_id": "x" * 513, "width": 1, "height": 1}]),
+        unsupported_message(video={}),
+        unsupported_message(video="not-an-object"),
+        unsupported_message(
+            photo=[{"file_id": "photo-id", "width": 1, "height": 1}],
+            caption="x" * 1025,
+        ),
+    ],
+)
+def test_final_review_malformed_or_unknown_no_text_message_is_rejected(
+    message: object,
+) -> None:
+    harness = TelegramHarness(
+        [json_response({"ok": True, "result": [{"update_id": 100, "message": message}]})]
+    )
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.get_updates(offset=100, timeout=30))
+    run(harness.close())
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        unsupported_message(
+            photo=[
+                {"file_id": "photo-small", "width": 320, "height": 240},
+                {"file_id": "photo-large", "width": 1280, "height": 960},
+            ],
+            caption="사진 설명",
+        ),
+        unsupported_message(
+            video={
+                "file_id": "video-id",
+                "width": 1280,
+                "height": 720,
+                "duration": 5,
+            }
+        ),
+        unsupported_message(document={"file_id": "document-id"}),
+    ],
+)
+def test_final_review_valid_bounded_media_message_advances_offset(message: object) -> None:
+    harness = TelegramHarness(
+        [json_response({"ok": True, "result": [{"update_id": 101, "message": message}]})]
+    )
+
+    assert run(harness.api.get_updates(offset=101, timeout=30)) == [TelegramUpdate(101, None, None)]
+    run(harness.close())
+
+
+def test_final_review_cancellation_propagates_and_owned_transport_still_closes() -> None:
+    close_calls = 0
+
+    async def cancel_handler(_request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    transport = httpx.MockTransport(cancel_handler)
+    original_close = transport.aclose
+
+    async def recording_close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        await original_close()
+
+    object.__setattr__(transport, "aclose", recording_close)
+    api = TelegramApi(TOKEN, transport=transport)
+
+    with pytest.raises(asyncio.CancelledError):
+        run(api.get_updates(offset=0, timeout=30))
+    run(api.aclose())
+
+    assert close_calls == 1
