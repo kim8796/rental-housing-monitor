@@ -9,6 +9,7 @@ import stat
 import sys
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import asdict
 from pathlib import Path
 
 
@@ -57,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("enabled", "disabled"),
         default="disabled",
     )
+    migration = sub.add_parser("migration")
+    migration_subcommands = migration.add_subparsers(dest="migration_action", required=True)
+    import_rental = migration_subcommands.add_parser("import-rental")
+    import_rental.add_argument("--source", type=Path, required=True)
+    import_rental.add_argument("--database", type=Path, required=True)
+    import_rental.add_argument("--owner", required=True)
+    import_rental.add_argument("--target", required=True)
+    import_rental.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -107,6 +116,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, RuntimeError, sqlite3.Error, ValueError):
             print("run-once failed", file=sys.stderr)
             return 1
+    if arguments.command == "migration":
+        return _migration_import_rental(
+            arguments.source,
+            arguments.database,
+            arguments.owner,
+            arguments.target,
+            dry_run=arguments.dry_run,
+        )
     return 2
 
 
@@ -347,3 +364,29 @@ def _run_once_command(database: Path, monitor: str, delivery: str) -> int:
             delivery_enabled=delivery == "enabled",
         )
     )
+
+
+def _migration_import_rental(
+    source: Path,
+    database: Path,
+    owner: str,
+    target: str,
+    *,
+    dry_run: bool,
+) -> int:
+    from personal_monitor.migration import import_rental_state
+    from personal_monitor.storage.schema import canonical_json
+
+    try:
+        report = import_rental_state(
+            source,
+            database,
+            owner,
+            target,
+            dry_run=dry_run,
+        )
+    except Exception:
+        print("rental import failed", file=sys.stderr)
+        return 1
+    print(canonical_json(asdict(report)))
+    return 0
