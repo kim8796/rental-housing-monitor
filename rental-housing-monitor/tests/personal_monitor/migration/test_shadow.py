@@ -1225,6 +1225,38 @@ def test_duplicate_probe_passes_with_real_task2_delivered_aggregate(
         repository.connection.close()
 
 
+def test_duplicate_probe_passes_empty_task2_import_with_fixed_marker(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "empty-legacy-import.db"
+    database = tmp_path / "empty-personal-import.db"
+    legacy = create_legacy(source)
+    legacy.commit()
+    legacy.close()
+    import_rental_state(source, database, "telegram-user:1", "target-1")
+    repository = ShadowRepository(open_existing_database(database), clock=lambda: NOW)
+    try:
+        result = asyncio.run(
+            run_duplicate_probe(
+                repository,
+                "rental-housing-seoul-gyeonggi",
+                adapter=FakeAdapter(make_batch()),
+                sender=FailingSender(),
+                now=NOW,
+            )
+        )
+
+        assert result.passed is True
+        assert (
+            repository.connection.execute(
+                "SELECT started_at FROM runs WHERE id = 'migration:rental-housing:v1'"
+            ).fetchone()[0]
+            == "2000-01-01T00:00:00+00:00"
+        )
+    finally:
+        repository.connection.close()
+
+
 def test_duplicate_probe_validation_and_record_share_one_immediate_transaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1309,6 +1341,12 @@ def test_duplicate_probe_revalidates_active_version_after_fetch(
         "target-address",
         "target-created-at",
         "missing-owner",
+        "orphan-delivery",
+        "missing-delivery",
+        "wrong-outbox-prefix",
+        "extra-orphan-rental-delivery",
+        "future-observation",
+        "future-delivery",
     ),
 )
 def test_duplicate_probe_fails_malformed_task2_aggregate(
@@ -1338,8 +1376,88 @@ def test_duplicate_probe_fails_malformed_task2_aggregate(
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("DELETE FROM users WHERE id = 'telegram-user:1'")
         connection.execute("PRAGMA foreign_keys = ON")
+    elif mutation == "orphan-delivery":
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DELETE FROM outbox")
+        connection.execute("PRAGMA foreign_keys = ON")
+    elif mutation == "missing-delivery":
+        connection.execute("DELETE FROM deliveries")
+    elif mutation == "wrong-outbox-prefix":
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("UPDATE outbox SET id = 'wrong-prefix'")
+        connection.execute("UPDATE deliveries SET outbox_id = 'wrong-prefix'")
+        connection.execute("PRAGMA foreign_keys = ON")
+    elif mutation == "extra-orphan-rental-delivery":
+        marker_time = connection.execute(
+            "SELECT started_at FROM runs WHERE id = 'migration:rental-housing:v1'"
+        ).fetchone()[0]
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            "INSERT INTO deliveries(outbox_id, target_id, external_message_id, delivered_at) "
+            "VALUES (?, 'target-1', '99', ?)",
+            ("rental-import:" + ("f" * 64), marker_time),
+        )
+        connection.execute("PRAGMA foreign_keys = ON")
+    elif mutation in {"future-observation", "future-delivery"}:
+        marker_time = connection.execute(
+            "SELECT started_at FROM runs WHERE id = 'migration:rental-housing:v1'"
+        ).fetchone()[0]
+        future = (datetime.fromisoformat(marker_time) + timedelta(hours=1)).isoformat()
+        if mutation == "future-observation":
+            connection.execute(
+                "UPDATE observations SET last_seen_at = ?",
+                (future,),
+            )
+        else:
+            connection.execute(
+                "UPDATE outbox SET available_at = ?, created_at = ?",
+                (future, future),
+            )
+            connection.execute(
+                "UPDATE deliveries SET delivered_at = ?",
+                (future,),
+            )
     else:
         connection.execute("UPDATE delivery_targets SET created_at = '2026-07-29T12:30:00+09:00'")
+    before = runtime_snapshot(connection)
+    sender = FailingSender()
+    try:
+        result = asyncio.run(
+            run_duplicate_probe(
+                repository,
+                "rental-housing-seoul-gyeonggi",
+                adapter=FakeAdapter(make_batch(items=(item,))),
+                sender=sender,
+                now=NOW,
+            )
+        )
+
+        assert result.passed is False
+        assert sender.calls == 0
+        assert runtime_snapshot(connection) == before
+        assert (
+            connection.execute("SELECT passed FROM rental_duplicate_probe_results").fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+def test_duplicate_probe_ignores_unrelated_orphan_delivery(
+    tmp_path: Path,
+) -> None:
+    repository, item = imported_delivered_repository(tmp_path)
+    connection = repository.connection
+    marker_time = connection.execute(
+        "SELECT started_at FROM runs WHERE id = 'migration:rental-housing:v1'"
+    ).fetchone()[0]
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        "INSERT INTO deliveries(outbox_id, target_id, external_message_id, delivered_at) "
+        "VALUES ('unrelated-monitor:delivery', 'target-1', '99', ?)",
+        (marker_time,),
+    )
+    connection.execute("PRAGMA foreign_keys = ON")
     before = runtime_snapshot(connection)
     try:
         result = asyncio.run(
@@ -1352,7 +1470,7 @@ def test_duplicate_probe_fails_malformed_task2_aggregate(
             )
         )
 
-        assert result.passed is False
+        assert result.passed is True
         assert runtime_snapshot(connection) == before
     finally:
         connection.close()

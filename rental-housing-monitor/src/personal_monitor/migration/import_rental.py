@@ -1950,6 +1950,7 @@ def _validate_imported_rental_aggregate(connection: sqlite3.Connection) -> None:
         timestamp = _canonical_timestamp(marker["started_at"])
         if marker["started_at"] != timestamp or marker["finished_at"] != timestamp:
             raise RentalImportError("import marker conflicts")
+        evidence_time = datetime.fromisoformat(timestamp)
         owner_id = monitor["owner_id"]
         telegram_user_id = _telegram_user_id(owner_id)
         spec = _rental_spec(owner_id)
@@ -1998,13 +1999,20 @@ def _validate_imported_rental_aggregate(connection: sqlite3.Connection) -> None:
                     "last_seen_at": stored["last_seen_at"],
                 }  # type: ignore[arg-type]
             )
+            if (
+                datetime.fromisoformat(announcement.first_seen_at)
+                > datetime.fromisoformat(announcement.last_seen_at)
+                or datetime.fromisoformat(announcement.last_seen_at) > evidence_time
+            ):
+                raise RentalImportError("observation evidence conflicts")
             if _ensure_observation(connection, announcement, True):
                 raise RentalImportError("observation aggregate is incomplete")
             announcements[item_id] = announcement
 
         outbox_rows = _bounded_rows(
             connection,
-            "SELECT id, dedupe_key, target_id FROM outbox WHERE monitor_id = "
+            "SELECT id, dedupe_key, target_id, available_at, created_at "
+            "FROM outbox WHERE monitor_id = "
             f"'{RENTAL_MONITOR_ID}' ORDER BY id",
             "outbox",
         )
@@ -2040,6 +2048,7 @@ def _validate_imported_rental_aggregate(connection: sqlite3.Connection) -> None:
         ):
             raise RentalImportError("target aggregate is incomplete")
 
+        expected_outbox_ids: set[str] = set()
         for outbox in outbox_rows:
             matching = [
                 (item_id, announcement)
@@ -2066,7 +2075,16 @@ def _validate_imported_rental_aggregate(connection: sqlite3.Connection) -> None:
             ):
                 raise RentalImportError("delivery aggregate conflicts")
             delivered_at = _canonical_timestamp(delivery["delivered_at"])
-            if delivered_at != delivery["delivered_at"]:
+            available_at = _canonical_timestamp(outbox["available_at"])
+            created_at = _canonical_timestamp(outbox["created_at"])
+            if (
+                delivered_at != delivery["delivered_at"]
+                or available_at != outbox["available_at"]
+                or created_at != outbox["created_at"]
+                or available_at != created_at
+                or created_at != delivered_at
+                or datetime.fromisoformat(delivered_at) > evidence_time
+            ):
                 raise RentalImportError("delivery aggregate conflicts")
             row = _DeliveryRow(
                 key=item_id.removeprefix("announcement:"),
@@ -2086,13 +2104,28 @@ def _validate_imported_rental_aggregate(connection: sqlite3.Connection) -> None:
                 raise RentalImportError("outbox aggregate conflicts")
             if _ensure_delivery(connection, expected_outbox_id, target_id, row, True):
                 raise RentalImportError("delivery aggregate is incomplete")
+            expected_outbox_ids.add(expected_outbox_id)
 
-        delivered_count = connection.execute(
-            "SELECT count(*) FROM deliveries AS d JOIN outbox AS o ON o.id = d.outbox_id "
-            "WHERE o.monitor_id = ?",
-            (RENTAL_MONITOR_ID,),
-        ).fetchone()[0]
-        if type(delivered_count) is not int or delivered_count != len(outbox_rows):
+        rental_outboxes = _bounded_rows(
+            connection,
+            "SELECT id, monitor_id FROM outbox WHERE id GLOB 'rental-import:*' ORDER BY id",
+            "outbox",
+        )
+        rental_deliveries = _bounded_rows(
+            connection,
+            "SELECT outbox_id FROM deliveries "
+            "WHERE outbox_id GLOB 'rental-import:*' ORDER BY outbox_id",
+            "deliveries",
+        )
+        actual_outbox_ids = {row["id"] for row in rental_outboxes}
+        actual_delivery_ids = {row["outbox_id"] for row in rental_deliveries}
+        if (
+            len(actual_outbox_ids) != len(rental_outboxes)
+            or len(actual_delivery_ids) != len(rental_deliveries)
+            or any(row["monitor_id"] != RENTAL_MONITOR_ID for row in rental_outboxes)
+            or actual_outbox_ids != expected_outbox_ids
+            or actual_delivery_ids != expected_outbox_ids
+        ):
             raise RentalImportError("delivery aggregate conflicts")
     except RentalImportError:
         raise
