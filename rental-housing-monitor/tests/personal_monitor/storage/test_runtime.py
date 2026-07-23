@@ -99,6 +99,25 @@ def test_claim_due_leases_only_active_due_monitors(
     assert lease["lease_expires_at"] == "2026-01-01T00:00:30+00:00"
 
 
+def test_claim_monitor_for_operator_run_ignores_schedule_but_not_live_lease(
+    repositories: tuple[RegistryRepository, RuntimeRepository],
+    connection: sqlite3.Connection,
+) -> None:
+    registry, runtime = repositories
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    connection.execute(
+        "UPDATE monitors SET next_run_at = ? WHERE id = ?",
+        ((now + timedelta(days=30)).isoformat(), monitor_id),
+    )
+
+    assert runtime.claim_monitor(monitor_id, worker_id="operator", now=now) == MonitorLease(
+        monitor_id, 1
+    )
+    with pytest.raises(ValueError, match="monitor is not available"):
+        runtime.claim_monitor(monitor_id, worker_id="second", now=now)
+
+
 def test_runtime_exposes_no_unfenced_snapshot_or_outbox_mutation() -> None:
     assert not hasattr(RuntimeRepository, "upsert_items")
     assert not hasattr(RuntimeRepository, "enqueue_delivery")
@@ -526,6 +545,46 @@ def test_claim_due_outbox_orders_retries_and_delivery_removes_item_from_due_work
         "target-1",
         "telegram-42",
         base.isoformat(),
+    )
+
+
+def test_claim_due_outbox_can_be_scoped_to_one_operator_selected_monitor(
+    repositories: tuple[RegistryRepository, RuntimeRepository],
+    connection: sqlite3.Connection,
+) -> None:
+    registry, runtime = repositories
+    selected = registry.create_monitor(make_spec("selected"), created_by="telegram-user:1")
+    other = registry.create_monitor(make_spec("other"), created_by="telegram-user:1")
+    selected_outbox = seed_outbox(
+        connection,
+        dedupe_key="selected",
+        monitor_id=selected,
+        target_id="target-1",
+        payload={"text": "selected"},
+        available_at=OUTBOX_AT,
+    )
+    seed_outbox(
+        connection,
+        dedupe_key="other",
+        monitor_id=other,
+        target_id="target-1",
+        payload={"text": "other"},
+        available_at=OUTBOX_AT,
+    )
+
+    rows = runtime.claim_due_outbox(
+        worker_id="operator",
+        now=OUTBOX_AT,
+        monitor_id=selected,
+    )
+
+    assert [row.id for row in rows] == [selected_outbox]
+    assert (
+        connection.execute(
+            "SELECT lease_owner FROM outbox WHERE monitor_id = ?",
+            (other,),
+        ).fetchone()[0]
+        is None
     )
 
 

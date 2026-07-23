@@ -502,6 +502,20 @@ def test_unauthorized_or_unsupported_updates_touch_no_downstream_boundary(
     assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
 
 
+def test_gateway_supports_a_configured_signed_group_chat() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = FakeRouter(actions)
+    api = FakeApi()
+    gateway = TelegramGateway(7, -10042, router, actions, api)
+
+    run(gateway.handle_update(_message(chat_id=-10042)))
+
+    assert len(router.calls) == 1
+    assert router.calls[0].chat_id == "-10042"
+    connection.close()
+
+
 def test_unauthorized_log_contains_only_bounded_user_shape(
     gateway_parts, caplog: pytest.LogCaptureFixture
 ) -> None:

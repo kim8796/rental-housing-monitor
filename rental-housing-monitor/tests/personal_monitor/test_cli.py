@@ -287,3 +287,65 @@ def test_profile_bootstrap_has_one_fixed_redacted_failure_boundary(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "profile bootstrap failed\n"
+
+
+def test_run_once_defaults_to_disabled_delivery() -> None:
+    arguments = build_parser().parse_args(
+        ["run-once", "--database", "/srv/monitor.db", "--monitor", "monitor-1"]
+    )
+
+    assert arguments.delivery == "disabled"
+
+
+def test_ai_worker_refuses_service_and_api_environments_before_start(
+    monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path
+) -> None:
+    import personal_monitor.cli as cli_module
+
+    started = False
+
+    def should_not_start(_socket: Path) -> int:
+        nonlocal started
+        started = True
+        return 0
+
+    monkeypatch.setattr(cli_module, "_ai_worker_command", should_not_start)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "private")
+
+    result = main(["ai-worker", "--socket", str(tmp_path / "worker.sock")])
+
+    assert result == 1
+    assert not started
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "ai worker configuration refused\n"
+    assert "private" not in captured.err
+
+
+def test_run_once_passes_only_explicit_delivery_mode_to_safe_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import personal_monitor.cli as cli_module
+
+    calls: list[tuple[Path, str, str]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "_run_once_command",
+        lambda database, monitor, delivery: calls.append((database, monitor, delivery)) or 0,
+    )
+
+    assert (
+        main(
+            [
+                "run-once",
+                "--database",
+                str(tmp_path / "db"),
+                "--monitor",
+                "monitor-private",
+                "--delivery",
+                "enabled",
+            ]
+        )
+        == 0
+    )
+    assert calls == [(tmp_path / "db", "monitor-private", "enabled")]

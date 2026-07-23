@@ -59,7 +59,7 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
     assert second.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert second.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     versions = second.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in versions] == [1, 2, 3, 4]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5]
     columns = {
         row["name"]: row for row in second.execute("PRAGMA table_info(diagnostic_snapshots)")
     }
@@ -121,7 +121,7 @@ def test_existing_v1_database_migrates_to_v2_atomically_and_reruns(tmp_path) -> 
 
     migrated = open_database(database_path)
     migrated_versions = migrated.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in migrated_versions] == [1, 2, 3, 4]
+    assert [row["version"] for row in migrated_versions] == [1, 2, 3, 4, 5]
     assert migrated.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='diagnostic_snapshots'"
     ).fetchone()
@@ -142,7 +142,7 @@ def test_schema_rejects_a_migration_newer_than_the_binary(tmp_path) -> None:
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
     )
     connection.execute(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)",
         (datetime.now(UTC).isoformat(),),
     )
     connection.commit()

@@ -101,6 +101,55 @@ class RuntimeRepository:
                     leases.append(MonitorLease(row["id"], generation))
         return leases
 
+    def claim_monitor(
+        self,
+        monitor_id: str,
+        *,
+        worker_id: str,
+        now: datetime,
+        lease_seconds: int = 300,
+    ) -> MonitorLease:
+        """Claim one explicitly selected active monitor for an operator one-shot run."""
+        now_timestamp = utc_timestamp(now, parameter="now")
+        if (
+            type(monitor_id) is not str
+            or not monitor_id
+            or type(worker_id) is not str
+            or not worker_id
+            or lease_seconds <= 0
+        ):
+            raise ValueError("monitor is not available")
+        lease_expires_at = utc_timestamp(
+            now + timedelta(seconds=lease_seconds),
+            parameter="lease_expires_at",
+        )
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT lease_generation FROM monitors WHERE id = ? AND status = 'active' "
+                "AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+                (monitor_id, now_timestamp),
+            ).fetchone()
+            if row is None:
+                raise ValueError("monitor is not available")
+            generation = row["lease_generation"] + 1
+            cursor = self.connection.execute(
+                "UPDATE monitors SET lease_owner = ?, lease_expires_at = ?, "
+                "lease_generation = ? WHERE id = ? AND lease_generation = ? "
+                "AND status = 'active' AND "
+                "(lease_expires_at IS NULL OR lease_expires_at <= ?)",
+                (
+                    worker_id,
+                    lease_expires_at,
+                    generation,
+                    monitor_id,
+                    row["lease_generation"],
+                    now_timestamp,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("monitor is not available")
+        return MonitorLease(monitor_id, generation)
+
     def release_lease(self, lease: MonitorLease, *, worker_id: str, next_run_at: datetime) -> None:
         next_timestamp = utc_timestamp(next_run_at, parameter="next_run_at")
         with transaction(self.connection):
@@ -317,22 +366,32 @@ class RuntimeRepository:
         now: datetime,
         lease_seconds: int = 300,
         limit: int = 50,
+        monitor_id: str | None = None,
     ) -> list[OutboxRow]:
         now_timestamp = utc_timestamp(now, parameter="now")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         if limit <= 0:
             raise ValueError("limit must be positive")
+        if monitor_id is not None and (type(monitor_id) is not str or not monitor_id):
+            raise ValueError("monitor_id must be nonempty")
         lease_expires_at = utc_timestamp(
             now + timedelta(seconds=lease_seconds), parameter="lease_expires_at"
+        )
+        monitor_clause = "" if monitor_id is None else "AND monitor_id = ? "
+        parameters: tuple[object, ...] = (
+            (now_timestamp, now_timestamp, limit)
+            if monitor_id is None
+            else (now_timestamp, now_timestamp, monitor_id, limit)
         )
         with transaction(self.connection, immediate=True):
             rows = self.connection.execute(
                 "SELECT id, target_id, payload_json, attempt_count FROM outbox "
                 "WHERE status = 'pending' AND available_at <= ? "
                 "AND (lease_expires_at IS NULL OR lease_expires_at <= ?) "
+                f"{monitor_clause}"
                 "ORDER BY available_at, created_at, id LIMIT ?",
-                (now_timestamp, now_timestamp, limit),
+                parameters,
             ).fetchall()
             self.connection.executemany(
                 "UPDATE outbox SET lease_owner = ?, lease_expires_at = ? WHERE id = ?",

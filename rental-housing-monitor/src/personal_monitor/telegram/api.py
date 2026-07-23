@@ -407,7 +407,7 @@ class TelegramApi:
         buttons: Sequence[Sequence[InlineButton]] | None = None,
         disable_web_page_preview: bool = True,
     ) -> str:
-        chat = _positive_identifier(chat_id)
+        chat = _chat_identifier(chat_id)
         message = _outgoing_message(text)
         markup = _inline_keyboard(buttons)
         if chat is None or message is None or type(disable_web_page_preview) is not bool:
@@ -437,7 +437,7 @@ class TelegramApi:
         *,
         buttons: Sequence[Sequence[InlineButton]] | None = None,
     ) -> str:
-        chat = _positive_identifier(chat_id)
+        chat = _chat_identifier(chat_id)
         target_message = _positive_identifier(message_id)
         message = _outgoing_message(text)
         markup = _inline_keyboard(buttons)
@@ -652,6 +652,26 @@ def _positive_identifier(value: object) -> str | None:
     return str(number)
 
 
+def _chat_identifier(value: object) -> str | None:
+    if type(value) is int:
+        if value != 0 and abs(value) <= MAX_IDENTIFIER:
+            return str(value)
+        return None
+    if type(value) is not str or not value.isascii():
+        return None
+    negative = value.startswith("-")
+    digits = value[1:] if negative else value
+    if not digits.isdigit() or digits.startswith("0"):
+        return None
+    try:
+        number = int(value)
+    except ValueError:
+        return None
+    if number == 0 or abs(number) > MAX_IDENTIFIER:
+        return None
+    return str(number)
+
+
 def _bounded_string(
     value: object,
     *,
@@ -770,9 +790,11 @@ def _parse_message(value: object) -> TelegramMessage | object | None:
     message_id = value.get("message_id")
     chat_id = chat.get("id")
     from_user_id = sender.get("id")
-    if not all(
-        _is_int_in_range(item, minimum=1, maximum=MAX_IDENTIFIER)
-        for item in (message_id, chat_id, from_user_id)
+    if (
+        not _is_int_in_range(message_id, minimum=1, maximum=MAX_IDENTIFIER)
+        or type(chat_id) is not int
+        or _chat_identifier(chat_id) is None
+        or not _is_int_in_range(from_user_id, minimum=1, maximum=MAX_IDENTIFIER)
     ):
         return None
     if "text" not in value:
@@ -1175,8 +1197,10 @@ def _parse_callback(value: object) -> CallbackQuery | object | None:
         return None
     chat_id = chat.get("id")
     message_id = message.get("message_id")
-    if not all(
-        _is_int_in_range(item, minimum=1, maximum=MAX_IDENTIFIER) for item in (chat_id, message_id)
+    if (
+        type(chat_id) is not int
+        or _chat_identifier(chat_id) is None
+        or not _is_int_in_range(message_id, minimum=1, maximum=MAX_IDENTIFIER)
     ):
         return None
     return CallbackQuery(callback_id, from_user_id, chat_id, message_id, data)

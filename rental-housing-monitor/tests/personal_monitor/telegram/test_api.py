@@ -249,6 +249,16 @@ def test_send_message_splits_unbroken_and_korean_text_in_order_and_returns_final
     )
 
 
+def test_send_message_accepts_a_signed_group_chat_id() -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": {"message_id": 91}})])
+
+    result = run(harness.api.send_message(-100123, "hello"))
+    run(harness.close())
+
+    assert result == "91"
+    assert request_json(harness.requests[0])["chat_id"] == "-100123"
+
+
 def test_inline_keyboard_has_canonical_structure_and_copies_mutable_rows() -> None:
     rows = [[InlineButton("등록", "confirm:opaque")]]
     harness = TelegramHarness([json_response({"ok": True, "result": {"message_id": 88}})])

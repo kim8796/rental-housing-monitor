@@ -97,11 +97,27 @@ ADD COLUMN parent_version_id TEXT REFERENCES monitor_versions(id);
 CREATE INDEX monitor_versions_parent_idx ON monitor_versions(parent_version_id);
 """
 
+_MIGRATION_5 = """
+CREATE TABLE operator_events(
+  id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE,
+  payload_json TEXT NOT NULL, status TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX operator_events_due_idx
+ON operator_events(status, available_at);
+CREATE TABLE health_write_probe(
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  checked_at TEXT NOT NULL
+);
+"""
+
 _MIGRATIONS = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
     (4, _MIGRATION_4),
+    (5, _MIGRATION_5),
 )
 
 

@@ -1,6 +1,5 @@
 from .actions import ActionDenied, ConsumedAction, PendingAction, PendingActionService
 from .messages import ControlReply
-from .service import ControlService
 
 __all__ = [
     "ActionDenied",
@@ -10,3 +9,11 @@ __all__ = [
     "PendingAction",
     "PendingActionService",
 ]
+
+
+def __getattr__(name: str):
+    if name == "ControlService":
+        from .service import ControlService
+
+        return ControlService
+    raise AttributeError(name)

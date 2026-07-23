@@ -31,9 +31,20 @@ class OutboxWorker:
         self.health_sink = health_sink
         self.worker_id = worker_id
 
-    async def drain_once(self, *, now: datetime, limit: int = 50) -> int:
+    async def drain_once(
+        self,
+        *,
+        now: datetime,
+        limit: int = 50,
+        monitor_id: str | None = None,
+    ) -> int:
         delivered_count = 0
-        for row in self.runtime.claim_due_outbox(worker_id=self.worker_id, now=now, limit=limit):
+        for row in self.runtime.claim_due_outbox(
+            worker_id=self.worker_id,
+            now=now,
+            limit=limit,
+            monitor_id=monitor_id,
+        ):
             try:
                 target = self.registry.get_delivery_target(row.target_id)
             except Exception:

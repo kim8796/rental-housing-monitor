@@ -29,8 +29,8 @@ class ControlRequest:
             or re.fullmatch(r"telegram-user:[1-9][0-9]{0,18}", self.owner_id) is None
             or type(self.chat_id) is not str
             or not self.chat_id.isascii()
-            or not self.chat_id.isdigit()
-            or not 1 <= int(self.chat_id) <= _MAX_IDENTIFIER
+            or re.fullmatch(r"-?[1-9][0-9]{0,18}", self.chat_id) is None
+            or not 1 <= abs(int(self.chat_id)) <= _MAX_IDENTIFIER
             or not _valid_text(self.text)
         ):
             raise ValueError("invalid control request")
@@ -95,7 +95,7 @@ class TelegramGateway:
     ) -> None:
         configuration_valid = (
             _valid_identifier(allowed_user_id)
-            and _valid_identifier(command_chat_id)
+            and _valid_chat_identifier(command_chat_id)
             and type(actions) is PendingActionService
         )
         route = None
@@ -260,7 +260,7 @@ class TelegramGateway:
     def _authorized(self, user_id: object, chat_id: object) -> bool:
         if (
             _valid_identifier(user_id)
-            and _valid_identifier(chat_id)
+            and _valid_chat_identifier(chat_id)
             and user_id == self._allowed_user_id_anchor
             and chat_id == self._command_chat_id_anchor
         ):
@@ -290,7 +290,7 @@ class TelegramGateway:
                 or command_chat_id is not command_chat_id_anchor
             ):
                 return False
-            return _valid_identifier(allowed_user_id) and _valid_identifier(command_chat_id)
+            return _valid_identifier(allowed_user_id) and _valid_chat_identifier(command_chat_id)
         except Exception:
             return False
 
@@ -332,6 +332,10 @@ class TelegramGateway:
 
 def _valid_identifier(value: object) -> bool:
     return type(value) is int and 1 <= value <= _MAX_IDENTIFIER
+
+
+def _valid_chat_identifier(value: object) -> bool:
+    return type(value) is int and value != 0 and abs(value) <= _MAX_IDENTIFIER
 
 
 def _is_fatal_exception(error: BaseException) -> bool:
