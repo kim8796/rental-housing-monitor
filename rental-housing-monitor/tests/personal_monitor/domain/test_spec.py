@@ -175,6 +175,12 @@ def test_rule_spec_arguments_must_match_kind(payload: dict[str, object], valid: 
         "https://example.com/listing?client_secret=secret",
         "https://example.com/listing?password=secret",
         "https://example.com/listing?authorization=secret",
+        "https://example.com/listing?session_id=secret",
+        "https://example.com/listing?session-id=secret",
+        "https://example.com/listing?auth=secret",
+        "https://example.com/listing?credentials=secret",
+        "https://example.com/listing?signature=secret",
+        "https://example.com/listing?key=secret",
     ],
 )
 def test_monitor_spec_rejects_unsafe_target_urls(url: str) -> None:

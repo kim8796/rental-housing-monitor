@@ -22,7 +22,6 @@ from personal_monitor.ai.worker import CodexWorkerError
 from personal_monitor.control.actions import ConsumedAction, PendingAction, PendingActionService
 from personal_monitor.domain.observation import ObservedItem, Scalar, stable_item_id
 from personal_monitor.domain.spec import (
-    SENSITIVE_QUERY_PARAMETER_NAMES,
     FetchStrategy,
     FieldType,
     MonitorSpec,
@@ -32,6 +31,7 @@ from personal_monitor.engine.errors import MonitorError
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.extractor import DeclarativeExtractor
 from personal_monitor.scraping.validator import ObservationValidator
+from personal_monitor.security.credential_names import is_sensitive_credential_name
 from personal_monitor.security.robots import RobotsDecision
 from personal_monitor.security.sanitize import sanitize_for_ai
 from personal_monitor.security.secret_text import contains_sensitive_text, redact_sensitive_text
@@ -63,14 +63,6 @@ _FEEDBACK_SCHEMA: Final = "candidate_schema_invalid"
 _FEEDBACK_BINDING: Final = "candidate_binding_invalid"
 _FEEDBACK_EXTRACT: Final = "candidate_extract_invalid"
 _FEEDBACK_WORKER: Final = "worker_unavailable"
-_CREDENTIAL_QUERY_NAMES: Final = frozenset(
-    {
-        *SENSITIVE_QUERY_PARAMETER_NAMES,
-        "x-amz-credential",
-        "x-amz-security-token",
-        "x-amz-signature",
-    }
-)
 
 
 class PlanningFailed(RuntimeError):
@@ -804,9 +796,8 @@ def _project_worker_input(
             pair = f"{name}={value}"
             if pair != "=":
                 secrets_to_remove.append(pair)
-            normalized_name = name.casefold()
-            credential_name = (
-                normalized_name in _CREDENTIAL_QUERY_NAMES or normalized_name.startswith("x-amz-")
+            credential_name = is_sensitive_credential_name(name) or name.casefold().startswith(
+                "x-amz-"
             )
             if value and (credential_name or len(value) >= 8):
                 secrets_to_remove.append(value)
@@ -817,11 +808,10 @@ def _project_worker_input(
                 secrets_to_remove.append(pair)
             if "=" in pair:
                 raw_name, raw_value = pair.split("=", 1)
-                normalized_raw_name = raw_name.casefold()
                 if raw_value and (
                     len(raw_value) >= 8
-                    or normalized_raw_name in _CREDENTIAL_QUERY_NAMES
-                    or normalized_raw_name.startswith("x-amz-")
+                    or is_sensitive_credential_name(raw_name)
+                    or raw_name.casefold().startswith("x-amz-")
                 ):
                     secrets_to_remove.append(raw_value)
         if probe.auth_profile_ref is not None:
@@ -1547,7 +1537,7 @@ def _safe_web_url(value: object, *, reject_sensitive_query: bool = False) -> boo
         return not (
             reject_sensitive_query
             and any(
-                name.casefold() in SENSITIVE_QUERY_PARAMETER_NAMES
+                is_sensitive_credential_name(name)
                 for name, _ in parse_qsl(parts.query, keep_blank_values=True)
             )
         )

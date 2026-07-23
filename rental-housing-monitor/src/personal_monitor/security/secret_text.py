@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Final
 
+from personal_monitor.security.credential_names import SENSITIVE_CREDENTIAL_NAMES
+
 _REDACTION: Final = "[숨김]"
 _TOKEN_PATTERNS: Final = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b", re.IGNORECASE),
@@ -10,13 +12,19 @@ _TOKEN_PATTERNS: Final = (
     re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"),
 )
 _SENSITIVE_KEY: Final = (
-    r"(?:access[_-]?token|api[_-]?key|authorization|client[_-]?secret|"
-    r"cookie|set-cookie|credential|passwd|password|secret|session(?:id)?|token)"
+    "(?:"
+    + "|".join(
+        sorted(
+            (re.escape(name).replace("_", "[-_]") for name in SENSITIVE_CREDENTIAL_NAMES),
+            key=lambda value: (-len(value), value),
+        )
+    )
+    + ")"
 )
 _ASSIGNMENT: Final = re.compile(
-    rf"(?<![A-Za-z0-9_-])[\"']?{_SENSITIVE_KEY}[\"']?"
+    rf"""(?<![A-Za-z0-9_-])["'`]?{_SENSITIVE_KEY}["'`]?"""
     r"\s*[:=]\s*"
-    r"(?:\"[^\"\r\n]|'[^'\r\n]|[^\s<>\"'])",
+    r"""(?:"[^"\r\n]|'[^'\r\n]|`[^`\r\n]|[^\s<>"'`])""",
     re.IGNORECASE,
 )
 _KEY_ONLY: Final = re.compile(rf"^{_SENSITIVE_KEY}$", re.IGNORECASE)

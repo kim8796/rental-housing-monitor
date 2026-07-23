@@ -20,6 +20,11 @@ from pydantic import (
     model_validator,
 )
 
+from personal_monitor.security.credential_names import (
+    SENSITIVE_CREDENTIAL_NAMES,
+    is_sensitive_credential_name,
+)
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True, strict=True)
@@ -69,24 +74,7 @@ SAFE_SELECTOR = re.compile(r"^[\w\s.#>*+~:\-\[\]=\"'()/@|]+$")
 SAFE_FIELD = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 MIN_SCHEDULE_INTERVAL_SECONDS = 900
 SCHEDULE_GAP_SAMPLE_COUNT = 512
-SENSITIVE_QUERY_PARAMETER_NAMES = frozenset(
-    {
-        "access_token",
-        "api_key",
-        "apikey",
-        "auth",
-        "authorization",
-        "client_secret",
-        "credentials",
-        "key",
-        "passwd",
-        "password",
-        "secret",
-        "session",
-        "signature",
-        "token",
-    }
-)
+SENSITIVE_QUERY_PARAMETER_NAMES = SENSITIVE_CREDENTIAL_NAMES
 
 
 class FieldSpec(StrictModel):
@@ -262,7 +250,7 @@ class MonitorSpec(StrictModel):
         ):
             raise ValueError("target_url must be an http(s) URL without userinfo")
         if any(
-            name.casefold() in SENSITIVE_QUERY_PARAMETER_NAMES
+            is_sensitive_credential_name(name)
             for name, _ in parse_qsl(parts.query, keep_blank_values=True)
         ):
             raise ValueError("target_url query contains a credential-like parameter")

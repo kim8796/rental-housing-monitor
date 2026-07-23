@@ -824,6 +824,13 @@ def test_broad_jwt_is_redacted_from_worker_sanitized_document(
         "password='supersecretvalue'",
         '"authorization": "supersecretvalue"',
         "'api_key': 'supersecretvalue'",
+        "session_id=supersecretvalue",
+        'session-id="supersecretvalue"',
+        "auth: supersecretvalue",
+        "credentials=supersecretvalue",
+        "signature: supersecretvalue",
+        "key=supersecretvalue",
+        "`authorization`: `supersecretvalue`",
     ),
 )
 def test_quoted_assignment_is_fully_hidden_from_worker_message_and_document(

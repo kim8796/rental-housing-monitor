@@ -406,6 +406,13 @@ def test_broad_jwt_is_hidden_from_every_rendered_preview_value(
         "password='supersecretvalue'",
         '"authorization": "supersecretvalue"',
         "'api_key': 'supersecretvalue'",
+        "session_id=supersecretvalue",
+        'session-id="supersecretvalue"',
+        "auth: supersecretvalue",
+        "credentials=supersecretvalue",
+        "signature: supersecretvalue",
+        "key=supersecretvalue",
+        "`authorization`: `supersecretvalue`",
     ),
 )
 def test_quoted_assignment_hides_entire_preview_values(

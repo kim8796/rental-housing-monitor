@@ -7,11 +7,9 @@ from datetime import date, datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from personal_monitor.domain.observation import Scalar
-from personal_monitor.domain.spec import (
-    SENSITIVE_QUERY_PARAMETER_NAMES,
-    FieldType,
-)
+from personal_monitor.domain.spec import FieldType
 from personal_monitor.engine.errors import ErrorClass, MonitorError
+from personal_monitor.security.credential_names import is_sensitive_credential_name
 from personal_monitor.security.url_policy import (
     canonicalize_hostname,
     has_unsafe_url_characters,
@@ -91,7 +89,7 @@ def normalize_url(value: str, base_url: str = "") -> str:
         )
     except (MonitorError, UnicodeError, ValueError):
         raise _normalization_error() from None
-    if any(key.casefold() in SENSITIVE_QUERY_PARAMETER_NAMES for key, _value in query):
+    if any(is_sensitive_credential_name(key) for key, _value in query):
         raise _normalization_error()
     query = [(key, item) for key, item in query if not _is_tracking_query_key(key)]
 

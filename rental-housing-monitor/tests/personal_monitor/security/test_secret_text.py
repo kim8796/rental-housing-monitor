@@ -14,6 +14,13 @@ QUOTED_ASSIGNMENTS = (
     "'api_key': 'supersecretvalue'",
     " authorization \t = \t supersecretvalue ",
     "prefix password : unquoted-secret-value suffix",
+    "session_id=supersecretvalue",
+    'session-id="supersecretvalue"',
+    "auth: supersecretvalue",
+    "credentials=supersecretvalue",
+    "signature: supersecretvalue",
+    "key=supersecretvalue",
+    "`authorization`: `supersecretvalue`",
 )
 
 

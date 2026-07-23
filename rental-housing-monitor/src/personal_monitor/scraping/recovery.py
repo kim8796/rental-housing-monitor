@@ -13,7 +13,6 @@ from scrapling import Selector
 
 from personal_monitor.domain.observation import ObservedItem, Scalar
 from personal_monitor.domain.spec import (
-    SENSITIVE_QUERY_PARAMETER_NAMES,
     MonitorSpec,
     SourceAdapterKind,
 )
@@ -22,6 +21,7 @@ from personal_monitor.scraping.adaptive_storage import EncryptedAdaptiveStorage
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.extractor import DeclarativeExtractor, _scope_xpath
 from personal_monitor.scraping.validator import ObservationValidator
+from personal_monitor.security.credential_names import is_sensitive_credential_name
 from personal_monitor.security.encryption import AesGcmCipher, EncryptedBlob
 from personal_monitor.security.sanitize import sanitize_for_ai
 from personal_monitor.security.secret_text import contains_sensitive_text
@@ -679,7 +679,7 @@ def _unsafe_text(value: str, secrets: tuple[str, ...]) -> bool:
     return parts.scheme.casefold() in {"http", "https"} and (
         parts.username is not None
         or parts.password is not None
-        or any(name.casefold() in SENSITIVE_QUERY_PARAMETER_NAMES for name, _value in query)
+        or any(is_sensitive_credential_name(name) for name, _value in query)
     )
 
 

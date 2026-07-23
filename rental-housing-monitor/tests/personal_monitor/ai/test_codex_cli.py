@@ -47,6 +47,13 @@ QUOTED_ASSIGNMENTS = (
     "password='supersecretvalue'",
     '"authorization": "supersecretvalue"',
     "'api_key': 'supersecretvalue'",
+    "session_id=supersecretvalue",
+    'session-id="supersecretvalue"',
+    "auth: supersecretvalue",
+    "credentials=supersecretvalue",
+    "signature: supersecretvalue",
+    "key=supersecretvalue",
+    "`authorization`: `supersecretvalue`",
 )
 
 
