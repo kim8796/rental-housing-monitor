@@ -358,8 +358,16 @@ class CodexWorkerServer:
                 await asyncio.wait_for(
                     asyncio.gather(*tasks, return_exceptions=True), _CLOSE_TIMEOUT
                 )
-        for writer in tuple(self._connections):
-            await _close_writer(writer)
+        writers = tuple(self._connections)
+        if writers:
+            with suppress(BaseException):
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(_close_writer(writer) for writer in writers),
+                        return_exceptions=True,
+                    ),
+                    _CLOSE_TIMEOUT,
+                )
         identity = self._identity
         if parent_error is None and identity is not None:
             self._unlink_exact(identity)
@@ -369,15 +377,29 @@ class CodexWorkerServer:
 
 
 class CodexWorkerClient:
-    __slots__ = ("_parent", "_parent_identity", "_socket_path")
+    __slots__ = ("_parent", "_parent_identity", "_socket_identity", "_socket_path")
 
     def __init__(self, socket_path: Path) -> None:
         if type(self) is not CodexWorkerClient:
             raise CodexWorkerError
         parent, parent_identity = _safe_socket_parent(Path(socket_path))
+        resolved_socket = parent / Path(socket_path).name
+        try:
+            metadata = resolved_socket.lstat()
+            if (
+                not stat.S_ISSOCK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise CodexWorkerError
+        except CodexWorkerError:
+            raise
+        except Exception:
+            raise CodexWorkerError from None
         object.__setattr__(self, "_parent", parent)
         object.__setattr__(self, "_parent_identity", parent_identity)
-        object.__setattr__(self, "_socket_path", parent / Path(socket_path).name)
+        object.__setattr__(self, "_socket_identity", (metadata.st_dev, metadata.st_ino))
+        object.__setattr__(self, "_socket_path", resolved_socket)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("CodexWorkerClient composition is sealed")
@@ -396,9 +418,9 @@ class CodexWorkerClient:
                 not stat.S_ISSOCK(metadata.st_mode)
                 or metadata.st_uid != os.geteuid()
                 or stat.S_IMODE(metadata.st_mode) != 0o600
+                or (metadata.st_dev, metadata.st_ino) != self._socket_identity
             ):
                 raise CodexWorkerError
-            socket_identity = (metadata.st_dev, metadata.st_ino)
             envelope = WorkerRequest(
                 kind=request_kind(request),
                 request=request,
@@ -417,7 +439,7 @@ class CodexWorkerClient:
                 connected = self._socket_path.lstat()
                 if (
                     not stat.S_ISSOCK(connected.st_mode)
-                    or (connected.st_dev, connected.st_ino) != socket_identity
+                    or (connected.st_dev, connected.st_ino) != self._socket_identity
                 ):
                     raise CodexWorkerError
                 writer.write(_encode(envelope.model_dump(mode="json")))

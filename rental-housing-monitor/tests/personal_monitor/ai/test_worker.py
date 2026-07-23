@@ -233,6 +233,15 @@ async def test_client_rejects_unsafe_socket_directory(tmp_path: Path) -> None:
         CodexWorkerClient(socket_path)
 
 
+def test_client_requires_existing_legitimate_socket() -> None:
+    directory, socket_path = short_socket_path()
+    try:
+        with pytest.raises(CodexWorkerError):
+            CodexWorkerClient(socket_path)
+    finally:
+        shutil.rmtree(directory)
+
+
 @async_test
 async def test_client_recursively_rejects_secret_in_safe_shaped_result() -> None:
     directory, socket_path = short_socket_path()
@@ -270,22 +279,67 @@ async def test_client_recursively_rejects_secret_in_safe_shaped_result() -> None
         shutil.rmtree(directory)
 
 
-def test_server_and_client_reject_parent_rename_replacement() -> None:
+@async_test
+async def test_server_and_client_reject_parent_rename_replacement() -> None:
     directory, socket_path = short_socket_path()
     harness = SecureHarness(directory)
     server = CodexWorkerServer(socket_path, harness.cli)
+    await server.start()
     client = CodexWorkerClient(socket_path)
     moved = directory.with_name(directory.name + "-moved")
     directory.rename(moved)
     directory.mkdir(mode=0o700)
     try:
         with pytest.raises(CodexWorkerError):
-            asyncio.run(server.start())
+            await server.close()
         with pytest.raises(CodexWorkerError):
-            asyncio.run(client.run(intent()))
+            await client.run(intent())
     finally:
         directory.rmdir()
         moved.rename(directory)
+        shutil.rmtree(directory)
+
+
+@async_test
+async def test_client_rejects_same_mode_socket_identity_replacement() -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+    secured_server = CodexWorkerServer(socket_path, harness.cli)
+    await secured_server.start()
+    client = CodexWorkerClient(socket_path)
+    socket_path.unlink()
+
+    async def malicious(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        payload = json.dumps(
+            {
+                "ok": True,
+                "result": {
+                    "kind": "unknown",
+                    "target_monitor_ids": [],
+                    "target_url": None,
+                    "condition_text": None,
+                    "schedule_text": None,
+                    "clarification": None,
+                    "confidence": 0.0,
+                },
+            }
+        ).encode()
+        writer.write(len(payload).to_bytes(4, "big") + payload)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    malicious_server = await asyncio.start_unix_server(malicious, path=socket_path)
+    socket_path.chmod(0o600)
+    try:
+        with pytest.raises(CodexWorkerError):
+            await client.run(intent())
+        assert harness.exec_calls == 0
+    finally:
+        malicious_server.close()
+        await malicious_server.wait_closed()
+        socket_path.unlink(missing_ok=True)
+        await secured_server.close()
         shutil.rmtree(directory)
 
 
@@ -358,3 +412,29 @@ async def test_slowloris_header_times_out_without_invocation(
     finally:
         await server.close()
         shutil.rmtree(directory)
+
+
+@async_test
+async def test_close_cancels_active_handler_and_clears_bookkeeping() -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+    server = CodexWorkerServer(socket_path, harness.cli)
+    await server.start()
+    _reader, writer = await asyncio.open_unix_connection(socket_path)
+    writer.write((100).to_bytes(4, "big"))
+    await writer.drain()
+    for _ in range(20):
+        if server._tasks:
+            break
+        await asyncio.sleep(0)
+    assert server._tasks
+    close_task = asyncio.create_task(server.close())
+    await asyncio.sleep(0)
+    writer.close()
+    with suppress(Exception):
+        await writer.wait_closed()
+    await close_task
+    assert not server._tasks
+    assert not server._connections
+    assert not socket_path.exists()
+    shutil.rmtree(directory)

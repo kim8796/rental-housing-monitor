@@ -65,7 +65,9 @@ async def _read_bounded(stream: object, limit: int) -> bytes:
 async def _stop_process(process: object) -> None:
     if getattr(process, "returncode", None) is not None:
         with suppress(BaseException):
-            await process.wait()  # type: ignore[attr-defined]
+            await asyncio.wait_for(  # type: ignore[attr-defined]
+                process.wait(), _PROCESS_STOP_TIMEOUT
+            )
         return
     pid = getattr(process, "pid", None)
     if type(pid) is not int or pid <= 1:
@@ -94,7 +96,7 @@ async def _wait_status(process: object) -> tuple[bytes, bytes, int]:
         asyncio.create_task(process.wait()),  # type: ignore[attr-defined]
     )
     try:
-        return await asyncio.wait_for(asyncio.gather(*tasks), _AUTH_TIMEOUT)
+        return await asyncio.gather(*tasks)
     finally:
         for task in tasks:
             if not task.done():
@@ -175,17 +177,18 @@ class CodexAuthGuard:
         }
         process: object | None = None
         try:
-            process = await self._process_factory_anchor(
-                *launcher.argv_prefix,
-                "login",
-                "status",
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                start_new_session=True,
-            )
-            stdout, _stderr, returncode = await _wait_status(process)
+            async with asyncio.timeout(_AUTH_TIMEOUT):
+                process = await self._process_factory_anchor(
+                    *launcher.argv_prefix,
+                    "login",
+                    "status",
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    start_new_session=True,
+                )
+                stdout, _stderr, returncode = await _wait_status(process)
             if returncode != 0 or stdout.decode("utf-8", "strict").strip() != (
                 "Logged in using ChatGPT"
             ):

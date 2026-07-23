@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import os
+import signal
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,18 @@ def valid_events(*, text: str | None = None) -> bytes:
     return b"".join(
         json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n" for event in events
     )
+
+
+ACTUAL_CODEX_0144_BENIGN_EVENTS = (
+    b'{"type":"thread.started","thread_id":"019c-source-fixture"}\n'
+    b'{"type":"turn.started"}\n'
+    b'{"type":"item.completed","item":{"id":"item_0","type":"reasoning",'
+    b'"text":"Validated the bounded request."}}\n'
+    b'{"type":"item.completed","item":{"id":"item_1","type":"agent_message",'
+    b'"text":"Structured result prepared."}}\n'
+    b'{"type":"turn.completed","usage":{"input_tokens":42,"cached_input_tokens":7,'
+    b'"output_tokens":9,"reasoning_output_tokens":3}}\n'
+)
 
 
 def spec() -> MonitorSpec:
@@ -616,3 +629,159 @@ async def test_symlinked_result_is_rejected_and_workspace_removed(tmp_path: Path
         await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
     assert list(root.iterdir()) == []
     assert outside.exists()
+
+
+@async_test
+async def test_actual_codex_0144_usage_fixture_is_accepted(tmp_path: Path) -> None:
+    home, root = cli_paths(tmp_path)
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(
+            IntentResult(
+                kind=IntentKind.UNKNOWN,
+                target_monitor_ids=[],
+                confidence=0.0,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+        return FakeProcess(ACTUAL_CODEX_0144_BENIGN_EVENTS)
+
+    cli = make_cli(home, root, process_factory=spawn)
+    result = await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert result.kind is IntentKind.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "reasoning_value",
+    [True, -1, "3", None],
+)
+def test_actual_usage_rejects_invalid_reasoning_counter(reasoning_value: object) -> None:
+    from personal_monitor.ai.codex_cli import _validate_event
+
+    event = {
+        "type": "turn.completed",
+        "usage": {
+            "input_tokens": 1,
+            "cached_input_tokens": 0,
+            "output_tokens": 1,
+            "reasoning_output_tokens": reasoning_value,
+        },
+    }
+    with pytest.raises(CodexProtocolError):
+        _validate_event(json.dumps(event).encode(), 2)
+
+
+@async_test
+@pytest.mark.parametrize("stage", ["write", "drain", "wait_closed"])
+async def test_entire_stdin_lifecycle_is_deadlined_and_process_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    home, root = cli_paths(tmp_path)
+    entered = asyncio.Event()
+
+    class HangingStdin(FakeStdin):
+        async def _hang(self) -> None:
+            entered.set()
+            await asyncio.Future()
+
+        def write(self, value: bytes):
+            self.data += value
+            return self._hang() if stage == "write" else None
+
+        async def drain(self) -> None:
+            if stage == "drain":
+                await self._hang()
+
+        async def wait_closed(self) -> None:
+            if stage == "wait_closed":
+                await self._hang()
+
+    process = FakeProcess(b"")
+    process.stdin = HangingStdin()
+    process.returncode = None  # type: ignore[assignment]
+    process.pid = 717_171
+    process.waits = 0
+    signals: list[int] = []
+
+    async def wait() -> int:
+        process.waits += 1
+        while process.returncode is None:
+            await asyncio.sleep(0)
+        return process.returncode
+
+    process.wait = wait  # type: ignore[method-assign]
+
+    def killpg(_pid: int, sent: int) -> None:
+        signals.append(sent)
+        process.returncode = -sent  # type: ignore[assignment]
+
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        return process
+
+    monkeypatch.setattr("personal_monitor.ai.codex_cli._RUN_TIMEOUT", 0.01)
+    monkeypatch.setattr("personal_monitor.ai.codex_cli._STDIN_CLOSE_TIMEOUT", 0.01)
+    monkeypatch.setattr("personal_monitor.ai.auth._PROCESS_STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr("personal_monitor.ai.auth.os.killpg", killpg)
+    cli = make_cli(home, root, process_factory=spawn)
+    with pytest.raises(CodexProtocolError):
+        await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert entered.is_set()
+    assert signals == [signal.SIGTERM]
+    assert process.waits >= 1
+    assert list(root.iterdir()) == []
+
+
+@async_test
+async def test_cancellation_wins_over_workspace_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, root = cli_paths(tmp_path)
+    entered = asyncio.Event()
+
+    class HangingStdin(FakeStdin):
+        async def drain(self) -> None:
+            entered.set()
+            await asyncio.Future()
+
+        async def wait_closed(self) -> None:
+            await asyncio.Future()
+
+    process = FakeProcess(b"")
+    process.stdin = HangingStdin()
+    process.returncode = None  # type: ignore[assignment]
+    process.pid = 818_181
+
+    async def wait() -> int:
+        while process.returncode is None:
+            await asyncio.sleep(0)
+        return process.returncode
+
+    process.wait = wait  # type: ignore[method-assign]
+
+    def killpg(_pid: int, sent: int) -> None:
+        process.returncode = -sent  # type: ignore[assignment]
+
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        return process
+
+    def fail_cleanup(_path: Path, _identity: tuple[int, int]) -> None:
+        raise OSError("private-cleanup-secret")
+
+    monkeypatch.setattr("personal_monitor.ai.codex_cli._STDIN_CLOSE_TIMEOUT", 0.01)
+    monkeypatch.setattr("personal_monitor.ai.auth._PROCESS_STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr("personal_monitor.ai.auth.os.killpg", killpg)
+    monkeypatch.setattr("personal_monitor.ai.codex_cli._remove_workspace_sync", fail_cleanup)
+    cli = make_cli(home, root, process_factory=spawn)
+    task = asyncio.create_task(
+        cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    )
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert "private-cleanup-secret" not in str(caught.value.__notes__)
+    for leftover in root.iterdir():
+        import shutil
+
+        shutil.rmtree(leftover)

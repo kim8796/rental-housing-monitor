@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import os
@@ -37,6 +38,7 @@ MAX_JSON_NODES: Final = 10_000
 MAX_JSON_STRING_CHARS: Final = 40_000
 MAX_JSON_ARRAY_ITEMS: Final = 1_000
 _RUN_TIMEOUT: Final = 120.0
+_STDIN_CLOSE_TIMEOUT: Final = 1.0
 _SPAWN = asyncio.create_subprocess_exec
 _ALLOWED_MODELS: Final = {
     ("gpt-5.6-terra", "medium"),
@@ -282,8 +284,13 @@ def _validate_event(line: bytes, state: int) -> int:
         if set(value) != {"type", "usage"} or type(value["usage"]) is not dict:
             raise CodexProtocolError
         usage = value["usage"]
-        if set(usage) != {"input_tokens", "cached_input_tokens", "output_tokens"} or any(
-            type(usage[name]) is not int or not 0 <= usage[name] <= 2**63 - 1 for name in usage
+        required_usage = {"input_tokens", "cached_input_tokens", "output_tokens"}
+        if (
+            not required_usage.issubset(usage)
+            or bool(set(usage) - required_usage - {"reasoning_output_tokens"})
+            or any(
+                type(usage[name]) is not int or not 0 <= usage[name] <= 2**63 - 1 for name in usage
+            )
         ):
             raise CodexProtocolError
         return 3
@@ -353,7 +360,7 @@ async def _wait_process_streams(process: object) -> tuple[bytes, bytes, int]:
         asyncio.create_task(process.wait()),  # type: ignore[attr-defined]
     )
     try:
-        return await asyncio.wait_for(asyncio.gather(*tasks), _RUN_TIMEOUT)
+        return await asyncio.gather(*tasks)
     finally:
         for task in tasks:
             if not task.done():
@@ -361,12 +368,34 @@ async def _wait_process_streams(process: object) -> tuple[bytes, bytes, int]:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def _interact_with_process(process: object, request_data: bytes) -> tuple[bytes, bytes, int]:
+    written = process.stdin.write(request_data)  # type: ignore[attr-defined]
+    if inspect.isawaitable(written):
+        await written
+    await process.stdin.drain()  # type: ignore[attr-defined]
+    process.stdin.close()  # type: ignore[attr-defined]
+    with suppress(AttributeError):
+        await process.stdin.wait_closed()  # type: ignore[attr-defined]
+    return await _wait_process_streams(process)
+
+
 async def _cleanup_process(process: object) -> None:
     with suppress(BaseException):
         process.stdin.close()  # type: ignore[attr-defined]
     with suppress(BaseException):
-        await process.stdin.wait_closed()  # type: ignore[attr-defined]
+        await asyncio.wait_for(  # type: ignore[attr-defined]
+            process.stdin.wait_closed(), _STDIN_CLOSE_TIMEOUT
+        )
     await _stop_process(process)
+
+
+async def _shielded_process_cleanup(process: object) -> None:
+    task = asyncio.create_task(_cleanup_process(process))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.shield(task)
+        raise
 
 
 class CodexCli:
@@ -464,6 +493,7 @@ class CodexCli:
         workspace: Path | None = None
         workspace_identity: tuple[int, int] | None = None
         process: object | None = None
+        result: ResultModel | None = None
         try:
             root = _safe_owned_directory(self._task_root)
             home = _safe_directory(self._codex_home)
@@ -539,20 +569,16 @@ class CodexCli:
                 "LANG": "C.UTF-8",
                 "LC_ALL": "C.UTF-8",
             }
-            process = await self._process_factory_anchor(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                start_new_session=True,
-            )
-            process.stdin.write(request_data)  # type: ignore[attr-defined]
-            await process.stdin.drain()  # type: ignore[attr-defined]
-            process.stdin.close()  # type: ignore[attr-defined]
-            with suppress(AttributeError):
-                await process.stdin.wait_closed()  # type: ignore[attr-defined]
-            _stdout, _stderr, returncode = await _wait_process_streams(process)
+            async with asyncio.timeout(_RUN_TIMEOUT):
+                process = await self._process_factory_anchor(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                    start_new_session=True,
+                )
+                _stdout, _stderr, returncode = await _interact_with_process(process, request_data)
             if returncode != 0:
                 raise CodexProtocolError
             raw = _read_pinned(result_path, result_identity, MAX_RESULT_BYTES)
@@ -561,27 +587,52 @@ class CodexCli:
                 raise CodexProtocolError
             _scan_secrets(parsed)
             try:
-                result = expected_type.model_validate(parsed)
+                validated_result = expected_type.model_validate(parsed)
             except ValidationError:
                 raise CodexProtocolError from None
-            _scan_secrets(result.model_dump(mode="python"))
-            return result
-        except asyncio.CancelledError:
+            _scan_secrets(validated_result.model_dump(mode="python"))
+            result = validated_result
+        except asyncio.CancelledError as cancellation:
             if process is not None:
-                await asyncio.shield(_cleanup_process(process))
-            raise
+                try:
+                    await _shielded_process_cleanup(process)
+                except BaseException:
+                    cancellation.add_note("Codex process cleanup failed")
+            if workspace is not None:
+                try:
+                    if workspace_identity is None:
+                        raise CodexProtocolError
+                    await _remove_workspace(workspace, workspace_identity)
+                except BaseException:
+                    cancellation.add_note("Codex workspace cleanup failed")
+            raise cancellation
         except CodexProtocolError:
             if process is not None:
-                await _cleanup_process(process)
-            raise
+                with suppress(BaseException):
+                    await _shielded_process_cleanup(process)
+            if workspace is not None:
+                if workspace_identity is None:
+                    raise CodexProtocolError from None
+                await _remove_workspace(workspace, workspace_identity)
+            raise CodexProtocolError from None
         except BaseException as error:
             if process is not None:
-                await _cleanup_process(process)
+                with suppress(BaseException):
+                    await _shielded_process_cleanup(process)
+            if workspace is not None:
+                try:
+                    if workspace_identity is None:
+                        raise CodexProtocolError
+                    await _remove_workspace(workspace, workspace_identity)
+                except BaseException:
+                    if not isinstance(error, Exception):
+                        error.add_note("Codex workspace cleanup failed")
+                    else:
+                        raise CodexProtocolError from None
             if not isinstance(error, Exception):
                 raise
             raise CodexProtocolError from None
-        finally:
-            if workspace is not None:
-                if workspace_identity is None:
-                    raise CodexProtocolError
-                await _remove_workspace(workspace, workspace_identity)
+        if workspace is None or workspace_identity is None or result is None:
+            raise CodexProtocolError
+        await _remove_workspace(workspace, workspace_identity)
+        return result
