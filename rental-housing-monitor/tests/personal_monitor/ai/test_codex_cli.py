@@ -1,0 +1,392 @@
+from __future__ import annotations
+
+import asyncio
+import functools
+import json
+import os
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from personal_monitor.ai.codex_cli import CodexCli, CodexProtocolError
+from personal_monitor.ai.contracts import (
+    IntentKind,
+    IntentRequest,
+    IntentResult,
+    PlanRequest,
+    PlanResult,
+    RepairRequest,
+    RepairResult,
+    WorkerRequest,
+)
+from personal_monitor.domain.spec import MonitorSpec
+
+
+def async_test(function):
+    @functools.wraps(function)
+    def run(*args: object, **kwargs: object):
+        return asyncio.run(function(*args, **kwargs))
+
+    return run
+
+
+def request() -> IntentRequest:
+    return IntentRequest(
+        request_id="req-1",
+        owner_id="telegram-user:7",
+        message="서울 임대주택을 모니터해줘",
+        monitor_summaries=[],
+    )
+
+
+def cli_paths(tmp_path: Path) -> tuple[Path, Path]:
+    home = tmp_path / "codex-home"
+    home.mkdir(mode=0o700)
+    root = tmp_path / "tasks"
+    root.mkdir(mode=0o700)
+    return home, root
+
+
+def spec() -> MonitorSpec:
+    return MonitorSpec.model_validate(
+        {
+            "schema_version": 1,
+            "owner_id": "telegram-user:7",
+            "name": "가격 감시",
+            "target_url": "https://example.com/product",
+            "source_adapter": "scrapling",
+            "adapter_ref": None,
+            "fetch_strategy": "auto",
+            "schedule": "0 */6 * * *",
+            "timezone": "Asia/Seoul",
+            "extract": {
+                "item_scope": "main",
+                "fields": {"price": {"selector": ".price", "type": "krw", "required": True}},
+            },
+            "validators": {
+                "min_items": 1,
+                "max_items": 1,
+                "allowed_link_domains": ["example.com"],
+            },
+            "rules": [
+                {
+                    "kind": "numeric_threshold",
+                    "field": "price",
+                    "operator": "lte",
+                    "value": 100_000,
+                }
+            ],
+            "notify_on_no_change": False,
+            "auth_profile_ref": None,
+        }
+    )
+
+
+class FakeStdin:
+    def __init__(self) -> None:
+        self.data = b""
+
+    def write(self, value: bytes) -> None:
+        self.data += value
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class FakeStream:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    async def read(self, size: int) -> bytes:
+        value, self.data = self.data[:size], self.data[size:]
+        return value
+
+
+class FakeProcess:
+    def __init__(self, stdout: bytes, stderr: bytes = b"", returncode: int = 0) -> None:
+        self.stdin = FakeStdin()
+        self.stdout = FakeStream(stdout)
+        self.stderr = FakeStream(stderr)
+        self.returncode = returncode
+        self.pid = os.getpid()
+
+    async def wait(self) -> int:
+        return self.returncode
+
+
+@async_test
+async def test_cli_exact_argv_env_stdin_and_cleanup(tmp_path: Path) -> None:
+    home, task_root = cli_paths(tmp_path)
+    observed: tuple[tuple[str, ...], dict[str, object], FakeProcess] | None = None
+
+    async def spawn(*argv: str, **kwargs: object) -> FakeProcess:
+        nonlocal observed
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(
+            IntentResult(
+                kind=IntentKind.CREATE,
+                target_monitor_ids=[],
+                target_url="https://example.com",
+                condition_text=None,
+                schedule_text=None,
+                clarification=None,
+                confidence=0.9,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+        process = FakeProcess(b'{"type":"turn.completed"}\n')
+        observed = (argv, kwargs, process)
+        return process
+
+    cli = CodexCli("/usr/bin/true", home, task_root, process_factory=spawn)
+    result = await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert result.kind is IntentKind.CREATE
+    assert observed is not None
+    argv, kwargs, process = observed
+    assert argv[:15] == (
+        "/usr/bin/true",
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "--model",
+        "gpt-5.6-terra",
+        "--strict-config",
+        "-c",
+        'model_reasoning_effort="medium"',
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        'forced_login_method="chatgpt"',
+        "-c",
+    )
+    assert "exec" in argv
+    assert "--ignore-user-config" in argv
+    assert "--ignore-rules" in argv
+    assert kwargs["start_new_session"] is True
+    assert "shell" not in kwargs
+    env = kwargs["env"]
+    assert isinstance(env, dict)
+    assert "OPENAI_API_KEY" not in env
+    assert "CODEX_API_KEY" not in env
+    decoded = json.loads(process.stdin.data)
+    assert decoded["message"] == "서울 임대주택을 모니터해줘"
+    assert list(task_root.iterdir()) == []
+
+
+@async_test
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [
+        ("gpt-5.6-terra", "high"),
+        ("gpt-5.6-sol", "medium"),
+        ("other", "medium"),
+    ],
+)
+async def test_only_exact_model_effort_pairs(tmp_path: Path, model: str, effort: str) -> None:
+    home, root = cli_paths(tmp_path)
+    cli = CodexCli("/usr/bin/true", home, root)
+    with pytest.raises(CodexProtocolError):
+        await cli.run(request(), IntentResult.model_json_schema(), model, effort)
+
+
+@async_test
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "item.started", "item": {"type": "command_execution"}},
+        {"type": "item.completed", "item": {"type": "file_change"}},
+        {"type": "item.started", "item": {"type": "mcp_tool_call"}},
+        {"type": "item.completed", "item": {"type": "web_search"}},
+        {"type": "item.started", "item": {"type": "image_generation"}},
+    ],
+)
+async def test_forbidden_event_rejects_entire_result(
+    tmp_path: Path, event: dict[str, object]
+) -> None:
+    home, root = cli_paths(tmp_path)
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(
+            '{"kind":"unknown","target_monitor_ids":[],"target_url":null,'
+            '"condition_text":null,"schedule_text":null,"clarification":null,'
+            '"confidence":0}',
+            encoding="utf-8",
+        )
+        return FakeProcess((json.dumps(event) + "\n" + '{"type":"turn.completed"}\n').encode())
+
+    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    with pytest.raises(CodexProtocolError, match="Codex protocol failure"):
+        await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+
+
+@async_test
+@pytest.mark.parametrize(
+    "stdout",
+    [b"not-json\n", b"\xff\n", b"[" + b"[" * 80 + b"]" * 80 + b"]\n"],
+)
+async def test_invalid_stream_is_fixed(tmp_path: Path, stdout: bytes) -> None:
+    home, root = cli_paths(tmp_path)
+
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        return FakeProcess(stdout)
+
+    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    with pytest.raises(CodexProtocolError) as caught:
+        await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert "not-json" not in str(caught.value)
+
+
+@async_test
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "Bearer abcdefghijklmnopqrstuvwxyz",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signaturevalue",
+        "Cookie: session=abcdefghijklmnop",
+        "Authorization: private-value",
+    ],
+)
+async def test_result_secret_scanner_is_recursive(tmp_path: Path, secret: str) -> None:
+    home, root = cli_paths(tmp_path)
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        payload = {
+            "kind": "unknown",
+            "target_monitor_ids": [],
+            "target_url": None,
+            "condition_text": None,
+            "schedule_text": None,
+            "clarification": secret,
+            "confidence": 0.0,
+        }
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
+        return FakeProcess(b'{"type":"turn.completed"}\n')
+
+    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    with pytest.raises(CodexProtocolError) as caught:
+        await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert secret not in str(caught.value)
+
+
+def test_contracts_forbid_extra_and_redact_user_content() -> None:
+    value = request()
+    assert "서울 임대주택" not in repr(value)
+    with pytest.raises(ValidationError):
+        IntentRequest(
+            request_id="r",
+            owner_id="o",
+            message="x",
+            monitor_summaries=[],
+            extra="bad",  # type: ignore[call-arg]
+        )
+    with pytest.raises(ValidationError):
+        WorkerRequest.model_validate(
+            {"kind": "intent", "request": value.model_dump(), "extra": "bad"}
+        )
+
+
+@async_test
+@pytest.mark.parametrize("kind", ["intent", "plan", "repair"])
+async def test_all_three_request_result_pairs_use_fixed_prompts(tmp_path: Path, kind: str) -> None:
+    home, root = cli_paths(tmp_path)
+    intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url="https://example.com/product",
+        condition_text="10만원 이하",
+        schedule_text=None,
+        clarification=None,
+        confidence=0.9,
+    )
+    current = spec()
+    cases = {
+        "intent": (
+            request(),
+            intent,
+            IntentResult,
+        ),
+        "plan": (
+            PlanRequest(
+                request_id="req-2",
+                owner_id="telegram-user:7",
+                message="가격을 감시해줘",
+                intent=intent,
+                sanitized_document="<main><span class=price>90000</span></main>",
+                observed_preview_values=["price=90000"],
+            ),
+            PlanResult(spec=current, explanation="가격 필드를 기준으로 구성했습니다."),
+            PlanResult,
+        ),
+        "repair": (
+            RepairRequest(
+                request_id="req-3",
+                owner_id="telegram-user:7",
+                current_spec=current,
+                validation_failures=["price selector missing"],
+                sanitized_fragment="<span class=amount>90000</span>",
+            ),
+            RepairResult(
+                spec=current,
+                explanation="현재 구성이 유효합니다.",
+                changed_fields=[],
+            ),
+            RepairResult,
+        ),
+    }
+    ai_request, expected, result_type = cases[kind]
+    prompts: list[str] = []
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        prompts.append(argv[-1])
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(expected.model_dump_json(), encoding="utf-8")
+        return FakeProcess(b'{"type":"turn.completed"}\n')
+
+    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    actual = await cli.run(
+        ai_request,
+        result_type.model_json_schema(),
+        "gpt-5.6-terra",
+        "medium",
+    )
+    assert type(actual) is result_type
+    assert len(prompts) == 1
+    assert "JSON" in prompts[0]
+
+
+@async_test
+async def test_stream_overflow_and_result_type_mismatch_cleanup(tmp_path: Path) -> None:
+    home, root = cli_paths(tmp_path)
+    attempts = 0
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        nonlocal attempts
+        attempts += 1
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        if attempts == 1:
+            result_path.write_text("{}", encoding="utf-8")
+            return FakeProcess(b"x" * (1024 * 1024 + 1))
+        result_path.write_text('{"unexpected":"private"}', encoding="utf-8")
+        return FakeProcess(b'{"type":"turn.completed"}\n')
+
+    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    for _ in range(2):
+        with pytest.raises(CodexProtocolError):
+            await cli.run(
+                request(),
+                IntentResult.model_json_schema(),
+                "gpt-5.6-terra",
+                "medium",
+            )
+        assert list(root.iterdir()) == []
