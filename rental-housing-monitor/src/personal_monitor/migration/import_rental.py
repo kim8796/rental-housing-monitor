@@ -9,7 +9,7 @@ import stat
 import tempfile
 import threading
 from collections.abc import Mapping
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -178,6 +178,152 @@ class _FileIdentity:
 
 
 @dataclass(slots=True)
+class _PrivateWorkspace:
+    path: Path
+    identity: _FileIdentity
+    directory_fd: int | None
+    parent_fd: int | None
+    owned: dict[str, _FileIdentity]
+
+    @classmethod
+    def create(cls, *, parent: Path | None, prefix: str) -> _PrivateWorkspace:
+        raw_path = tempfile.mkdtemp(
+            prefix=prefix,
+            dir=None if parent is None else parent,
+        )
+        path = Path(raw_path)
+        parent_fd: int | None = None
+        directory_fd: int | None = None
+        try:
+            parent_fd = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            directory_fd = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            os.fchmod(directory_fd, 0o700)
+            metadata = os.fstat(directory_fd)
+            if not stat.S_ISDIR(metadata.st_mode) or _identity(
+                os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            ) != _identity(metadata):
+                raise RentalImportError("private workspace identity changed")
+            return cls(
+                path=path,
+                identity=_identity(metadata),
+                directory_fd=directory_fd,
+                parent_fd=parent_fd,
+                owned={},
+            )
+        except BaseException:
+            if directory_fd is not None and parent_fd is not None:
+                try:
+                    anchored = os.fstat(directory_fd)
+                    current = os.stat(
+                        path.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISDIR(anchored.st_mode) and _identity(anchored) == _identity(current):
+                        os.rmdir(path.name, dir_fd=parent_fd)
+                except (FileNotFoundError, OSError):
+                    pass
+            if directory_fd is not None:
+                os.close(directory_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+            raise
+
+    def record(
+        self,
+        path: Path,
+        *,
+        expected: _FileIdentity | None = None,
+    ) -> _FileIdentity:
+        directory_fd, _parent_fd = self._descriptors()
+        if path.parent != self.path or path.name in {"", ".", ".."}:
+            raise RentalImportError("private workspace file is invalid")
+        metadata = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        identity = _identity(metadata)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise RentalImportError("private workspace file is invalid")
+        if expected is not None and identity != expected:
+            raise RentalImportError("private workspace file identity changed")
+        previous = self.owned.get(path.name)
+        if previous is not None and previous != identity:
+            raise RentalImportError("private workspace cleanup identity changed")
+        self.owned[path.name] = identity
+        return identity
+
+    def require_owned(self, path: Path, expected: _FileIdentity) -> None:
+        directory_fd, _parent_fd = self._descriptors()
+        if path.parent != self.path or self.owned.get(path.name) != expected:
+            raise RentalImportError("private workspace cleanup identity changed")
+        try:
+            metadata = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            raise RentalImportError("private workspace cleanup identity changed") from None
+        if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != expected:
+            raise RentalImportError("private workspace cleanup identity changed")
+
+    def cleanup(self) -> None:
+        if self.directory_fd is None and self.parent_fd is None:
+            return
+        directory_fd, parent_fd = self._descriptors()
+        try:
+            self._require_directory_binding(directory_fd, parent_fd)
+            names = os.listdir(directory_fd)
+            identities: dict[str, _FileIdentity] = {}
+            for name in names:
+                try:
+                    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    raise RentalImportError("private workspace cleanup identity changed") from None
+                identity = _identity(metadata)
+                if not stat.S_ISREG(metadata.st_mode) or self.owned.get(name) != identity:
+                    raise RentalImportError("private workspace cleanup identity changed")
+                identities[name] = identity
+            self._require_directory_binding(directory_fd, parent_fd)
+            for name, expected in identities.items():
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if _identity(metadata) != expected:
+                    raise RentalImportError("private workspace cleanup identity changed")
+                os.unlink(name, dir_fd=directory_fd)
+            self._require_directory_binding(directory_fd, parent_fd)
+            os.rmdir(self.path.name, dir_fd=parent_fd)
+        finally:
+            os.close(directory_fd)
+            os.close(parent_fd)
+            self.directory_fd = None
+            self.parent_fd = None
+
+    def _descriptors(self) -> tuple[int, int]:
+        if self.directory_fd is None or self.parent_fd is None:
+            raise RentalImportError("private workspace is closed")
+        return self.directory_fd, self.parent_fd
+
+    def _require_directory_binding(self, directory_fd: int, parent_fd: int) -> None:
+        anchored = os.fstat(directory_fd)
+        try:
+            current = os.stat(
+                self.path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            raise RentalImportError("private workspace cleanup identity changed") from None
+        if (
+            not stat.S_ISDIR(anchored.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or _identity(anchored) != self.identity
+            or _identity(current) != self.identity
+        ):
+            raise RentalImportError("private workspace cleanup identity changed")
+
+
+@dataclass(slots=True)
 class _TargetHandle:
     connection: sqlite3.Connection
     anchor_fd: int | None
@@ -185,15 +331,14 @@ class _TargetHandle:
     staging_path: Path | None
     destination: Path
     dry_run: bool
-    snapshot_directory: tempfile.TemporaryDirectory[str] | None = None
+    workspace: _PrivateWorkspace | None = None
 
     def abort(self) -> None:
         try:
             self.connection.close()
         finally:
             self._close_anchor()
-            self._remove_staging()
-            self._remove_snapshot()
+            self._cleanup_workspace()
 
     def finish(self) -> bool:
         """Close safely; return False when a concurrent publisher requires a retry."""
@@ -201,8 +346,7 @@ class _TargetHandle:
             self.connection.close()
         except BaseException:
             self._close_anchor()
-            self._remove_staging()
-            self._remove_snapshot()
+            self._cleanup_workspace()
             raise
         self._close_anchor()
         if self.staging_path is None:
@@ -211,48 +355,38 @@ class _TargetHandle:
                     _require_path_identity(self.destination, self.identity)
                 return True
             finally:
-                self._remove_snapshot()
+                self._cleanup_workspace()
         staging = self.staging_path
         try:
-            metadata = staging.lstat()
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or self.identity is None
-                or _identity(metadata) != self.identity
-            ):
+            if self.workspace is None or self.identity is None:
                 raise RentalImportError("target staging identity changed")
+            self.workspace.require_owned(staging, self.identity)
+            _require_path_identity(staging, self.identity)
+            directory_fd, parent_fd = self.workspace._descriptors()
             try:
-                os.link(staging, self.destination, follow_symlinks=False)
+                os.link(
+                    staging.name,
+                    self.destination.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
             except FileExistsError:
                 return False
             return True
         finally:
-            self._remove_staging()
-            self._remove_snapshot()
+            self._cleanup_workspace()
 
     def _close_anchor(self) -> None:
         if self.anchor_fd is not None:
             os.close(self.anchor_fd)
             self.anchor_fd = None
 
-    def _remove_staging(self) -> None:
-        if self.staging_path is None:
-            return
-        staging = self.staging_path
-        self.staging_path = None
-        for candidate in (
-            staging,
-            Path(f"{staging}-wal"),
-            Path(f"{staging}-shm"),
-            Path(f"{staging}-journal"),
-        ):
-            with suppress(FileNotFoundError):
-                candidate.unlink()
-
-    def _remove_snapshot(self) -> None:
-        if self.snapshot_directory is not None:
-            self.snapshot_directory.cleanup()
-            self.snapshot_directory = None
+    def _cleanup_workspace(self) -> None:
+        if self.workspace is not None:
+            workspace = self.workspace
+            self.workspace = None
+            workspace.cleanup()
 
 
 @dataclass(slots=True)
@@ -462,13 +596,8 @@ def _read_source(path: Path, expected_identity: _FileIdentity) -> _SourceSnapsho
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         if _identity(os.fstat(descriptor)) != expected_identity:
             raise RentalImportError("legacy database identity changed")
-        descriptor_count = _descriptor_identity_count(expected_identity)
         connection = _read_only_connection(path, immutable=True)
-        connection.execute("PRAGMA schema_version").fetchone()
-        if (
-            _identity(path.lstat()) != expected_identity
-            or _descriptor_identity_count(expected_identity) != descriptor_count + 1
-        ):
+        if _identity(path.lstat()) != expected_identity:
             raise RentalImportError("legacy database identity changed")
         connection.execute("BEGIN")
         _validate_source_schema(connection)
@@ -877,16 +1006,21 @@ def _open_target(
     if _identity(metadata) == source_identity:
         raise RentalImportError("source and target must differ")
     if dry_run:
-        snapshot_directory, snapshot_path = _copy_target_snapshot(
+        workspace, snapshot_path = _copy_target_snapshot(
             path,
             expected_identity=_identity(metadata),
         )
-        connection = _read_only_connection(snapshot_path, immutable=False)
+        connection: sqlite3.Connection | None = None
         try:
+            _require_no_rollback_journal(path)
+            connection = _read_only_connection(snapshot_path, immutable=False)
+            _record_sqlite_sidecars(workspace, snapshot_path)
             _validate_existing_schema(connection)
+            _validate_snapshot_integrity(connection)
         except BaseException:
-            connection.close()
-            snapshot_directory.cleanup()
+            if connection is not None:
+                connection.close()
+            workspace.cleanup()
             raise
         return _TargetHandle(
             connection,
@@ -895,18 +1029,21 @@ def _open_target(
             None,
             path,
             True,
-            snapshot_directory,
+            workspace,
         )
     return _open_existing_target(path, source_identity)
 
 
 def _copy_target_snapshot(
     path: Path, *, expected_identity: _FileIdentity
-) -> tuple[tempfile.TemporaryDirectory[str], Path]:
-    temporary = tempfile.TemporaryDirectory(prefix="personal-monitor-dry-run-")
-    snapshot = Path(temporary.name) / "target.sqlite3"
+) -> tuple[_PrivateWorkspace, Path]:
+    workspace = _PrivateWorkspace.create(
+        parent=None,
+        prefix="personal-monitor-dry-run-",
+    )
     try:
-        for _attempt in range(3):
+        for attempt in range(3):
+            snapshot = workspace.path / f"target-{attempt}.sqlite3"
             descriptors = _open_target_snapshot_files(path, expected_identity)
             try:
                 before = {
@@ -917,6 +1054,7 @@ def _copy_target_snapshot(
                     _copy_descriptor_private(
                         descriptor,
                         Path(f"{snapshot}{suffix}"),
+                        workspace,
                     )
                 if _target_snapshot_is_stable(
                     path,
@@ -924,22 +1062,21 @@ def _copy_target_snapshot(
                     descriptors,
                     before,
                 ):
-                    return temporary, snapshot
+                    _require_no_rollback_journal(path)
+                    return workspace, snapshot
             finally:
                 for descriptor in descriptors.values():
                     os.close(descriptor)
-            for suffix in ("", "-wal", "-shm"):
-                with suppress(FileNotFoundError):
-                    Path(f"{snapshot}{suffix}").unlink()
         raise RentalImportError("target database changed during dry-run snapshot")
     except BaseException:
-        temporary.cleanup()
+        workspace.cleanup()
         raise
 
 
 def _open_target_snapshot_files(path: Path, expected_identity: _FileIdentity) -> dict[str, int]:
     descriptors: dict[str, int] = {}
     try:
+        _require_no_rollback_journal(path)
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{path}{suffix}")
             try:
@@ -965,13 +1102,18 @@ def _open_target_snapshot_files(path: Path, expected_identity: _FileIdentity) ->
         raise
 
 
-def _copy_descriptor_private(descriptor: int, destination: Path) -> None:
+def _copy_descriptor_private(
+    descriptor: int,
+    destination: Path,
+    workspace: _PrivateWorkspace,
+) -> None:
     destination_fd = os.open(
         destination,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
         0o600,
     )
     try:
+        workspace.record(destination, expected=_identity(os.fstat(destination_fd)))
         os.lseek(descriptor, 0, os.SEEK_SET)
         with (
             os.fdopen(os.dup(descriptor), "rb") as source,
@@ -992,7 +1134,9 @@ def _target_snapshot_is_stable(
 ) -> bool:
     expected_suffixes = set(descriptors)
     actual_suffixes = {
-        suffix for suffix in ("", "-wal", "-shm") if Path(f"{path}{suffix}").exists()
+        suffix
+        for suffix in ("", "-wal", "-shm", "-journal")
+        if _path_entry_exists(Path(f"{path}{suffix}"))
     }
     if actual_suffixes != expected_suffixes:
         return False
@@ -1011,6 +1155,30 @@ def _target_snapshot_is_stable(
         if _stat_fingerprint(os.fstat(descriptor)) != before[suffix]:
             return False
     return True
+
+
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _require_no_rollback_journal(path: Path) -> None:
+    if _path_entry_exists(Path(f"{path}-journal")):
+        raise RentalImportError("target database has rollback journal")
+
+
+def _validate_snapshot_integrity(connection: sqlite3.Connection) -> None:
+    journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+    if journal_mode is None or str(journal_mode[0]).lower() != "wal":
+        raise RentalImportError("target database is not in WAL mode")
+    integrity = connection.execute("PRAGMA integrity_check(100)").fetchall()
+    if len(integrity) != 1 or integrity[0][0] != "ok":
+        raise RentalImportError("target database integrity check failed")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise RentalImportError("target database integrity check failed")
 
 
 def _stat_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -1043,29 +1211,40 @@ def _digest_path(path: Path) -> bytes:
 def _open_staged_target(destination: Path, source_identity: _FileIdentity) -> _TargetHandle:
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _reject_symlink_components(destination.parent)
-    descriptor, raw_staging = tempfile.mkstemp(
+    workspace = _PrivateWorkspace.create(
+        parent=destination.parent,
         prefix=".personal-monitor-import-",
-        suffix=".sqlite3",
-        dir=destination.parent,
     )
-    staging = Path(raw_staging)
-    os.fchmod(descriptor, 0o600)
+    staging = workspace.path / "target.sqlite3"
+    descriptor: int | None = None
     try:
+        descriptor = os.open(
+            staging,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
         identity = _verified_regular_identity(descriptor, source_identity)
+        workspace.record(staging, expected=identity)
         connection = _connect_verified_writable(
             staging,
             anchor_fd=descriptor,
             expected_identity=identity,
             source_identity=source_identity,
+            expected_empty=True,
         )
         try:
             _before_target_schema_write(staging)
             _require_path_identity(staging, identity)
+            connection.execute("PRAGMA query_only = OFF")
             _configure_connection(connection)
             _require_path_identity(staging, identity)
             _apply_migrations(connection)
+            _record_sqlite_sidecars(workspace, staging)
         except BaseException:
-            connection.close()
+            try:
+                _record_sqlite_sidecars(workspace, staging)
+            finally:
+                connection.close()
             raise
         return _TargetHandle(
             connection,
@@ -1074,10 +1253,12 @@ def _open_staged_target(destination: Path, source_identity: _FileIdentity) -> _T
             staging,
             destination,
             False,
+            workspace,
         )
     except BaseException:
-        os.close(descriptor)
-        _remove_database_files(staging)
+        if descriptor is not None:
+            os.close(descriptor)
+        workspace.cleanup()
         raise
 
 
@@ -1090,10 +1271,12 @@ def _open_existing_target(path: Path, source_identity: _FileIdentity) -> _Target
             anchor_fd=descriptor,
             expected_identity=identity,
             source_identity=source_identity,
+            expected_empty=False,
         )
         try:
             _before_target_schema_write(path)
             _require_path_identity(path, identity)
+            connection.execute("PRAGMA query_only = OFF")
             _configure_connection(connection)
             _require_path_identity(path, identity)
             _apply_migrations(connection)
@@ -1104,6 +1287,27 @@ def _open_existing_target(path: Path, source_identity: _FileIdentity) -> _Target
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _record_sqlite_sidecars(workspace: _PrivateWorkspace, path: Path) -> None:
+    directory_fd, _parent_fd = workspace._descriptors()
+    for suffix in ("-wal", "-shm"):
+        candidate = Path(f"{path}{suffix}")
+        try:
+            descriptor = os.open(
+                candidate.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            continue
+        try:
+            workspace.record(
+                candidate,
+                expected=_identity(os.fstat(descriptor)),
+            )
+        finally:
+            os.close(descriptor)
 
 
 def _verified_regular_identity(descriptor: int, source_identity: _FileIdentity) -> _FileIdentity:
@@ -1133,13 +1337,18 @@ def _connect_verified_writable(
     anchor_fd: int,
     expected_identity: _FileIdentity,
     source_identity: _FileIdentity,
+    expected_empty: bool,
 ) -> sqlite3.Connection:
-    expected_before = _descriptor_identity_count(expected_identity)
-    source_before = _descriptor_identity_count(source_identity)
     uri = f"file:{quote(os.fspath(path), safe='/')}?mode=rw"
     connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+    connection.row_factory = sqlite3.Row
     try:
-        connection.execute("PRAGMA schema_version").fetchone()
+        connection.execute("PRAGMA query_only = ON")
+        if expected_empty:
+            if connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone() is not None:
+                raise RentalImportError("target staging database is not empty")
+        else:
+            _validate_existing_schema(connection)
         anchored = _identity(os.fstat(anchor_fd))
         try:
             current = _identity(path.lstat())
@@ -1148,43 +1357,13 @@ def _connect_verified_writable(
         if (
             anchored != expected_identity
             or current != expected_identity
-            or _descriptor_identity_count(expected_identity) != expected_before + 1
-            or _descriptor_identity_count(source_identity) != source_before
+            or anchored == source_identity
         ):
             raise RentalImportError("target connection identity changed")
         return connection
     except BaseException:
         connection.close()
         raise
-
-
-def _descriptor_identity_count(identity: _FileIdentity) -> int:
-    root = Path("/dev/fd")
-    try:
-        count = 0
-        for entry in root.iterdir():
-            if not entry.name.isascii() or not entry.name.isdigit():
-                continue
-            try:
-                metadata = os.fstat(int(entry.name))
-            except OSError:
-                continue
-            if stat.S_ISREG(metadata.st_mode) and _identity(metadata) == identity:
-                count += 1
-        return count
-    except OSError:
-        raise RentalImportError("target connection identity unavailable") from None
-
-
-def _remove_database_files(path: Path) -> None:
-    for candidate in (
-        path,
-        Path(f"{path}-wal"),
-        Path(f"{path}-shm"),
-        Path(f"{path}-journal"),
-    ):
-        with suppress(FileNotFoundError):
-            candidate.unlink()
 
 
 def _rental_spec(owner_id: str) -> MonitorSpec:

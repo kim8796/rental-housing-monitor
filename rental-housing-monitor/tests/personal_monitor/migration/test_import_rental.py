@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
@@ -739,16 +740,16 @@ def test_dry_run_snapshot_is_private_and_unstable_copy_fails_closed(
     _create_legacy(old_path).close()
     import_rental_state(old_path, new_path, OWNER, TARGET)
     identity = module._identity(new_path.lstat())
-    temporary, snapshot = module._copy_target_snapshot(
+    workspace, snapshot = module._copy_target_snapshot(
         new_path,
         expected_identity=identity,
     )
-    temporary_path = Path(temporary.name)
+    temporary_path = workspace.path
     try:
         assert stat.S_IMODE(temporary_path.lstat().st_mode) == 0o700
         assert stat.S_IMODE(snapshot.lstat().st_mode) == 0o600
     finally:
-        temporary.cleanup()
+        workspace.cleanup()
     assert not temporary_path.exists()
     target_before = new_path.read_bytes()
     monkeypatch.setattr(
@@ -761,6 +762,100 @@ def test_dry_run_snapshot_is_private_and_unstable_copy_fails_closed(
         import_rental_state(old_path, new_path, OWNER, TARGET, dry_run=True)
 
     assert new_path.read_bytes() == target_before
+
+
+@pytest.mark.parametrize("replaced_name", ("target.sqlite3", "target.sqlite3-wal"))
+def test_private_workspace_cleanup_never_unlinks_replaced_owned_inode(
+    tmp_path: Path,
+    replaced_name: str,
+) -> None:
+    import personal_monitor.migration.import_rental as module
+
+    workspace = module._PrivateWorkspace.create(
+        parent=tmp_path,
+        prefix=".cleanup-proof-",
+    )
+    owned = workspace.path / replaced_name
+    descriptor = os.open(owned, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    workspace.record(owned)
+    owned.unlink()
+    owned.write_bytes(b"replacement")
+
+    with pytest.raises(RuntimeError, match="cleanup identity"):
+        workspace.cleanup()
+
+    assert owned.read_bytes() == b"replacement"
+    owned.unlink()
+    workspace.path.rmdir()
+
+
+def test_dry_run_rejects_live_rollback_journal_without_mutation(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    writer = sqlite3.connect(new_path, isolation_level=None)
+    assert writer.execute("PRAGMA journal_mode = DELETE").fetchone()[0] == "delete"
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "UPDATE delivery_targets SET address = 'rollback-pending' WHERE id = ?",
+        (TARGET,),
+    )
+    journal = Path(f"{new_path}-journal")
+    assert journal.exists()
+    before = (new_path.read_bytes(), journal.read_bytes())
+    try:
+        with pytest.raises(RuntimeError, match="rollback journal"):
+            import_rental_state(old_path, new_path, OWNER, TARGET, dry_run=True)
+        assert (new_path.read_bytes(), journal.read_bytes()) == before
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_dry_run_rejects_closed_non_wal_target(tmp_path: Path) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    with sqlite3.connect(new_path, isolation_level=None) as connection:
+        assert connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0] == "delete"
+    before = new_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="WAL mode"):
+        import_rental_state(old_path, new_path, OWNER, TARGET, dry_run=True)
+
+    assert new_path.read_bytes() == before
+
+
+def test_dry_run_fails_closed_when_rollback_journal_appears_during_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import personal_monitor.migration.import_rental as module
+
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    _create_legacy(old_path).close()
+    import_rental_state(old_path, new_path, OWNER, TARGET)
+    before = new_path.read_bytes()
+    journal = Path(f"{new_path}-journal")
+    original_stable = module._target_snapshot_is_stable
+
+    def create_journal_then_check(*args, **kwargs) -> bool:
+        journal.write_bytes(b"appeared")
+        return original_stable(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_target_snapshot_is_stable", create_journal_then_check)
+
+    with pytest.raises(RuntimeError, match="rollback journal"):
+        import_rental_state(old_path, new_path, OWNER, TARGET, dry_run=True)
+
+    assert new_path.read_bytes() == before
+    assert journal.read_bytes() == b"appeared"
 
 
 def test_generated_legacy_column_is_rejected_even_when_table_info_hides_it(
