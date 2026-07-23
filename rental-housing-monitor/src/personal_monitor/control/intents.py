@@ -291,7 +291,13 @@ def _looks_like_command(value: object) -> bool:
     if normalized.startswith("/"):
         return True
     name = unicodedata.name(prefix, "")
-    return any(token in name for token in ("SLASH", "SOLIDUS", "DIAGONAL"))
+    if "SLASH" in name or "SOLIDUS" in name:
+        return True
+    category = unicodedata.category(prefix)
+    return (
+        category == "Sm"
+        and name in {"MATHEMATICAL RISING DIAGONAL", "MATHEMATICAL FALLING DIAGONAL"}
+    ) or (category == "So" and name.startswith("BOX DRAWINGS") and "DIAGONAL" in name)
 
 
 def _action(

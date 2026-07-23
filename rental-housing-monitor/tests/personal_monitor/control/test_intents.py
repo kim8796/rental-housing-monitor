@@ -175,6 +175,19 @@ def test_unicode_slash_lookalikes_never_reach_dependencies(prefix: str) -> None:
     assert worker.calls == []
 
 
+@pytest.mark.parametrize("text", ["🫤 요즘 어때?", "▩ 이 표시는 뭐야?", "⛞ 상태 알려줘"])
+def test_unrelated_diagonal_named_symbols_remain_natural_language(text: str) -> None:
+    output = _result(IntentKind.UNKNOWN, clarification="어떤 요청인지 알려주세요")
+    router, provider, worker = _router([output])
+
+    result = run(router.route(REQUEST(text)))
+
+    assert result.clarification == output.clarification
+    assert provider.calls == [OWNER]
+    assert len(worker.calls) == 1
+    assert worker.calls[0][0].message == text
+
+
 def test_unknown_or_unowned_exact_command_target_does_not_guess() -> None:
     router, provider, worker = _router([])
 
