@@ -31,6 +31,7 @@ from personal_monitor.security.robots import RobotsDecision
 from personal_monitor.security.url_policy import PolicyError, ResolvedTarget
 from personal_monitor.storage import open_database
 from personal_monitor.telegram.gateway import ControlRequest
+from tests.credential_alias_cases import SENSITIVE_ASSIGNMENTS
 
 OWNER = "telegram-user:7"
 NOW = datetime(2026, 7, 23, tzinfo=UTC)
@@ -831,6 +832,7 @@ def test_broad_jwt_is_redacted_from_worker_sanitized_document(
         "signature: supersecretvalue",
         "key=supersecretvalue",
         "`authorization`: `supersecretvalue`",
+        *SENSITIVE_ASSIGNMENTS,
     ),
 )
 def test_quoted_assignment_is_fully_hidden_from_worker_message_and_document(

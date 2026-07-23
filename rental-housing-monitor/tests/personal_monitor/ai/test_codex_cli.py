@@ -23,6 +23,7 @@ from personal_monitor.ai.contracts import (
     WorkerRequest,
 )
 from personal_monitor.domain.spec import MonitorSpec
+from tests.credential_alias_cases import SENSITIVE_ASSIGNMENTS
 
 
 def async_test(function):
@@ -54,6 +55,7 @@ QUOTED_ASSIGNMENTS = (
     "signature: supersecretvalue",
     "key=supersecretvalue",
     "`authorization`: `supersecretvalue`",
+    *SENSITIVE_ASSIGNMENTS,
 )
 
 

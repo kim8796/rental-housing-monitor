@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pytest
 
@@ -20,6 +21,10 @@ from personal_monitor.security.encryption import AesGcmCipher, EncryptedBlob
 from personal_monitor.security.sanitize import sanitize_for_ai
 from personal_monitor.security.url_policy import UrlPolicy
 from personal_monitor.storage import RecoveryRepository, RegistryRepository, open_database
+from tests.credential_alias_cases import (
+    BENIGN_CREDENTIAL_LIKE_KEYS,
+    SENSITIVE_KEY_VARIANTS,
+)
 
 pytestmark = [
     pytest.mark.filterwarnings("ignore:The 'strip_cdata' option.*:DeprecationWarning"),
@@ -983,6 +988,53 @@ def test_recovery_candidate_freezes_caps_and_redacts_nested_values() -> None:
     assert "credential-secret" not in representation
     assert "token-secret" not in representation
     assert "x" * 100 not in representation
+
+
+@pytest.mark.parametrize("key", SENSITIVE_KEY_VARIANTS)
+def test_recovery_candidate_removes_every_credential_field_key_variant(key: str) -> None:
+    from personal_monitor.scraping.recovery import RecoveryCandidate
+
+    candidate = RecoveryCandidate(
+        version_id="version-id",
+        validation_passed=True,
+        field_changes={key: ".safe"},
+        preview_items=[{key: "supersecretvalue"}],
+    )
+
+    assert candidate.field_changes == {}
+    assert candidate.preview_items == ({},)
+    assert "supersecretvalue" not in repr(candidate)
+
+
+@pytest.mark.parametrize("key", SENSITIVE_KEY_VARIANTS)
+def test_recovery_candidate_removes_urls_with_every_credential_query_variant(key: str) -> None:
+    from personal_monitor.scraping.recovery import RecoveryCandidate
+
+    secret_url = f"https://example.com/path?{quote_plus(key)}=supersecretvalue"
+    candidate = RecoveryCandidate(
+        version_id="version-id",
+        validation_passed=True,
+        field_changes={},
+        preview_items=[{"safe": secret_url}],
+    )
+
+    assert candidate.preview_items == ({},)
+    assert "supersecretvalue" not in repr(candidate)
+
+
+@pytest.mark.parametrize("key", BENIGN_CREDENTIAL_LIKE_KEYS)
+def test_recovery_candidate_preserves_noncanonical_field_keys(key: str) -> None:
+    from personal_monitor.scraping.recovery import RecoveryCandidate
+
+    candidate = RecoveryCandidate(
+        version_id="version-id",
+        validation_passed=True,
+        field_changes={key: ".safe"},
+        preview_items=[{key: "ordinary"}],
+    )
+
+    assert candidate.field_changes == {key: ".safe"}
+    assert candidate.preview_items == ({key: "ordinary"},)
 
 
 def test_recovery_requires_an_explicit_scrapling_storage_dependency(

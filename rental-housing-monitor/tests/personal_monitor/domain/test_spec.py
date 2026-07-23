@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from urllib.parse import quote_plus
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +13,10 @@ from personal_monitor.domain.spec import (
     MonitorSpec,
     RuleSpec,
     ValidatorSpec,
+)
+from tests.credential_alias_cases import (
+    BENIGN_CREDENTIAL_LIKE_KEYS,
+    SENSITIVE_KEY_VARIANTS,
 )
 
 
@@ -181,6 +186,10 @@ def test_rule_spec_arguments_must_match_kind(payload: dict[str, object], valid: 
         "https://example.com/listing?credentials=secret",
         "https://example.com/listing?signature=secret",
         "https://example.com/listing?key=secret",
+        *(
+            f"https://example.com/listing?{quote_plus(name)}=secret"
+            for name in SENSITIVE_KEY_VARIANTS
+        ),
     ],
 )
 def test_monitor_spec_rejects_unsafe_target_urls(url: str) -> None:
@@ -189,8 +198,10 @@ def test_monitor_spec_rejects_unsafe_target_urls(url: str) -> None:
         MonitorSpec.model_validate(payload)
 
 
-def test_monitor_spec_allows_ordinary_target_url_query_parameters() -> None:
-    payload = valid_spec() | {"target_url": "https://example.com/listing?page=2&sort=price"}
+@pytest.mark.parametrize("key", ("page", "sort", *BENIGN_CREDENTIAL_LIKE_KEYS))
+def test_monitor_spec_allows_ordinary_target_url_query_parameters(key: str) -> None:
+    url = f"https://example.com/listing?{quote_plus(key)}=ordinary"
+    payload = valid_spec() | {"target_url": url}
     assert MonitorSpec.model_validate(payload).target_url == payload["target_url"]
 
 

@@ -3,7 +3,10 @@ from __future__ import annotations
 import re
 from typing import Final
 
-from personal_monitor.security.credential_names import SENSITIVE_CREDENTIAL_NAMES
+from personal_monitor.security.credential_names import (
+    SENSITIVE_CREDENTIAL_NAMES,
+    is_sensitive_credential_name,
+)
 
 _REDACTION: Final = "[숨김]"
 _TOKEN_PATTERNS: Final = (
@@ -15,19 +18,19 @@ _SENSITIVE_KEY: Final = (
     "(?:"
     + "|".join(
         sorted(
-            (re.escape(name).replace("_", "[-_]") for name in SENSITIVE_CREDENTIAL_NAMES),
+            (re.escape(name).replace("_", "[-_]?") for name in SENSITIVE_CREDENTIAL_NAMES),
             key=lambda value: (-len(value), value),
         )
     )
     + ")"
 )
 _ASSIGNMENT: Final = re.compile(
-    rf"""(?<![A-Za-z0-9_-])["'`]?{_SENSITIVE_KEY}["'`]?"""
+    rf"""(?:^|[\s{{\[(,;])(?P<key_quote>["'`]?)\s*{_SENSITIVE_KEY}"""
+    r"\s*(?P=key_quote)"
     r"\s*[:=]\s*"
     r"""(?:"[^"\r\n]|'[^'\r\n]|`[^`\r\n]|[^\s<>"'`])""",
     re.IGNORECASE,
 )
-_KEY_ONLY: Final = re.compile(rf"^{_SENSITIVE_KEY}$", re.IGNORECASE)
 
 
 def contains_sensitive_text(value: str) -> bool:
@@ -35,7 +38,7 @@ def contains_sensitive_text(value: str) -> bool:
         return True
     return (
         _ASSIGNMENT.search(value) is not None
-        or _KEY_ONLY.fullmatch(value) is not None
+        or is_sensitive_credential_name(value)
         or any(pattern.search(value) is not None for pattern in _TOKEN_PATTERNS)
     )
 

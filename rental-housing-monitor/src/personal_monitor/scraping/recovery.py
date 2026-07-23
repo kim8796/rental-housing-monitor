@@ -39,9 +39,6 @@ MAX_PREVIEW_TEXT = 160
 MAX_SELECTOR_LENGTH = 500
 _HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 _ADAPTIVE_FAILURES = frozenset({ErrorClass.STRUCTURE, ErrorClass.VALIDATION})
-_SENSITIVE_FIELD = re.compile(
-    r"(?:auth|cookie|credential|key|pass(?:word|wd)?|secret|session|token)", re.IGNORECASE
-)
 _SAFE_SELECTOR_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 
 
@@ -84,7 +81,7 @@ class RecoveryCandidate:
         for name, selector in sorted(self.field_changes.items())[:MAX_FIELD_CHANGES]:
             if not isinstance(name, str) or not isinstance(selector, str):
                 raise TypeError("candidate field changes are invalid")
-            if _unsafe_text(selector, ()):
+            if is_sensitive_credential_name(name) or _unsafe_text(selector, ()):
                 continue
             changes[name[:64]] = selector[:MAX_SELECTOR_LENGTH]
         previews: list[Mapping[str, Scalar]] = []
@@ -95,7 +92,7 @@ class RecoveryCandidate:
             for name, value in sorted(item.items()):
                 if len(bounded) >= MAX_PREVIEW_FIELDS:
                     break
-                if not isinstance(name, str) or _SENSITIVE_FIELD.search(name):
+                if not isinstance(name, str) or is_sensitive_credential_name(name):
                     continue
                 if not isinstance(value, str | int | float | bool) or value is None:
                     continue
@@ -650,7 +647,7 @@ def _preview(items: Sequence[ObservedItem], secrets: tuple[str, ...]) -> list[Ma
     for item in items[:MAX_PREVIEW_ITEMS]:
         values: dict[str, Scalar] = {}
         for name, value in item.fields.items():
-            if _SENSITIVE_FIELD.search(name):
+            if is_sensitive_credential_name(name):
                 continue
             values[name] = _sanitize_preview_value(value, secrets)
         previews.append(values)

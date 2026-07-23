@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pytest
 
@@ -10,6 +11,10 @@ from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.extractor import DeclarativeExtractor
 from personal_monitor.scraping.normalizers import normalize_url
+from tests.credential_alias_cases import (
+    BENIGN_CREDENTIAL_LIKE_KEYS,
+    SENSITIVE_KEY_VARIANTS,
+)
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "personal_monitor"
 pytestmark = pytest.mark.filterwarnings("ignore:The 'strip_cdata' option.*:DeprecationWarning")
@@ -641,6 +646,23 @@ def test_url_normalization_reuses_strict_host_and_character_policy() -> None:
 
 def test_url_normalization_accepts_a_blank_query_value_deterministically() -> None:
     assert normalize_url("https://example.com/path?flag") == "https://example.com/path?flag="
+
+
+@pytest.mark.parametrize("key", SENSITIVE_KEY_VARIANTS)
+def test_url_normalization_rejects_every_credential_query_variant(key: str) -> None:
+    url = f"https://example.com/path?{quote_plus(key)}=supersecretvalue"
+
+    with pytest.raises(MonitorError):
+        normalize_url(url)
+
+
+@pytest.mark.parametrize("key", BENIGN_CREDENTIAL_LIKE_KEYS)
+def test_url_normalization_preserves_noncanonical_query_keys(key: str) -> None:
+    encoded = quote_plus(key)
+
+    assert normalize_url(f"https://example.com/path?{encoded}=ordinary") == (
+        f"https://example.com/path?{encoded}=ordinary"
+    )
 
 
 def test_url_normalization_maps_a_malformed_base_to_a_safe_error() -> None:

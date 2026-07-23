@@ -6,6 +6,11 @@ from personal_monitor.security.secret_text import (
     contains_sensitive_text,
     redact_sensitive_text,
 )
+from tests.credential_alias_cases import (
+    BENIGN_CREDENTIAL_LIKE_KEYS,
+    EXACT_BOUNDARY_ASSIGNMENTS,
+    SENSITIVE_ASSIGNMENTS,
+)
 
 QUOTED_ASSIGNMENTS = (
     'authorization: "supersecretvalue"',
@@ -21,6 +26,7 @@ QUOTED_ASSIGNMENTS = (
     "signature: supersecretvalue",
     "key=supersecretvalue",
     "`authorization`: `supersecretvalue`",
+    *EXACT_BOUNDARY_ASSIGNMENTS,
 )
 
 
@@ -64,3 +70,17 @@ def test_assignment_detection_has_no_whitespace_length_bypass() -> None:
 )
 def test_contains_if_and_only_if_redaction_hides_entire_string(value: str) -> None:
     assert contains_sensitive_text(value) is (redact_sensitive_text(value) == "[숨김]")
+
+
+@pytest.mark.parametrize("value", SENSITIVE_ASSIGNMENTS)
+def test_every_canonical_assignment_variant_is_fully_redacted(value: str) -> None:
+    assert contains_sensitive_text(value)
+    assert redact_sensitive_text(value) == "[숨김]"
+
+
+@pytest.mark.parametrize("key", BENIGN_CREDENTIAL_LIKE_KEYS)
+def test_noncanonical_assignment_keys_are_not_redacted(key: str) -> None:
+    value = f"{key}=ordinaryvalue"
+
+    assert not contains_sensitive_text(value)
+    assert redact_sensitive_text(value) == value
