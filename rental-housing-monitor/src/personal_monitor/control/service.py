@@ -23,7 +23,7 @@ from personal_monitor.control.planner import (
     update_scope_is_valid,
 )
 from personal_monitor.control.preview import render_preview
-from personal_monitor.domain.spec import MonitorStatus
+from personal_monitor.domain.spec import MonitorStatus, RuleKind, RuleSpec
 from personal_monitor.storage.registry import ControlMonitor, RegistryRepository
 from personal_monitor.storage.schema import canonical_json, transaction, utc_now
 from personal_monitor.telegram.gateway import ControlRequest
@@ -77,6 +77,7 @@ class ControlService:
             route = intent_router.route
             propose = planner.propose
             plan_update = getattr(planner, "plan_update", None)
+            planner_actions = planner.action_service
             claim = actions.claim
             registry_methods = tuple(
                 (name, getattr(registry, name))
@@ -96,7 +97,12 @@ class ControlService:
                 for name in ("_integrity_ok", "claim", "create", "revoke")
             )
             now_call = _capture_callable(now_source)
-            if not callable(route) or not callable(propose) or not callable(claim):
+            if (
+                not callable(route)
+                or not callable(propose)
+                or not callable(claim)
+                or planner_actions is not actions
+            ):
                 raise TypeError
             if not all(callable(method) for _, method in (*registry_methods, *actions_methods)):
                 raise TypeError
@@ -130,6 +136,12 @@ class ControlService:
 
     def __repr__(self) -> str:
         return "<ControlService redacted>"
+
+    @property
+    def action_service(self) -> PendingActionService:
+        if not self._integrity_ok():
+            raise ValueError("invalid control service composition")
+        return self._actions_anchor
 
     async def route(self, value: ControlRequest | ConsumedAction) -> ControlReply:
         return await self.handle(value)
@@ -304,10 +316,12 @@ class ControlService:
                         f"{safe_plain(fresh_spec.schedule, limit=80)}"
                     )
                 if current.spec.rules != fresh_spec.rules:
-                    kinds = ", ".join(sorted({rule.kind.value for rule in fresh_spec.rules}))
                     lines.append(
-                        f"조건 변경: {len(current.spec.rules)}개 → {len(fresh_spec.rules)}개 "
-                        f"(종류: {safe_plain(kinds, limit=120)})"
+                        f"조건 변경: {len(current.spec.rules)}개 → {len(fresh_spec.rules)}개"
+                    )
+                    lines.extend(
+                        _rule_summary(rule, index)
+                        for index, rule in enumerate(fresh_spec.rules, start=1)
                     )
                 lines.extend(
                     (
@@ -591,6 +605,7 @@ class ControlService:
                 and self._now_source is self._now_source_anchor
                 and self._registry_anchor.connection is self._connection_anchor
                 and self._actions_anchor.connection is self._connection_anchor
+                and self._planner_anchor.action_service is self._actions_anchor
                 and self._actions_anchor._integrity_ok()
                 and _callable_still_attached(self._route_anchor, self._router_anchor, "route")
                 and _callable_still_attached(
@@ -777,6 +792,29 @@ def _status_lines(monitor: ControlMonitor, *, prefix: str = "") -> list[str]:
         lines.append("일반 알림은 검토가 끝날 때까지 일시정지됩니다.")
     lines.append("사용자 작업: 상태 변경이나 삭제를 요청할 수 있습니다.")
     return lines
+
+
+_RULE_KIND_LABELS: Final = {
+    RuleKind.NEW_ITEM: "새 항목",
+    RuleKind.FIELD_CHANGED: "필드 변경",
+    RuleKind.NUMERIC_THRESHOLD: "숫자 임계값",
+    RuleKind.STATUS_EQUALS: "상태 일치",
+    RuleKind.KEYWORD_MATCH: "키워드 일치",
+}
+
+
+def _rule_summary(rule: RuleSpec, index: int) -> str:
+    parts = [f"조건 {index}: 종류={_RULE_KIND_LABELS[rule.kind]}"]
+    if rule.field is not None:
+        parts.append(f"필드={safe_plain(rule.field, limit=80)}")
+    if rule.operator is not None:
+        parts.append(f"연산자={safe_plain(rule.operator, limit=20)}")
+    if rule.value is not None:
+        parts.append(f"값={safe_plain(str(rule.value), limit=300)}")
+    if rule.keywords:
+        keywords = ", ".join(safe_plain(keyword, limit=120) for keyword in rule.keywords)
+        parts.append(f"키워드={keywords}")
+    return ", ".join(parts)
 
 
 def _bounded_reply(lines: list[str]) -> ControlReply:

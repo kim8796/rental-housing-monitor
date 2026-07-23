@@ -46,7 +46,8 @@ class FakeApi:
 
 
 class FakeRouter:
-    def __init__(self) -> None:
+    def __init__(self, action_service: PendingActionService) -> None:
+        self.action_service = action_service
         self.calls: list[object] = []
         self.error: BaseException | None = None
 
@@ -66,8 +67,13 @@ class ReplyRouter(FakeRouter):
 
 
 class CountingProtocolBoundary:
-    def __init__(self, attribute: str) -> None:
+    def __init__(
+        self,
+        attribute: str,
+        action_service: PendingActionService | None = None,
+    ) -> None:
         self.attribute = attribute
+        self.action_service = action_service
         self.accesses = 0
         self.call = AsyncMock()
         self.send_call = AsyncMock(return_value="88")
@@ -100,7 +106,7 @@ def gateway_parts() -> tuple[
 ]:
     connection = _connection()
     actions = PendingActionService(connection)
-    router = FakeRouter()
+    router = FakeRouter(actions)
     api = FakeApi()
     gateway = TelegramGateway(
         allowed_user_id=7,
@@ -165,7 +171,7 @@ def test_authorized_natural_language_routes_exactly_once_with_redacted_request(
 def test_gateway_sends_validated_reply_for_messages_and_confirmed_callbacks() -> None:
     connection = _connection()
     actions = PendingActionService(connection)
-    router = ReplyRouter()
+    router = ReplyRouter(actions)
     api = FakeApi()
     gateway = TelegramGateway(7, 42, router, actions, api)
 
@@ -187,7 +193,7 @@ def test_gateway_requires_send_message_at_construction() -> None:
     api = SimpleNamespace(answer_callback=AsyncMock())
 
     with pytest.raises(ValueError, match="invalid Telegram gateway configuration"):
-        TelegramGateway(7, 42, FakeRouter(), actions, api)
+        TelegramGateway(7, 42, FakeRouter(actions), actions, api)
 
     connection.close()
 
@@ -200,7 +206,7 @@ def test_confirm_delivery_failure_gets_one_truthful_alert_after_consumption() ->
     connection = _connection()
     actions = PendingActionService(connection)
     api = FailingSendApi()
-    gateway = TelegramGateway(7, 42, ReplyRouter(), actions, api)
+    gateway = TelegramGateway(7, 42, ReplyRouter(actions), actions, api)
     pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
 
     run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
@@ -210,10 +216,78 @@ def test_confirm_delivery_failure_gets_one_truthful_alert_after_consumption() ->
     connection.close()
 
 
+def test_custom_base_exception_from_router_discards_receipt_and_alerts_once() -> None:
+    class FatalRoute(BaseException):
+        pass
+
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = FakeRouter(actions)
+    router.error = FatalRoute("router-secret")
+    api = FakeApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+
+    assert len(router.calls) == 1
+    assert actions.claim(router.calls[0]) is False
+    assert api.answers == [("cb-1", "결과 전달에 실패했습니다. 모니터 상태를 확인해 주세요.", True)]
+    connection.close()
+
+
+def test_custom_base_exception_from_send_after_claim_alerts_once() -> None:
+    class FatalSend(BaseException):
+        pass
+
+    class ClaimingRouter:
+        def __init__(self, actions: PendingActionService) -> None:
+            self.actions = actions
+            self.action_service = actions
+            self.seen: object | None = None
+
+        async def route(self, value: object) -> ControlReply:
+            self.seen = value
+            assert self.actions.claim(value)
+            return ControlReply("상태 변경 완료")
+
+    class FatalSendApi(FakeApi):
+        async def send_message(self, *args: object, **kwargs: object) -> str:
+            raise FatalSend("send-secret")
+
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = ClaimingRouter(actions)
+    api = FatalSendApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+
+    assert router.seen is not None
+    assert actions.claim(router.seen) is False
+    assert api.answers == [("cb-1", "결과 전달에 실패했습니다. 모니터 상태를 확인해 주세요.", True)]
+    connection.close()
+
+
+def test_gateway_rejects_router_bound_to_different_action_service() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    other = PendingActionService(connection)
+    router = FakeRouter(other)
+    router.action_service = other
+
+    with pytest.raises(ValueError, match="invalid Telegram gateway configuration"):
+        TelegramGateway(7, 42, router, actions, FakeApi())
+
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    connection.close()
+
+
 def test_edit_callback_is_requester_bound_single_use_and_dispatched_without_confirmation() -> None:
     connection = _connection()
     actions = PendingActionService(connection)
-    router = ReplyRouter()
+    router = ReplyRouter(actions)
     api = FakeApi()
     gateway = TelegramGateway(7, 42, router, actions, api)
     pending = actions.create(OWNER, "update", {"owner_id": OWNER}, now=NOW)
@@ -431,11 +505,10 @@ def test_router_cancellation_is_preserved_and_action_stays_consumed(gateway_part
 def test_same_token_confirmation_race_dispatches_exactly_once(tmp_path: Path) -> None:
     path = tmp_path / "gateway-actions.db"
     setup_connection = _connection(path)
-    pending = PendingActionService(setup_connection).create(
-        OWNER, "delete", {"monitor_id": "m1"}, now=NOW
-    )
+    setup_actions = PendingActionService(setup_connection)
+    pending = setup_actions.create(OWNER, "delete", {"monitor_id": "m1"}, now=NOW)
+    first_router, second_router = FakeRouter(setup_actions), FakeRouter(setup_actions)
     setup_connection.close()
-    first_router, second_router = FakeRouter(), FakeRouter()
     first_api, second_api = FakeApi(), FakeApi()
     boundaries = ((first_router, first_api), (second_router, second_api))
     barrier = Barrier(2)
@@ -444,7 +517,9 @@ def test_same_token_confirmation_race_dispatches_exactly_once(tmp_path: Path) ->
         connection = open_database(path)
         try:
             router, api = boundary
-            gateway = TelegramGateway(7, 42, router, PendingActionService(connection), api)
+            actions = PendingActionService(connection)
+            router.action_service = actions
+            gateway = TelegramGateway(7, 42, router, actions, api)
             barrier.wait()
             run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
         finally:
@@ -492,7 +567,7 @@ def test_instance_level_async_callables_are_supported(
     route = AsyncMock(return_value=None)
     answer = AsyncMock()
     send = AsyncMock(return_value="88")
-    router = SimpleNamespace(route=route)
+    router = SimpleNamespace(route=route, action_service=actions)
     api = SimpleNamespace(answer_callback=answer, send_message=send)
     gateway = TelegramGateway(7, 42, router, actions, api)
 
@@ -541,6 +616,7 @@ def test_constructor_retrieves_each_protocol_callable_exactly_once(gateway_parts
         def __init__(self) -> None:
             self.accesses = 0
             self.call = AsyncMock()
+            self.action_service = actions
 
         @property
         def route(self):  # type: ignore[no-untyped-def]
@@ -571,7 +647,7 @@ def test_unauthorized_and_unsupported_updates_do_not_retrieve_protocol_callables
     gateway_parts,
 ) -> None:
     _, _, _, actions, _ = gateway_parts
-    router = CountingProtocolBoundary("route")
+    router = CountingProtocolBoundary("route", actions)
     api = CountingProtocolBoundary("answer_callback")
     gateway = TelegramGateway(7, 42, router, actions, api)
     assert (router.accesses, api.accesses) == (1, 1)
@@ -605,7 +681,7 @@ def test_corrupt_config_drops_all_updates_before_authorization_or_protocol_acces
     mutation: str,
 ) -> None:
     _, _, _, actions, connection = gateway_parts
-    router = CountingProtocolBoundary("route")
+    router = CountingProtocolBoundary("route", actions)
     api = CountingProtocolBoundary("answer_callback")
     gateway = TelegramGateway(7, 42, router, actions, api)
     assert (router.accesses, api.accesses) == (1, 1)
@@ -651,6 +727,7 @@ def test_changing_callable_descriptor_fails_closed_on_use(gateway_parts, boundar
     class ChangingRouter:
         def __init__(self) -> None:
             self.calls: list[object] = []
+            self.action_service = actions
 
         @property
         def route(self):  # type: ignore[no-untyped-def]

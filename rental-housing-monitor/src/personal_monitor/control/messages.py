@@ -113,6 +113,7 @@ def _safe_button(value: object) -> bool:
         type(value) is InlineButton
         and _safe_text(value.text, 64)
         and not contains_sensitive_text(value.text)
+        and _direct_text_is_safe(value.text)
         and type(value.callback_data) is str
         and value.callback_data.isascii()
         and len(value.callback_data.encode("ascii")) <= 64

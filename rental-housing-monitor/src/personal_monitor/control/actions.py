@@ -6,9 +6,10 @@ import math
 import re
 import secrets
 import sqlite3
+import threading
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Final
@@ -53,6 +54,54 @@ class _RejectAction(Exception):
     pass
 
 
+def _make_consumed_action_registry():  # type: ignore[no-untyped-def]
+    records: dict[
+        int,
+        tuple[ConsumedAction, PendingActionService, tuple[str, str, str, str]],
+    ] = {}
+    lock = threading.RLock()
+
+    def register(
+        issuer: PendingActionService,
+        action: ConsumedAction,
+        fingerprint: tuple[str, str, str, str],
+    ) -> None:
+        with lock:
+            key = id(action)
+            if key in records:
+                raise RuntimeError("consumed action registration failed")
+            records[key] = (action, issuer, fingerprint)
+
+    def claim(
+        issuer: PendingActionService,
+        action: ConsumedAction,
+        fingerprint: tuple[str, str, str, str],
+    ) -> bool:
+        with lock:
+            key = id(action)
+            record = records.get(key)
+            if (
+                record is None
+                or record[0] is not action
+                or record[1] is not issuer
+                or record[2] != fingerprint
+            ):
+                return False
+            records.pop(key)
+            return True
+
+    def discard(issuer: PendingActionService, action: ConsumedAction) -> bool:
+        with lock:
+            key = id(action)
+            record = records.get(key)
+            if record is None or record[0] is not action or record[1] is not issuer:
+                return False
+            records.pop(key)
+            return True
+
+    return register, claim, discard
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class PendingAction:
     token: str
@@ -80,8 +129,6 @@ class ConsumedAction:
     payload: Mapping[str, object]
     owner_id: str
     operation: str = "confirm"
-    _issuer: object | None = field(default=None, init=False, repr=False)
-    _receipt: object | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -104,10 +151,6 @@ class PendingActionService:
     __slots__ = (
         "_connection",
         "_connection_anchor",
-        "_issued",
-        "_issued_anchor",
-        "_issuer",
-        "_issuer_anchor",
         "_token_source",
         "_token_source_anchor",
     )
@@ -117,12 +160,6 @@ class PendingActionService:
             raise ValueError("invalid pending action storage")
         object.__setattr__(self, "_connection", connection)
         object.__setattr__(self, "_connection_anchor", connection)
-        issuer = object()
-        issued: dict[object, tuple[ConsumedAction, str, str, str, str]] = {}
-        object.__setattr__(self, "_issuer", issuer)
-        object.__setattr__(self, "_issuer_anchor", issuer)
-        object.__setattr__(self, "_issued", issued)
-        object.__setattr__(self, "_issued_anchor", issued)
         object.__setattr__(self, "_token_source", _TOKEN_URLSAFE)
         object.__setattr__(self, "_token_source_anchor", _TOKEN_URLSAFE)
 
@@ -241,21 +278,21 @@ class PendingActionService:
                 )
                 if cursor.rowcount != 1:
                     raise _RejectAction
-                receipt = object()
                 result = ConsumedAction(action, payload, owner, operation)
-                object.__setattr__(result, "_issuer", self._issuer_anchor)
-                object.__setattr__(result, "_receipt", receipt)
-                self._issued_anchor[receipt] = (
+                _register_consumed_action(
+                    self,
                     result,
-                    action,
-                    payload_json,
-                    owner,
-                    operation,
+                    (
+                        action,
+                        payload_json,
+                        owner,
+                        operation,
+                    ),
                 )
         except Exception:
             failed = True
-        if failed and result is not None and result._receipt is not None:
-            self._issued_anchor.pop(result._receipt, None)
+        if failed and result is not None:
+            _discard_consumed_action(self, result)
         if failed or result is None:
             raise ActionDenied("pending action denied") from None
         return result
@@ -265,27 +302,27 @@ class PendingActionService:
         if not self._integrity_ok() or type(action) is not ConsumedAction:
             return False
         try:
-            receipt = action._receipt
-            if action._issuer is not self._issuer_anchor or receipt is None:
-                return False
-            record = self._issued_anchor.pop(receipt, None)
-            if record is None:
-                return False
-            issued, expected_action, expected_payload, expected_owner, expected_operation = record
             payload_json, _ = _validated_payload(action.payload)
-            return (
-                issued is action
-                and action.action == expected_action
-                and payload_json == expected_payload
-                and action.owner_id == expected_owner
-                and action.operation == expected_operation
+            return _claim_consumed_action(
+                self,
+                action,
+                (
+                    action.action,
+                    payload_json,
+                    action.owner_id,
+                    action.operation,
+                ),
             )
         except Exception:
             return False
 
     def discard(self, action: object) -> bool:
         """Consume an unused in-memory receipt, such as a cancelled callback."""
-        return self.claim(action)
+        return (
+            type(action) is ConsumedAction
+            and self._integrity_ok()
+            and _discard_consumed_action(self, action)
+        )
 
     def revoke(self, token: str, owner_id: str) -> None:
         safe_token = _valid_token(token)
@@ -312,14 +349,18 @@ class PendingActionService:
             return (
                 type(self._connection) is sqlite3.Connection
                 and self._connection is self._connection_anchor
-                and self._issuer is self._issuer_anchor
-                and type(self._issued) is dict
-                and self._issued is self._issued_anchor
                 and self._token_source is self._token_source_anchor
                 and self._token_source_anchor is _TOKEN_URLSAFE
             )
         except Exception:
             return False
+
+
+(
+    _register_consumed_action,
+    _claim_consumed_action,
+    _discard_consumed_action,
+) = _make_consumed_action_registry()
 
 
 def _valid_owner(value: object) -> str | None:

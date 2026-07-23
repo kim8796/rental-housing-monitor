@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,13 +74,21 @@ class FakeIntentRouter:
 
 
 class UnusedPlanner:
+    def __init__(self, action_service: PendingActionService) -> None:
+        self.action_service = action_service
+
     async def propose(self, *_args: object, **_kwargs: object) -> Any:
         raise AssertionError("planner must not be called")
 
 
 class FakePlanner:
-    def __init__(self, proposal: ProposedMonitor) -> None:
+    def __init__(
+        self,
+        proposal: ProposedMonitor,
+        action_service: PendingActionService,
+    ) -> None:
         self.proposal = proposal
+        self.action_service = action_service
         self.calls: list[tuple[ControlRequest, IntentResult]] = []
 
     async def propose(self, request: ControlRequest, intent: IntentResult) -> ProposedMonitor:
@@ -88,8 +97,13 @@ class FakePlanner:
 
 
 class FakeUpdatePlanner:
-    def __init__(self, planned: PlannedMonitor) -> None:
+    def __init__(
+        self,
+        planned: PlannedMonitor,
+        action_service: PendingActionService,
+    ) -> None:
         self.planned = planned
+        self.action_service = action_service
         self.calls: list[tuple[ControlRequest, IntentResult, MonitorSpec]] = []
 
     async def propose(self, *_args: object, **_kwargs: object) -> Any:
@@ -106,11 +120,19 @@ class FakeUpdatePlanner:
 
 
 class ErrorPlanner:
+    def __init__(self, action_service: PendingActionService) -> None:
+        self.action_service = action_service
+
     async def propose(self, *_args: object, **_kwargs: object) -> Any:
         raise RuntimeError(
             "<html>private</html> cookie=session-secret "
             "Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature"
         )
+
+
+class BoundUnusedPlanner(UnusedPlanner):
+    def __init__(self, action_service: PendingActionService) -> None:
+        super().__init__(action_service)
 
 
 def _intent(kind: IntentKind, monitor_id: str | None = None) -> IntentResult:
@@ -234,6 +256,22 @@ def test_control_reply_constructor_rejects_unstripped_urls_and_html(text: str) -
         ControlReply(text)
 
 
+@pytest.mark.parametrize(
+    "label",
+    (
+        "보기 https://example.com/path?ref=ordinary-private-value",
+        "보기 https://example.com/path#private-fragment",
+        "<b>확인</b>",
+    ),
+)
+def test_control_reply_rejects_unsafe_button_text(label: str) -> None:
+    with pytest.raises(ValueError, match="invalid control reply"):
+        ControlReply(
+            "안전한 본문",
+            ((InlineButton(label, "confirm:" + "x" * 32),),),
+        )
+
+
 def test_consumed_action_carries_exact_authenticated_owner_and_operation() -> None:
     connection = open_database(":memory:")
     connection.execute(
@@ -259,7 +297,7 @@ def test_forged_consumed_action_cannot_mutate_control_service() -> None:
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.LIST)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -282,6 +320,24 @@ def test_forged_consumed_action_cannot_mutate_control_service() -> None:
     connection.close()
 
 
+def test_control_service_rejects_planner_bound_to_different_action_store() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    other = PendingActionService(connection)
+
+    with pytest.raises(ValueError, match="invalid control service composition"):
+        ControlService(
+            FakeIntentRouter(_intent(IntentKind.LIST)),
+            registry,
+            BoundUnusedPlanner(other),
+            actions,
+            now_source=lambda: NOW,
+        )
+
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    connection.close()
+
+
 def test_consumed_action_receipt_is_bound_to_service_and_claimed_once() -> None:
     registry, connection = _registry()
     issuing_actions = PendingActionService(connection)
@@ -291,7 +347,7 @@ def test_consumed_action_receipt_is_bound_to_service_and_claimed_once() -> None:
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.LIST)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(service_actions),
         service_actions,
         now_source=lambda: NOW,
     )
@@ -309,6 +365,52 @@ def test_consumed_action_receipt_is_bound_to_service_and_claimed_once() -> None:
     assert "등록했습니다" in first.text
     assert "처리하지 못했습니다" in second.text
     assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 1
+    connection.close()
+
+
+def test_copied_capability_state_cannot_deny_the_real_exact_action() -> None:
+    registry, connection = _registry()
+    monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
+    active = registry.get_active_monitor(monitor_id)
+    actions = PendingActionService(connection)
+    pending = actions.create(
+        OWNER,
+        "delete",
+        {
+            "owner_id": OWNER,
+            "monitor_id": monitor_id,
+            "monitor_name": "가격 감시",
+            "expected_status": MonitorStatus.ACTIVE.value,
+            "expected_active_version_id": active.version_id,
+        },
+        now=NOW,
+    )
+    consumed = actions.consume(pending.token, OWNER, now=NOW)
+    forged = ConsumedAction(
+        consumed.action,
+        consumed.payload,
+        consumed.owner_id,
+        consumed.operation,
+    )
+    for name in ("_issuer", "_receipt"):
+        with suppress(AttributeError):
+            object.__setattr__(forged, name, getattr(consumed, name))
+    service = ControlService(
+        FakeIntentRouter(_intent(IntentKind.LIST)),
+        registry,
+        UnusedPlanner(actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    forged_reply = _run(service.handle(forged))
+    real_reply = _run(service.handle(consumed))
+
+    assert "처리하지 못했습니다" in forged_reply.text
+    assert "삭제했습니다" in real_reply.text
+    assert "_issuer" not in ConsumedAction.__slots__
+    assert "_receipt" not in ConsumedAction.__slots__
+    assert "_issued" not in PendingActionService.__slots__
     connection.close()
 
 
@@ -374,7 +476,7 @@ def test_list_and_status_are_immediate_owner_only_and_query_redacted() -> None:
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.LIST)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -383,7 +485,7 @@ def test_list_and_status_are_immediate_owner_only_and_query_redacted() -> None:
     status_service = ControlService(
         FakeIntentRouter(_intent(IntentKind.STATUS, monitor_id)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -402,6 +504,7 @@ def test_list_and_status_are_immediate_owner_only_and_query_redacted() -> None:
 
 def test_ambiguous_reference_returns_owner_only_numbered_question_without_writes() -> None:
     registry, connection = _registry()
+    actions = PendingActionService(connection)
     registry.create_monitor(_spec(name="첫 번째"), created_by=OWNER)
     registry.create_monitor(_spec(name="두 번째"), created_by=OWNER)
     registry.create_monitor(
@@ -420,8 +523,8 @@ def test_ambiguous_reference_returns_owner_only_numbered_question_without_writes
     service = ControlService(
         FakeIntentRouter(unknown),
         registry,
-        UnusedPlanner(),
-        PendingActionService(connection),
+        UnusedPlanner(actions),
+        actions,
         now_source=lambda: NOW,
     )
 
@@ -442,7 +545,7 @@ def test_pause_is_preview_only_then_exact_confirmation_changes_state() -> None:
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.PAUSE, monitor_id)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -475,7 +578,7 @@ def test_resume_only_allows_user_paused_monitor() -> None:
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.RESUME, monitor_id)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -508,7 +611,7 @@ def test_delete_confirmation_soft_deletes_without_removing_versions_or_observati
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.DELETE, monitor_id)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -550,7 +653,7 @@ def test_create_is_absent_before_confirmation_and_created_for_authenticated_owne
         clarification=None,
         confidence=1.0,
     )
-    planner = FakePlanner(proposal)
+    planner = FakePlanner(proposal, actions)
     service = ControlService(
         FakeIntentRouter(create_intent),
         registry,
@@ -576,6 +679,7 @@ def test_planner_error_html_cookie_and_token_never_reach_reply_or_logs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     registry, connection = _registry()
+    actions = PendingActionService(connection)
     intent = IntentResult(
         kind=IntentKind.CREATE,
         target_monitor_ids=[],
@@ -588,8 +692,8 @@ def test_planner_error_html_cookie_and_token_never_reach_reply_or_logs(
     service = ControlService(
         FakeIntentRouter(intent),
         registry,
-        ErrorPlanner(),
-        PendingActionService(connection),
+        ErrorPlanner(actions),
+        actions,
         now_source=lambda: NOW,
     )
 
@@ -621,7 +725,7 @@ def test_schedule_update_stages_unapproved_candidate_then_atomically_activates()
     service = ControlService(
         FakeIntentRouter(update_intent),
         registry,
-        FakeUpdatePlanner(_planned_update()),
+        FakeUpdatePlanner(_planned_update(), actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -654,8 +758,16 @@ def test_schedule_update_stages_unapproved_candidate_then_atomically_activates()
     connection.close()
 
 
-def test_condition_only_preview_summarizes_rules_and_validation_without_literals() -> None:
+@pytest.mark.parametrize(
+    ("threshold", "other_threshold"),
+    ((777777, 888888), (888888, 777777)),
+)
+def test_condition_only_preview_faithfully_summarizes_actual_safe_rule_values(
+    threshold: int,
+    other_threshold: int,
+) -> None:
     registry, connection = _registry()
+    actions = PendingActionService(connection)
     monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
     payload = _spec().model_dump(mode="json")
     payload["rules"] = [
@@ -663,12 +775,12 @@ def test_condition_only_preview_summarizes_rules_and_validation_without_literals
             "kind": "numeric_threshold",
             "field": "price",
             "operator": "lt",
-            "value": 777777,
+            "value": threshold,
         }
     ]
     planned = PlannedMonitor(
         spec=MonitorSpec.model_validate(payload),
-        preview_items=(PreviewItem({"price": 777777}),),
+        preview_items=(PreviewItem({"price": threshold}),),
         resolved_strategy=FetchStrategy.HTTP,
         robots=RobotsDecision(True, None, NOW, True),
         warnings=(),
@@ -685,8 +797,8 @@ def test_condition_only_preview_summarizes_rules_and_validation_without_literals
     service = ControlService(
         FakeIntentRouter(intent),
         registry,
-        FakeUpdatePlanner(planned),
-        PendingActionService(connection),
+        FakeUpdatePlanner(planned, actions),
+        actions,
         now_source=lambda: NOW,
     )
 
@@ -694,13 +806,169 @@ def test_condition_only_preview_summarizes_rules_and_validation_without_literals
 
     assert "조건 변경: 1개 → 1개" in reply.text
     assert "검증 미리보기: 1개 항목 통과" in reply.text
-    assert "777777" not in reply.text
+    assert "숫자 임계값" in reply.text
+    assert "price" in reply.text
+    assert "lt" in reply.text
+    assert str(threshold) in reply.text
+    assert str(other_threshold) not in reply.text
     assert ".price" not in reply.text
+    connection.close()
+
+
+def test_compound_update_preview_shows_both_schedule_and_actual_rule_values() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
+    payload = _spec().model_dump(mode="json")
+    payload["schedule"] = "0 9 * * *"
+    payload["rules"] = [
+        {
+            "kind": "numeric_threshold",
+            "field": "price",
+            "operator": "lte",
+            "value": 654321,
+        }
+    ]
+    planned = PlannedMonitor(
+        spec=MonitorSpec.model_validate(payload),
+        preview_items=(PreviewItem({"price": 654321}),),
+        resolved_strategy=FetchStrategy.HTTP,
+        robots=RobotsDecision(True, None, NOW, True),
+        warnings=(),
+    )
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text="가격 조건도 바꿔줘",
+        schedule_text="매일 오전 9시",
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(planned, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("일정과 가격 조건을 같이 바꿔줘")))
+
+    assert "일정 변경: 0 */6 * * * → 0 9 * * *" in reply.text
+    assert "조건 변경: 1개 → 1개" in reply.text
+    assert "숫자 임계값" in reply.text
+    assert "price" in reply.text
+    assert "lte" in reply.text
+    assert "654321" in reply.text
+    connection.close()
+
+
+def test_keyword_preview_redacts_secret_and_preserves_safe_actual_keyword() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    current_payload = _spec().model_dump(mode="json")
+    current_payload["extract"]["fields"]["title"] = {
+        "selector": ".title",
+        "type": "text",
+    }
+    current = MonitorSpec.model_validate(current_payload)
+    monitor_id = registry.create_monitor(current, created_by=OWNER)
+    payload = current.model_dump(mode="json")
+    payload["rules"] = [
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": ["cookie=session-secret", "재입고"],
+        }
+    ]
+    planned = PlannedMonitor(
+        spec=MonitorSpec.model_validate(payload),
+        preview_items=(PreviewItem({"title": "재입고"}),),
+        resolved_strategy=FetchStrategy.HTTP,
+        robots=RobotsDecision(True, None, NOW, True),
+        warnings=(),
+    )
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text="재입고 키워드로 바꿔줘",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(planned, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("재입고 키워드로 바꿔줘")))
+
+    assert "키워드 일치" in reply.text
+    assert "title" in reply.text
+    assert "재입고" in reply.text
+    assert "[숨김]" in reply.text
+    assert "session-secret" not in reply.text
+    connection.close()
+
+
+def test_oversized_rule_preview_rolls_back_candidate_and_action_atomically() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    current_payload = _spec().model_dump(mode="json")
+    current_payload["extract"]["fields"]["title"] = {
+        "selector": ".title",
+        "type": "text",
+    }
+    current = MonitorSpec.model_validate(current_payload)
+    monitor_id = registry.create_monitor(current, created_by=OWNER)
+    payload = current.model_dump(mode="json")
+    payload["rules"] = [
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": [f"keyword-{index}-" + "x" * 200 for index in range(50)],
+        }
+    ]
+    planned = PlannedMonitor(
+        spec=MonitorSpec.model_validate(payload),
+        preview_items=(PreviewItem({"title": "safe"}),),
+        resolved_strategy=FetchStrategy.HTTP,
+        robots=RobotsDecision(True, None, NOW, True),
+        warnings=(),
+    )
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text="키워드를 바꿔줘",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(planned, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("키워드를 바꿔줘")))
+
+    assert "처리하지 못했습니다" in reply.text
+    assert connection.execute("SELECT count(*) FROM monitor_versions").fetchone()[0] == 1
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
     connection.close()
 
 
 def test_schedule_only_update_rejects_every_hidden_spec_change_without_writes() -> None:
     registry, connection = _registry()
+    actions = PendingActionService(connection)
     monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
     payload = _spec().model_dump(mode="json")
     payload.update(
@@ -737,12 +1005,41 @@ def test_schedule_only_update_rejects_every_hidden_spec_change_without_writes() 
     service = ControlService(
         FakeIntentRouter(intent),
         registry,
-        FakeUpdatePlanner(hostile),
-        PendingActionService(connection),
+        FakeUpdatePlanner(hostile, actions),
+        actions,
         now_source=lambda: NOW,
     )
 
     reply = _run(service.handle(_request("일정만 매일 오전 9시로 바꿔줘")))
+
+    assert "처리하지 못했습니다" in reply.text
+    assert connection.execute("SELECT count(*) FROM monitor_versions").fetchone()[0] == 1
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    connection.close()
+
+
+def test_compound_update_requires_both_schedule_and_rules_to_change() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text="가격 조건도 바꿔줘",
+        schedule_text="매일 오전 9시",
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(_planned_update(), actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("일정과 가격 조건을 같이 바꿔줘")))
 
     assert "처리하지 못했습니다" in reply.text
     assert connection.execute("SELECT count(*) FROM monitor_versions").fetchone()[0] == 1
@@ -771,14 +1068,15 @@ def test_router_cannot_swap_registry_database_across_await() -> None:
             return create_intent
 
     class RecordingPlanner:
-        def __init__(self) -> None:
+        def __init__(self, action_service: PendingActionService) -> None:
+            self.action_service = action_service
             self.called = False
 
         async def propose(self, *_args: object) -> object:
             self.called = True
             raise AssertionError("planner must not run after composition swap")
 
-    planner = RecordingPlanner()
+    planner = RecordingPlanner(actions)
     service = ControlService(
         SwappingRouter(),
         registry,
@@ -821,7 +1119,7 @@ def test_needs_review_status_offers_only_adaptive_repair_and_activates_exact_can
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.STATUS, monitor_id)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -844,6 +1142,7 @@ def test_needs_review_status_offers_only_adaptive_repair_and_activates_exact_can
 
 def test_adaptive_candidate_without_stored_current_parent_is_never_offered() -> None:
     registry, connection = _registry()
+    actions = PendingActionService(connection)
     monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
     candidate = registry.add_version(
         monitor_id,
@@ -862,8 +1161,8 @@ def test_adaptive_candidate_without_stored_current_parent_is_never_offered() -> 
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.STATUS, monitor_id)),
         registry,
-        UnusedPlanner(),
-        PendingActionService(connection),
+        UnusedPlanner(actions),
+        actions,
         now_source=lambda: NOW,
     )
 
@@ -895,7 +1194,7 @@ def test_update_candidate_and_pending_roll_back_together_on_database_failure() -
     service = ControlService(
         FakeIntentRouter(update_intent),
         registry,
-        FakeUpdatePlanner(_planned_update()),
+        FakeUpdatePlanner(_planned_update(), actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -930,7 +1229,7 @@ def test_edit_consumes_update_action_without_activation() -> None:
     service = ControlService(
         FakeIntentRouter(intent),
         registry,
-        FakeUpdatePlanner(_planned_update()),
+        FakeUpdatePlanner(_planned_update(), actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -957,7 +1256,7 @@ def test_stale_pause_confirmation_fails_without_overriding_review_state() -> Non
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.PAUSE, monitor_id)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -994,7 +1293,7 @@ def test_create_preview_validation_failure_revokes_orphan_action() -> None:
     service = ControlService(
         FakeIntentRouter(intent),
         registry,
-        FakePlanner(proposal),
+        FakePlanner(proposal, actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -1024,7 +1323,7 @@ def test_stale_repair_confirmation_leaves_candidate_unapproved() -> None:
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.STATUS, monitor_id)),
         registry,
-        UnusedPlanner(),
+        UnusedPlanner(actions),
         actions,
         now_source=lambda: NOW,
     )
@@ -1050,6 +1349,7 @@ def test_stale_repair_confirmation_leaves_candidate_unapproved() -> None:
 
 def test_corrupt_status_data_returns_fixed_failure_without_database_value() -> None:
     registry, connection = _registry()
+    actions = PendingActionService(connection)
     monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
     connection.execute(
         "UPDATE monitors SET next_run_at = 'private-db-secret' WHERE id = ?",
@@ -1058,8 +1358,8 @@ def test_corrupt_status_data_returns_fixed_failure_without_database_value() -> N
     service = ControlService(
         FakeIntentRouter(_intent(IntentKind.STATUS, monitor_id)),
         registry,
-        UnusedPlanner(),
-        PendingActionService(connection),
+        UnusedPlanner(actions),
+        actions,
         now_source=lambda: NOW,
     )
 

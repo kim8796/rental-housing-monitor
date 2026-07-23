@@ -4,7 +4,6 @@ import asyncio
 import logging
 import re
 import unicodedata
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final, Protocol
@@ -40,6 +39,9 @@ class ControlRequest:
 
 
 class ControlRouter(Protocol):
+    @property
+    def action_service(self) -> PendingActionService: ...
+
     async def route(self, value: ControlRequest | ConsumedAction) -> object | None: ...
 
 
@@ -78,6 +80,7 @@ class TelegramGateway:
         "_route_anchor",
         "_send_message_anchor",
         "_router",
+        "_router_action_service_anchor",
         "_router_anchor",
     )
 
@@ -103,6 +106,7 @@ class TelegramGateway:
         if configuration_valid:
             try:
                 route = router.route
+                router_action_service = router.action_service
                 answer_callback = api.answer_callback
                 consume = actions.consume
                 discard = actions.discard
@@ -111,6 +115,8 @@ class TelegramGateway:
                     callable(item)
                     for item in (route, consume, discard, answer_callback, candidate_send)
                 ):
+                    capture_failed = True
+                if router_action_service is not actions:
                     capture_failed = True
                 send_message = candidate_send
             except Exception:
@@ -123,6 +129,7 @@ class TelegramGateway:
         object.__setattr__(self, "_command_chat_id_anchor", command_chat_id)
         object.__setattr__(self, "_router", router)
         object.__setattr__(self, "_router_anchor", router)
+        object.__setattr__(self, "_router_action_service_anchor", actions)
         object.__setattr__(self, "_route_anchor", route)
         object.__setattr__(self, "_actions", actions)
         object.__setattr__(self, "_actions_anchor", actions)
@@ -210,24 +217,26 @@ class TelegramGateway:
             await self._deliver_reply(callback.chat_id, reply)
             if not self._integrity_ok():
                 raise RuntimeError("gateway integrity failure")
-            await self._answer_callback_anchor(
-                callback.id,
-                text="수정 안내를 보냈습니다" if operation == "edit" else "처리되었습니다",
-                show_alert=False,
-            )
-        except asyncio.CancelledError:
+        except BaseException as error:
             self._discard_anchor(action)
-            raise
-        except Exception:
-            self._discard_anchor(action)
-            with suppress(Exception):
+            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            try:
                 await self._answer_callback_anchor(
                     callback.id,
                     text="결과 전달에 실패했습니다. 모니터 상태를 확인해 주세요.",
                     show_alert=True,
                 )
+            except BaseException as alert_error:
+                if isinstance(alert_error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
             return
         self._discard_anchor(action)
+        await self._answer_callback_anchor(
+            callback.id,
+            text="수정 안내를 보냈습니다" if operation == "edit" else "처리되었습니다",
+            show_alert=False,
+        )
 
     async def _deliver_reply(self, chat_id: int, value: object) -> None:
         from personal_monitor.control.messages import ControlReply
@@ -288,6 +297,7 @@ class TelegramGateway:
         try:
             return (
                 self._router is self._router_anchor
+                and self._router_anchor.action_service is self._router_action_service_anchor
                 and self._actions is self._actions_anchor
                 and self._api is self._api_anchor
                 and self._allowed_user_id is self._allowed_user_id_anchor

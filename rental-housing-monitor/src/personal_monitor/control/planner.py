@@ -274,6 +274,13 @@ class MonitorPlanner:
     def __repr__(self) -> str:
         return "<MonitorPlanner redacted>"
 
+    @property
+    def action_service(self) -> PendingActionService:
+        actions = self._actions_anchor.root
+        if type(actions) is not PendingActionService or not self._all_dependencies_intact():
+            raise PlanningFailed
+        return actions
+
     async def propose(
         self,
         request: ControlRequest,
@@ -851,7 +858,7 @@ def update_scope_is_valid(
         before = current.model_dump(mode="json")
         after = candidate.model_dump(mode="json")
         changed = {key for key in before if before[key] != after[key]}
-        return bool(changed) and changed <= allowed
+        return changed == allowed
     except Exception:
         return False
 
