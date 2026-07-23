@@ -13,6 +13,7 @@ from personal_monitor.scraping.extractor import DeclarativeExtractor
 from personal_monitor.scraping.normalizers import normalize_url
 from tests.credential_alias_cases import (
     BENIGN_CREDENTIAL_LIKE_KEYS,
+    SENSITIVE_COMPOUND_FIELD_NAMES,
     SENSITIVE_KEY_VARIANTS,
 )
 
@@ -658,6 +659,15 @@ def test_url_normalization_rejects_every_credential_query_variant(key: str) -> N
 
 @pytest.mark.parametrize("key", BENIGN_CREDENTIAL_LIKE_KEYS)
 def test_url_normalization_preserves_noncanonical_query_keys(key: str) -> None:
+    encoded = quote_plus(key)
+
+    assert normalize_url(f"https://example.com/path?{encoded}=ordinary") == (
+        f"https://example.com/path?{encoded}=ordinary"
+    )
+
+
+@pytest.mark.parametrize("key", SENSITIVE_COMPOUND_FIELD_NAMES)
+def test_url_normalization_does_not_apply_compound_field_semantics_to_queries(key: str) -> None:
     encoded = quote_plus(key)
 
     assert normalize_url(f"https://example.com/path?{encoded}=ordinary") == (

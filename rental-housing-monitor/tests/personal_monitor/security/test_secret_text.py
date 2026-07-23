@@ -7,8 +7,9 @@ from personal_monitor.security.secret_text import (
     redact_sensitive_text,
 )
 from tests.credential_alias_cases import (
-    BENIGN_CREDENTIAL_LIKE_KEYS,
+    BENIGN_ASSIGNMENT_KEYS,
     EXACT_BOUNDARY_ASSIGNMENTS,
+    PUNCTUATED_ASSIGNMENTS,
     SENSITIVE_ASSIGNMENTS,
 )
 
@@ -27,6 +28,7 @@ QUOTED_ASSIGNMENTS = (
     "key=supersecretvalue",
     "`authorization`: `supersecretvalue`",
     *EXACT_BOUNDARY_ASSIGNMENTS,
+    *PUNCTUATED_ASSIGNMENTS,
 )
 
 
@@ -44,6 +46,10 @@ def test_sensitive_assignment_detection_and_redaction_have_identical_semantics(
         "ordinary authorization documentation",
         "password policy changed",
         "https://example.com/catalog",
+        "https://example.com/catalog?page=2&sort=price",
+        "myauthorization=ordinaryvalue",
+        "monkey=ordinaryvalue",
+        "hockey=ordinaryvalue",
         "상품 가격을 알려줘",
     ),
 )
@@ -78,7 +84,7 @@ def test_every_canonical_assignment_variant_is_fully_redacted(value: str) -> Non
     assert redact_sensitive_text(value) == "[숨김]"
 
 
-@pytest.mark.parametrize("key", BENIGN_CREDENTIAL_LIKE_KEYS)
+@pytest.mark.parametrize("key", BENIGN_ASSIGNMENT_KEYS)
 def test_noncanonical_assignment_keys_are_not_redacted(key: str) -> None:
     value = f"{key}=ordinaryvalue"
 

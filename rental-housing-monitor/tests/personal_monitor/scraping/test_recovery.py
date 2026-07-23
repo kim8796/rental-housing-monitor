@@ -22,7 +22,8 @@ from personal_monitor.security.sanitize import sanitize_for_ai
 from personal_monitor.security.url_policy import UrlPolicy
 from personal_monitor.storage import RecoveryRepository, RegistryRepository, open_database
 from tests.credential_alias_cases import (
-    BENIGN_CREDENTIAL_LIKE_KEYS,
+    BENIGN_COMPOUND_FIELD_NAMES,
+    SENSITIVE_COMPOUND_FIELD_NAMES,
     SENSITIVE_KEY_VARIANTS,
 )
 
@@ -1006,6 +1007,22 @@ def test_recovery_candidate_removes_every_credential_field_key_variant(key: str)
     assert "supersecretvalue" not in repr(candidate)
 
 
+@pytest.mark.parametrize("key", SENSITIVE_COMPOUND_FIELD_NAMES)
+def test_recovery_candidate_removes_compound_credential_field_keys(key: str) -> None:
+    from personal_monitor.scraping.recovery import RecoveryCandidate
+
+    candidate = RecoveryCandidate(
+        version_id="version-id",
+        validation_passed=True,
+        field_changes={key: ".safe"},
+        preview_items=[{key: "supersecretvalue"}],
+    )
+
+    assert candidate.field_changes == {}
+    assert candidate.preview_items == ({},)
+    assert "supersecretvalue" not in repr(candidate)
+
+
 @pytest.mark.parametrize("key", SENSITIVE_KEY_VARIANTS)
 def test_recovery_candidate_removes_urls_with_every_credential_query_variant(key: str) -> None:
     from personal_monitor.scraping.recovery import RecoveryCandidate
@@ -1022,7 +1039,22 @@ def test_recovery_candidate_removes_urls_with_every_credential_query_variant(key
     assert "supersecretvalue" not in repr(candidate)
 
 
-@pytest.mark.parametrize("key", BENIGN_CREDENTIAL_LIKE_KEYS)
+@pytest.mark.parametrize("key", SENSITIVE_COMPOUND_FIELD_NAMES)
+def test_recovery_url_checks_do_not_apply_compound_field_semantics(key: str) -> None:
+    from personal_monitor.scraping.recovery import RecoveryCandidate
+
+    safe_url = f"https://example.com/path?{quote_plus(key)}=ordinary"
+    candidate = RecoveryCandidate(
+        version_id="version-id",
+        validation_passed=True,
+        field_changes={},
+        preview_items=[{"safe": safe_url}],
+    )
+
+    assert candidate.preview_items == ({"safe": safe_url},)
+
+
+@pytest.mark.parametrize("key", BENIGN_COMPOUND_FIELD_NAMES)
 def test_recovery_candidate_preserves_noncanonical_field_keys(key: str) -> None:
     from personal_monitor.scraping.recovery import RecoveryCandidate
 

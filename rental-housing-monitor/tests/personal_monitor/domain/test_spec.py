@@ -16,6 +16,7 @@ from personal_monitor.domain.spec import (
 )
 from tests.credential_alias_cases import (
     BENIGN_CREDENTIAL_LIKE_KEYS,
+    SENSITIVE_COMPOUND_FIELD_NAMES,
     SENSITIVE_KEY_VARIANTS,
 )
 
@@ -203,6 +204,14 @@ def test_monitor_spec_allows_ordinary_target_url_query_parameters(key: str) -> N
     url = f"https://example.com/listing?{quote_plus(key)}=ordinary"
     payload = valid_spec() | {"target_url": url}
     assert MonitorSpec.model_validate(payload).target_url == payload["target_url"]
+
+
+@pytest.mark.parametrize("key", SENSITIVE_COMPOUND_FIELD_NAMES)
+def test_monitor_spec_keeps_compound_field_semantics_out_of_query_names(key: str) -> None:
+    url = f"https://example.com/listing?{quote_plus(key)}=ordinary"
+    payload = valid_spec() | {"target_url": url}
+
+    assert MonitorSpec.model_validate(payload).target_url == url
 
 
 @pytest.mark.parametrize(

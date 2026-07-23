@@ -16,7 +16,7 @@ from personal_monitor.domain.spec import MonitorSpec
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.security.url_policy import ResolvedTarget
 from personal_monitor.storage import open_database
-from tests.credential_alias_cases import SENSITIVE_ASSIGNMENTS
+from tests.credential_alias_cases import PUNCTUATED_ASSIGNMENTS, SENSITIVE_ASSIGNMENTS
 from tests.personal_monitor.control.test_planner import (
     OWNER,
     FakePolicy,
@@ -415,6 +415,7 @@ def test_broad_jwt_is_hidden_from_every_rendered_preview_value(
         "key=supersecretvalue",
         "`authorization`: `supersecretvalue`",
         *SENSITIVE_ASSIGNMENTS,
+        *PUNCTUATED_ASSIGNMENTS,
     ),
 )
 def test_quoted_assignment_hides_entire_preview_values(

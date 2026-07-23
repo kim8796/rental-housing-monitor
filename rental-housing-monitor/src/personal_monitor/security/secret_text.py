@@ -25,7 +25,7 @@ _SENSITIVE_KEY: Final = (
     + ")"
 )
 _ASSIGNMENT: Final = re.compile(
-    rf"""(?:^|[\s{{\[(,;])(?P<key_quote>["'`]?)\s*{_SENSITIVE_KEY}"""
+    rf"""(?<![A-Za-z0-9_'"`-])(?P<key_quote>["'`]?)\s*{_SENSITIVE_KEY}"""
     r"\s*(?P=key_quote)"
     r"\s*[:=]\s*"
     r"""(?:"[^"\r\n]|'[^'\r\n]|`[^`\r\n]|[^\s<>"'`])""",

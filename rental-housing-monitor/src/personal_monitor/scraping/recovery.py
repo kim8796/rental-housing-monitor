@@ -21,7 +21,10 @@ from personal_monitor.scraping.adaptive_storage import EncryptedAdaptiveStorage
 from personal_monitor.scraping.document import SourceDocument
 from personal_monitor.scraping.extractor import DeclarativeExtractor, _scope_xpath
 from personal_monitor.scraping.validator import ObservationValidator
-from personal_monitor.security.credential_names import is_sensitive_credential_name
+from personal_monitor.security.credential_names import (
+    is_sensitive_compound_field_name,
+    is_sensitive_credential_name,
+)
 from personal_monitor.security.encryption import AesGcmCipher, EncryptedBlob
 from personal_monitor.security.sanitize import sanitize_for_ai
 from personal_monitor.security.secret_text import contains_sensitive_text
@@ -81,7 +84,7 @@ class RecoveryCandidate:
         for name, selector in sorted(self.field_changes.items())[:MAX_FIELD_CHANGES]:
             if not isinstance(name, str) or not isinstance(selector, str):
                 raise TypeError("candidate field changes are invalid")
-            if is_sensitive_credential_name(name) or _unsafe_text(selector, ()):
+            if is_sensitive_compound_field_name(name) or _unsafe_text(selector, ()):
                 continue
             changes[name[:64]] = selector[:MAX_SELECTOR_LENGTH]
         previews: list[Mapping[str, Scalar]] = []
@@ -92,7 +95,7 @@ class RecoveryCandidate:
             for name, value in sorted(item.items()):
                 if len(bounded) >= MAX_PREVIEW_FIELDS:
                     break
-                if not isinstance(name, str) or is_sensitive_credential_name(name):
+                if not isinstance(name, str) or is_sensitive_compound_field_name(name):
                     continue
                 if not isinstance(value, str | int | float | bool) or value is None:
                     continue
@@ -647,7 +650,7 @@ def _preview(items: Sequence[ObservedItem], secrets: tuple[str, ...]) -> list[Ma
     for item in items[:MAX_PREVIEW_ITEMS]:
         values: dict[str, Scalar] = {}
         for name, value in item.fields.items():
-            if is_sensitive_credential_name(name):
+            if is_sensitive_compound_field_name(name):
                 continue
             values[name] = _sanitize_preview_value(value, secrets)
         previews.append(values)
