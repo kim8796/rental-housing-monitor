@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from personal_monitor.ai.auth import CodexAuthGuard
 from personal_monitor.ai.codex_cli import CodexCli, CodexProtocolError
 from personal_monitor.ai.contracts import (
     IntentKind,
@@ -46,6 +47,52 @@ def cli_paths(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "tasks"
     root.mkdir(mode=0o700)
     return home, root
+
+
+def auth_guard(home: Path) -> CodexAuthGuard:
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        return FakeProcess(b"Logged in using ChatGPT\n")
+
+    return CodexAuthGuard("/usr/bin/true", home, process_factory=spawn)
+
+
+def make_cli(
+    home: Path,
+    root: Path,
+    *,
+    process_factory=None,
+) -> CodexCli:
+    kwargs: dict[str, object] = {"auth_guard": auth_guard(home)}
+    if process_factory is not None:
+        kwargs["process_factory"] = process_factory
+    return CodexCli("/usr/bin/true", home, root, **kwargs)  # type: ignore[arg-type]
+
+
+def valid_events(*, text: str | None = None) -> bytes:
+    events: list[dict[str, object]] = [
+        {"type": "thread.started", "thread_id": "thread-1"},
+        {"type": "turn.started"},
+    ]
+    if text is not None:
+        events.append(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item-1",
+                    "type": "agent_message",
+                    "text": text,
+                },
+            }
+        )
+    events.append(
+        {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1},
+        }
+    )
+    return b"".join(
+        json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n" for event in events
+    )
 
 
 def spec() -> MonitorSpec:
@@ -141,11 +188,11 @@ async def test_cli_exact_argv_env_stdin_and_cleanup(tmp_path: Path) -> None:
             ).model_dump_json(),
             encoding="utf-8",
         )
-        process = FakeProcess(b'{"type":"turn.completed"}\n')
+        process = FakeProcess(valid_events())
         observed = (argv, kwargs, process)
         return process
 
-    cli = CodexCli("/usr/bin/true", home, task_root, process_factory=spawn)
+    cli = make_cli(home, task_root, process_factory=spawn)
     result = await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
     assert result.kind is IntentKind.CREATE
     assert observed is not None
@@ -192,7 +239,7 @@ async def test_cli_exact_argv_env_stdin_and_cleanup(tmp_path: Path) -> None:
 )
 async def test_only_exact_model_effort_pairs(tmp_path: Path, model: str, effort: str) -> None:
     home, root = cli_paths(tmp_path)
-    cli = CodexCli("/usr/bin/true", home, root)
+    cli = make_cli(home, root)
     with pytest.raises(CodexProtocolError):
         await cli.run(request(), IntentResult.model_json_schema(), model, effort)
 
@@ -221,9 +268,10 @@ async def test_forbidden_event_rejects_entire_result(
             '"confidence":0}',
             encoding="utf-8",
         )
-        return FakeProcess((json.dumps(event) + "\n" + '{"type":"turn.completed"}\n').encode())
+        prefix = b'{"type":"thread.started","thread_id":"thread-1"}\n{"type":"turn.started"}\n'
+        return FakeProcess(prefix + json.dumps(event).encode() + b"\n" + valid_events())
 
-    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    cli = make_cli(home, root, process_factory=spawn)
     with pytest.raises(CodexProtocolError, match="Codex protocol failure"):
         await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
 
@@ -239,7 +287,7 @@ async def test_invalid_stream_is_fixed(tmp_path: Path, stdout: bytes) -> None:
     async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
         return FakeProcess(stdout)
 
-    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    cli = make_cli(home, root, process_factory=spawn)
     with pytest.raises(CodexProtocolError) as caught:
         await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
     assert "not-json" not in str(caught.value)
@@ -271,9 +319,9 @@ async def test_result_secret_scanner_is_recursive(tmp_path: Path, secret: str) -
             "confidence": 0.0,
         }
         result_path.write_text(json.dumps(payload), encoding="utf-8")
-        return FakeProcess(b'{"type":"turn.completed"}\n')
+        return FakeProcess(valid_events())
 
-    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    cli = make_cli(home, root, process_factory=spawn)
     with pytest.raises(CodexProtocolError) as caught:
         await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
     assert secret not in str(caught.value)
@@ -351,9 +399,9 @@ async def test_all_three_request_result_pairs_use_fixed_prompts(tmp_path: Path, 
         prompts.append(argv[-1])
         result_path = Path(argv[argv.index("--output-last-message") + 1])
         result_path.write_text(expected.model_dump_json(), encoding="utf-8")
-        return FakeProcess(b'{"type":"turn.completed"}\n')
+        return FakeProcess(valid_events())
 
-    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    cli = make_cli(home, root, process_factory=spawn)
     actual = await cli.run(
         ai_request,
         result_type.model_json_schema(),
@@ -378,9 +426,9 @@ async def test_stream_overflow_and_result_type_mismatch_cleanup(tmp_path: Path) 
             result_path.write_text("{}", encoding="utf-8")
             return FakeProcess(b"x" * (1024 * 1024 + 1))
         result_path.write_text('{"unexpected":"private"}', encoding="utf-8")
-        return FakeProcess(b'{"type":"turn.completed"}\n')
+        return FakeProcess(valid_events())
 
-    cli = CodexCli("/usr/bin/true", home, root, process_factory=spawn)
+    cli = make_cli(home, root, process_factory=spawn)
     for _ in range(2):
         with pytest.raises(CodexProtocolError):
             await cli.run(
@@ -390,3 +438,181 @@ async def test_stream_overflow_and_result_type_mismatch_cleanup(tmp_path: Path) 
                 "medium",
             )
         assert list(root.iterdir()) == []
+
+
+def test_cli_cannot_be_composed_without_exact_auth_guard(tmp_path: Path) -> None:
+    home, root = cli_paths(tmp_path)
+    with pytest.raises(TypeError):
+        CodexCli("/usr/bin/true", home, root)
+
+
+def test_worker_cannot_capture_an_arbitrary_run_callable(tmp_path: Path) -> None:
+    from personal_monitor.ai.worker import CodexWorkerError, CodexWorkerServer
+
+    class Arbitrary:
+        async def run(self, *_args: object) -> IntentResult:
+            raise AssertionError
+
+    directory = tmp_path / "socket"
+    directory.mkdir(mode=0o700)
+    with pytest.raises(CodexWorkerError):
+        CodexWorkerServer(directory / "worker.sock", Arbitrary())
+
+
+@async_test
+async def test_ordinary_agent_text_containing_images_path_is_allowed(tmp_path: Path) -> None:
+    home, root = cli_paths(tmp_path)
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(
+            IntentResult(
+                kind=IntentKind.UNKNOWN,
+                target_monitor_ids=[],
+                confidence=0.0,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+        events = [
+            {"type": "thread.started", "thread_id": "safe-thread"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item-1",
+                    "type": "agent_message",
+                    "text": "문서의 /images/catalog 경로를 관찰했습니다.",
+                },
+            },
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1},
+            },
+        ]
+        return FakeProcess(
+            b"".join(
+                json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n" for event in events
+            )
+        )
+
+    guard = auth_guard(home)
+    cli = CodexCli(
+        "/usr/bin/true",
+        home,
+        root,
+        auth_guard=guard,
+        process_factory=spawn,
+    )
+    result = await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert result.kind is IntentKind.UNKNOWN
+
+
+@async_test
+async def test_event_after_turn_completed_is_rejected(tmp_path: Path) -> None:
+    home, root = cli_paths(tmp_path)
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(
+            IntentResult(
+                kind=IntentKind.UNKNOWN,
+                target_monitor_ids=[],
+                confidence=0.0,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+        return FakeProcess(
+            valid_events()
+            + b'{"type":"item.completed","item":{"id":"late","type":"reasoning","text":"x"}}\n'
+        )
+
+    guard = auth_guard(home)
+    cli = CodexCli(
+        "/usr/bin/true",
+        home,
+        root,
+        auth_guard=guard,
+        process_factory=spawn,
+    )
+    with pytest.raises(CodexProtocolError):
+        await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+
+
+@async_test
+async def test_api_key_added_after_composition_blocks_exec_before_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, root = cli_paths(tmp_path)
+    exec_calls = 0
+
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        nonlocal exec_calls
+        exec_calls += 1
+        raise AssertionError("exec must not start")
+
+    cli = make_cli(home, root, process_factory=spawn)
+    monkeypatch.setenv("OPENAI_API_KEY", "private-api-value")
+    with pytest.raises(Exception) as caught:
+        await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert exec_calls == 0
+    assert list(root.iterdir()) == []
+    assert "private-api-value" not in f"{caught.value!s} {caught.value!r}"
+
+
+@async_test
+async def test_cleanup_failure_never_returns_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, root = cli_paths(tmp_path)
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(
+            IntentResult(
+                kind=IntentKind.UNKNOWN,
+                target_monitor_ids=[],
+                confidence=0.0,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+        return FakeProcess(valid_events())
+
+    cli = make_cli(home, root, process_factory=spawn)
+
+    def fail_cleanup(_path: Path, _identity: tuple[int, int]) -> None:
+        raise OSError("private-cleanup-detail")
+
+    monkeypatch.setattr("personal_monitor.ai.codex_cli._remove_workspace_sync", fail_cleanup)
+    with pytest.raises(CodexProtocolError) as caught:
+        await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert "private-cleanup-detail" not in f"{caught.value!s} {caught.value!r}"
+    for leftover in root.iterdir():
+        import shutil
+
+        shutil.rmtree(leftover)
+
+
+@async_test
+async def test_symlinked_result_is_rejected_and_workspace_removed(tmp_path: Path) -> None:
+    home, root = cli_paths(tmp_path)
+    outside = tmp_path / "outside-result.json"
+    outside.write_text(
+        IntentResult(
+            kind=IntentKind.UNKNOWN,
+            target_monitor_ids=[],
+            confidence=0.0,
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.unlink()
+        result_path.symlink_to(outside)
+        return FakeProcess(valid_events())
+
+    cli = make_cli(home, root, process_factory=spawn)
+    with pytest.raises(CodexProtocolError):
+        await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
+    assert list(root.iterdir()) == []
+    assert outside.exists()

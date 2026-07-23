@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import stat
 from contextlib import suppress
 from pathlib import Path
@@ -11,7 +12,13 @@ from typing import Final
 from pydantic import ValidationError
 
 from .auth import CodexAuthError
-from .codex_cli import MAX_FRAME_BYTES, CodexProtocolError, _bounded_json, _scan_secrets
+from .codex_cli import (
+    MAX_FRAME_BYTES,
+    CodexCli,
+    CodexProtocolError,
+    _bounded_json,
+    _scan_secrets,
+)
 from .contracts import (
     IntentRequest,
     PlanRequest,
@@ -24,6 +31,10 @@ from .contracts import (
 )
 
 _READ_TIMEOUT: Final = 5.0
+_EOF_TIMEOUT: Final = 1.0
+_CLOSE_TIMEOUT: Final = 1.0
+_RUN_TIMEOUT: Final = 125.0
+_HANDLER_TIMEOUT: Final = 128.0
 _CLIENT_TIMEOUT: Final = 130.0
 
 
@@ -37,7 +48,7 @@ class CodexWorkerError(RuntimeError):
         return "CodexWorkerError(<redacted>)"
 
 
-def _safe_socket_parent(path: Path) -> Path:
+def _safe_socket_parent(path: Path) -> tuple[Path, tuple[int, int]]:
     try:
         if not path.is_absolute() or path.name in {"", ".", ".."}:
             raise CodexWorkerError
@@ -52,7 +63,25 @@ def _safe_socket_parent(path: Path) -> Path:
             or path != resolved / path.name
         ):
             raise CodexWorkerError
-        return resolved
+        return resolved, (metadata.st_dev, metadata.st_ino)
+    except CodexWorkerError:
+        raise
+    except Exception:
+        raise CodexWorkerError from None
+
+
+def _require_parent(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+        if (
+            path != resolved
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or (metadata.st_dev, metadata.st_ino) != identity
+        ):
+            raise CodexWorkerError
     except CodexWorkerError:
         raise
     except Exception:
@@ -78,11 +107,8 @@ async def _read_frame(reader: asyncio.StreamReader) -> object:
         if size < 1 or size > MAX_FRAME_BYTES:
             raise CodexWorkerError
         payload = await asyncio.wait_for(reader.readexactly(size), _READ_TIMEOUT)
-        try:
-            trailing = await asyncio.wait_for(reader.read(1), 0.02)
-        except TimeoutError:
-            trailing = b""
-        if trailing:
+        trailing = await asyncio.wait_for(reader.read(1), _EOF_TIMEOUT)
+        if trailing != b"":
             raise CodexWorkerError
         return _bounded_json(payload)
     except asyncio.CancelledError:
@@ -91,6 +117,21 @@ async def _read_frame(reader: asyncio.StreamReader) -> object:
         raise
     except Exception:
         raise CodexWorkerError from None
+
+
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    with suppress(BaseException):
+        await asyncio.wait_for(writer.wait_closed(), _CLOSE_TIMEOUT)
+
+
+async def _shielded_close_writer(writer: asyncio.StreamWriter) -> None:
+    task = asyncio.create_task(_close_writer(writer))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.shield(task)
+        raise
 
 
 def _parse_worker_request(value: object) -> WorkerRequest:
@@ -118,19 +159,31 @@ class CodexWorkerServer:
     __slots__ = (
         "_active",
         "_connections",
+        "_handle_anchor",
         "_identity",
+        "_parent",
+        "_parent_identity",
         "_run",
+        "_run_anchor",
         "_server",
         "_socket_path",
         "_tasks",
     )
 
-    def __init__(self, socket_path: Path, cli: object, *, concurrency: int = 1) -> None:
-        if concurrency != 1:
+    def __init__(self, socket_path: Path, cli: CodexCli, *, concurrency: int = 1) -> None:
+        if type(self) is not CodexWorkerServer or concurrency != 1 or type(cli) is not CodexCli:
             raise CodexWorkerError
-        parent = _safe_socket_parent(Path(socket_path))
+        parent, parent_identity = _safe_socket_parent(Path(socket_path))
         path = parent / Path(socket_path).name
-        if len(os.fsencode(path)) > 100 or path.exists() or path.is_symlink():
+        if len(os.fsencode(path)) > 100:
+            raise CodexWorkerError
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            raise CodexWorkerError from None
+        else:
             raise CodexWorkerError
         try:
             run = cli.run
@@ -141,35 +194,86 @@ class CodexWorkerServer:
         except Exception:
             raise CodexWorkerError from None
         object.__setattr__(self, "_socket_path", path)
+        object.__setattr__(self, "_parent", parent)
+        object.__setattr__(self, "_parent_identity", parent_identity)
         object.__setattr__(self, "_run", run)
+        object.__setattr__(self, "_run_anchor", run)
         object.__setattr__(self, "_active", asyncio.Semaphore(1))
         object.__setattr__(self, "_connections", set())
         object.__setattr__(self, "_tasks", set())
         object.__setattr__(self, "_server", None)
         object.__setattr__(self, "_identity", None)
+        object.__setattr__(self, "_handle_anchor", self._handle)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("CodexWorkerServer composition is sealed")
 
+    def _integrity_ok(self) -> bool:
+        return (
+            type(self) is CodexWorkerServer
+            and self._run is self._run_anchor
+            and self._handle_anchor.__self__ is self
+            and self._handle_anchor.__func__ is CodexWorkerServer._handle
+        )
+
     async def start(self) -> None:
-        if self._server is not None or self._socket_path.exists():
+        if not self._integrity_ok() or self._server is not None:
             raise CodexWorkerError
+        _require_parent(self._parent, self._parent_identity)
         try:
-            server = await asyncio.start_unix_server(self._handle, path=self._socket_path)
-            os.chmod(self._socket_path, 0o600)
+            self._socket_path.lstat()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            raise CodexWorkerError from None
+        else:
+            raise CodexWorkerError
+
+        server: asyncio.AbstractServer | None = None
+        raw_socket: socket.socket | None = None
+        socket_identity: tuple[int, int] | None = None
+        try:
+            raw_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            raw_socket.setblocking(False)
+            raw_socket.bind(str(self._socket_path))
             metadata = self._socket_path.lstat()
-            if (
-                not stat.S_ISSOCK(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-            ):
-                server.close()
-                await server.wait_closed()
+            if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.geteuid():
                 raise CodexWorkerError
+            socket_identity = (metadata.st_dev, metadata.st_ino)
+            os.chmod(self._socket_path, 0o600, follow_symlinks=False)
+            checked = self._socket_path.lstat()
+            if (
+                not stat.S_ISSOCK(checked.st_mode)
+                or (checked.st_dev, checked.st_ino) != socket_identity
+                or checked.st_uid != os.geteuid()
+                or stat.S_IMODE(checked.st_mode) != 0o600
+            ):
+                raise CodexWorkerError
+            _require_parent(self._parent, self._parent_identity)
+            server = await asyncio.start_unix_server(self._handle_anchor, sock=raw_socket)
+            raw_socket = None
             object.__setattr__(self, "_server", server)
-            object.__setattr__(self, "_identity", (metadata.st_dev, metadata.st_ino))
-        except CodexWorkerError:
-            raise
+            object.__setattr__(self, "_identity", socket_identity)
+        except BaseException as error:
+            if server is not None:
+                server.close()
+                with suppress(BaseException):
+                    await asyncio.wait_for(server.wait_closed(), _CLOSE_TIMEOUT)
+            if raw_socket is not None:
+                raw_socket.close()
+            if socket_identity is not None:
+                self._unlink_exact(socket_identity)
+            if not isinstance(error, Exception):
+                raise
+            raise CodexWorkerError from None
+
+    def _unlink_exact(self, identity: tuple[int, int]) -> None:
+        try:
+            metadata = self._socket_path.lstat()
+            if stat.S_ISSOCK(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == identity:
+                self._socket_path.unlink()
+        except FileNotFoundError:
+            pass
         except Exception:
             raise CodexWorkerError from None
 
@@ -178,82 +282,101 @@ class CodexWorkerServer:
         if task is not None:
             self._tasks.add(task)
         self._connections.add(writer)
-        response: object
+        try:
+            async with asyncio.timeout(_HANDLER_TIMEOUT):
+                response = await self._response_for(reader)
+                writer.write(_encode(response))
+                await writer.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            with suppress(Exception):
+                writer.write(
+                    _encode(WorkerFailure(ok=False, error_code="worker_failed").model_dump())
+                )
+                await writer.drain()
+        finally:
+            try:
+                await _shielded_close_writer(writer)
+            finally:
+                self._connections.discard(writer)
+                if task is not None:
+                    self._tasks.discard(task)
+
+    async def _response_for(self, reader: asyncio.StreamReader) -> object:
         try:
             value = await _read_frame(reader)
             request = _parse_worker_request(value)
-            result_type = result_type_for(request.request)
-            async with self._active:
+            if self._active.locked():
+                return WorkerFailure(ok=False, error_code="busy").model_dump()
+            await self._active.acquire()
+            try:
+                result_type = result_type_for(request.request)
                 result = await asyncio.wait_for(
-                    self._run(
+                    self._run_anchor(
                         request.request,
                         result_type.model_json_schema(),
                         request.model,
                         request.effort,
                     ),
-                    125.0,
+                    _RUN_TIMEOUT,
                 )
+            finally:
+                self._active.release()
             validated = result_type.model_validate(result.model_dump(mode="python"))
             _scan_secrets(validated.model_dump(mode="python"))
-            response = {"ok": True, "result": validated.model_dump(mode="json")}
+            return {"ok": True, "result": validated.model_dump(mode="json")}
         except asyncio.CancelledError:
             raise
         except CodexAuthError:
-            response = WorkerFailure(ok=False, error_code="auth_failed").model_dump()
+            return WorkerFailure(ok=False, error_code="auth_failed").model_dump()
         except CodexProtocolError:
-            response = WorkerFailure(ok=False, error_code="protocol_failed").model_dump()
+            return WorkerFailure(ok=False, error_code="protocol_failed").model_dump()
         except CodexWorkerError:
-            response = WorkerFailure(ok=False, error_code="invalid_request").model_dump()
+            return WorkerFailure(ok=False, error_code="invalid_request").model_dump()
         except Exception:
-            response = WorkerFailure(ok=False, error_code="worker_failed").model_dump()
-        try:
-            writer.write(_encode(response))
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
-            writer.close()
-            with suppress(Exception):
-                await writer.wait_closed()
-            self._connections.discard(writer)
-            if task is not None:
-                self._tasks.discard(task)
+            return WorkerFailure(ok=False, error_code="worker_failed").model_dump()
 
     async def close(self) -> None:
+        parent_error: CodexWorkerError | None = None
+        try:
+            _require_parent(self._parent, self._parent_identity)
+        except CodexWorkerError as error:
+            parent_error = error
         server = self._server
         if server is not None:
             server.close()
-            await server.wait_closed()
+            with suppress(BaseException):
+                await asyncio.wait_for(server.wait_closed(), _CLOSE_TIMEOUT)
             object.__setattr__(self, "_server", None)
-        for writer in tuple(self._connections):
-            writer.close()
-        for writer in tuple(self._connections):
-            with suppress(Exception):
-                await writer.wait_closed()
         current = asyncio.current_task()
         tasks = tuple(task for task in self._tasks if task is not current)
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            with suppress(BaseException):
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), _CLOSE_TIMEOUT
+                )
+        for writer in tuple(self._connections):
+            await _close_writer(writer)
         identity = self._identity
-        try:
-            metadata = self._socket_path.lstat()
-            if (
-                identity is not None
-                and stat.S_ISSOCK(metadata.st_mode)
-                and (metadata.st_dev, metadata.st_ino) == identity
-            ):
-                self._socket_path.unlink()
-        except FileNotFoundError:
-            pass
+        if parent_error is None and identity is not None:
+            self._unlink_exact(identity)
+        object.__setattr__(self, "_identity", None)
+        if parent_error is not None:
+            raise parent_error
 
 
 class CodexWorkerClient:
-    __slots__ = ("_socket_path",)
+    __slots__ = ("_parent", "_parent_identity", "_socket_path")
 
     def __init__(self, socket_path: Path) -> None:
-        parent = _safe_socket_parent(Path(socket_path))
+        if type(self) is not CodexWorkerClient:
+            raise CodexWorkerError
+        parent, parent_identity = _safe_socket_parent(Path(socket_path))
+        object.__setattr__(self, "_parent", parent)
+        object.__setattr__(self, "_parent_identity", parent_identity)
         object.__setattr__(self, "_socket_path", parent / Path(socket_path).name)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -267,6 +390,7 @@ class CodexWorkerClient:
         effort: str = "medium",
     ):
         try:
+            _require_parent(self._parent, self._parent_identity)
             metadata = self._socket_path.lstat()
             if (
                 not stat.S_ISSOCK(metadata.st_mode)
@@ -289,28 +413,33 @@ class CodexWorkerClient:
             writer: asyncio.StreamWriter
             reader, writer = await asyncio.open_unix_connection(self._socket_path)
             try:
-                connected_metadata = self._socket_path.lstat()
+                _require_parent(self._parent, self._parent_identity)
+                connected = self._socket_path.lstat()
                 if (
-                    not stat.S_ISSOCK(connected_metadata.st_mode)
-                    or (connected_metadata.st_dev, connected_metadata.st_ino) != socket_identity
+                    not stat.S_ISSOCK(connected.st_mode)
+                    or (connected.st_dev, connected.st_ino) != socket_identity
                 ):
                     raise CodexWorkerError
                 writer.write(_encode(envelope.model_dump(mode="json")))
                 await writer.drain()
+                if not writer.can_write_eof():
+                    raise CodexWorkerError
+                writer.write_eof()
                 value = await _read_frame(reader)
             finally:
-                writer.close()
-                with suppress(Exception):
-                    await writer.wait_closed()
+                await _shielded_close_writer(writer)
+            _scan_secrets(value)
             if type(value) is not dict or type(value.get("ok")) is not bool:
                 raise CodexWorkerError
             if value["ok"] is not True or set(value) != {"ok", "result"}:
                 raise CodexWorkerError
             result_type = result_type_for(request)
             try:
-                return result_type.model_validate(value["result"])
+                result = result_type.model_validate(value["result"])
             except ValidationError:
                 raise CodexWorkerError from None
+            _scan_secrets(result.model_dump(mode="python"))
+            return result
 
         try:
             return await asyncio.wait_for(exchange(), _CLIENT_TIMEOUT)

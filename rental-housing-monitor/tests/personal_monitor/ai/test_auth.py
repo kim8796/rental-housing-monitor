@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+import signal
 from pathlib import Path
 
 import pytest
 
 from personal_monitor.ai.auth import CodexAuthError, CodexAuthGuard
+from personal_monitor.ai.launcher import LauncherError, resolve_launcher
 
 
 def async_test(function):
@@ -142,3 +144,157 @@ async def test_auth_cancellation_is_preserved(tmp_path: Path) -> None:
     guard = CodexAuthGuard("/usr/bin/true", home, process_factory=spawn)
     with pytest.raises(asyncio.CancelledError):
         await guard.check()
+
+
+def test_env_node_wrapper_uses_pinned_absolute_interpreter(tmp_path: Path) -> None:
+    node = tmp_path / "node"
+    node.write_bytes(b"native-placeholder")
+    node.chmod(0o755)
+    script = tmp_path / "codex"
+    script.write_text("#!/usr/bin/env node\n// safe fixture\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    launcher = resolve_launcher(str(script), node_binary=str(node))
+
+    assert launcher.argv_prefix == (str(node.resolve()), str(script.resolve()))
+    launcher.verify()
+
+
+def test_env_node_wrapper_rejects_writable_or_unknown_runtime(tmp_path: Path) -> None:
+    node = tmp_path / "node"
+    node.write_bytes(b"native-placeholder")
+    node.chmod(0o777)
+    script = tmp_path / "codex"
+    script.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    script.chmod(0o755)
+    with pytest.raises(LauncherError):
+        resolve_launcher(str(script), node_binary=str(node))
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    with pytest.raises(LauncherError):
+        resolve_launcher(str(script), node_binary="/usr/bin/true")
+
+
+@async_test
+async def test_auth_output_overflow_terminates_and_reaps_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir(mode=0o700)
+
+    class HangingProcess(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__(b"x" * (16 * 1024 + 1))
+            self.returncode = None  # type: ignore[assignment]
+            self.pid = 424_242
+            self.waits = 0
+
+        async def wait(self) -> int:
+            self.waits += 1
+            while self.returncode is None:
+                await asyncio.sleep(0)
+            return self.returncode
+
+    process = HangingProcess()
+    signals: list[int] = []
+
+    def killpg(pid: int, sent: int) -> None:
+        assert pid == process.pid
+        signals.append(sent)
+        process.returncode = -sent  # type: ignore[assignment]
+
+    async def spawn(*_argv: str, **_kwargs: object) -> HangingProcess:
+        return process
+
+    monkeypatch.setattr("personal_monitor.ai.auth.os.killpg", killpg)
+    guard = CodexAuthGuard("/usr/bin/true", home, process_factory=spawn)
+    with pytest.raises(CodexAuthError):
+        await guard.check()
+    assert signals == [signal.SIGTERM]
+    assert process.waits >= 1
+
+
+@async_test
+async def test_auth_timeout_is_fixed_and_terminates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir(mode=0o700)
+
+    class BlockingStream:
+        async def read(self, _size: int) -> bytes:
+            await asyncio.Future()
+            return b""
+
+    process = FakeProcess(b"")
+    process.stdout = BlockingStream()
+    process.stderr = BlockingStream()
+    process.returncode = None  # type: ignore[assignment]
+    process.pid = 515_151
+    signals: list[int] = []
+
+    async def wait() -> int:
+        while process.returncode is None:
+            await asyncio.sleep(0)
+        return process.returncode
+
+    process.wait = wait  # type: ignore[method-assign]
+
+    def killpg(_pid: int, sent: int) -> None:
+        signals.append(sent)
+        process.returncode = -sent  # type: ignore[assignment]
+
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        return process
+
+    monkeypatch.setattr("personal_monitor.ai.auth._AUTH_TIMEOUT", 0.01)
+    monkeypatch.setattr("personal_monitor.ai.auth.os.killpg", killpg)
+    guard = CodexAuthGuard("/usr/bin/true", home, process_factory=spawn)
+    with pytest.raises(CodexAuthError):
+        await guard.check()
+    assert signals == [signal.SIGTERM]
+
+
+@async_test
+async def test_auth_escalates_to_kill_and_preserves_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir(mode=0o700)
+
+    class BlockingStream:
+        async def read(self, _size: int) -> bytes:
+            await asyncio.Future()
+            return b""
+
+    process = FakeProcess(b"")
+    process.stdout = BlockingStream()
+    process.stderr = BlockingStream()
+    process.returncode = None  # type: ignore[assignment]
+    process.pid = 616_161
+    signals: list[int] = []
+
+    async def wait() -> int:
+        while process.returncode is None:
+            await asyncio.sleep(0)
+        return process.returncode
+
+    process.wait = wait  # type: ignore[method-assign]
+
+    def killpg(_pid: int, sent: int) -> None:
+        signals.append(sent)
+        if sent == signal.SIGKILL:
+            process.returncode = -sent  # type: ignore[assignment]
+
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        return process
+
+    monkeypatch.setattr("personal_monitor.ai.auth._PROCESS_STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr("personal_monitor.ai.auth.os.killpg", killpg)
+    guard = CodexAuthGuard("/usr/bin/true", home, process_factory=spawn)
+    task = asyncio.create_task(guard.check())
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process.returncode == -signal.SIGKILL

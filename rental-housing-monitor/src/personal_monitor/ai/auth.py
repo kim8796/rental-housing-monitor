@@ -9,11 +9,14 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Final
 
+from .launcher import LauncherError, PinnedLauncher, resolve_launcher
+
 _AUTH_ERROR: Final = (
     "Codex ChatGPT 로그인이 필요합니다. 관리자가 codex login --device-auth를 실행하세요."
 )
 _MAX_STATUS_BYTES: Final = 16 * 1024
 _AUTH_TIMEOUT: Final = 10.0
+_PROCESS_STOP_TIMEOUT: Final = 1.0
 _SPAWN = asyncio.create_subprocess_exec
 
 ProcessFactory = Callable[..., Awaitable[object]]
@@ -70,14 +73,18 @@ async def _stop_process(process: object) -> None:
     with suppress(ProcessLookupError, PermissionError):
         os.killpg(pid, signal.SIGTERM)
     try:
-        await asyncio.wait_for(process.wait(), 1.0)  # type: ignore[attr-defined]
+        await asyncio.wait_for(  # type: ignore[attr-defined]
+            process.wait(), _PROCESS_STOP_TIMEOUT
+        )
         return
     except BaseException:
         pass
     with suppress(ProcessLookupError, PermissionError):
         os.killpg(pid, signal.SIGKILL)
     with suppress(BaseException):
-        await asyncio.wait_for(process.wait(), 1.0)  # type: ignore[attr-defined]
+        await asyncio.wait_for(  # type: ignore[attr-defined]
+            process.wait(), _PROCESS_STOP_TIMEOUT
+        )
 
 
 async def _wait_status(process: object) -> tuple[bytes, bytes, int]:
@@ -97,10 +104,10 @@ async def _wait_status(process: object) -> tuple[bytes, bytes, int]:
 
 class CodexAuthGuard:
     __slots__ = (
-        "_binary",
-        "_binary_identity",
         "_home",
         "_home_identity",
+        "_launcher",
+        "_launcher_anchor",
         "_process_factory",
         "_process_factory_anchor",
         "_sealed",
@@ -111,33 +118,21 @@ class CodexAuthGuard:
         codex_binary: str,
         codex_home: Path,
         *,
+        node_binary: str | None = None,
         process_factory: ProcessFactory = _SPAWN,
     ) -> None:
         if type(self) is not CodexAuthGuard:
             raise CodexAuthError(_AUTH_ERROR)
-        binary = Path(codex_binary)
         try:
-            metadata = binary.stat()
-            if (
-                not binary.is_absolute()
-                or not stat.S_ISREG(metadata.st_mode)
-                or not os.access(binary, os.X_OK)
-            ):
-                raise CodexAuthError(_AUTH_ERROR)
-        except CodexAuthError:
-            raise
-        except Exception:
+            launcher = resolve_launcher(codex_binary, node_binary=node_binary)
+        except LauncherError:
             raise CodexAuthError(_AUTH_ERROR) from None
-        resolved_binary = binary.resolve(strict=True)
-        binary_metadata = resolved_binary.stat()
         home = _safe_directory(Path(codex_home))
         home_metadata = home.stat()
-        object.__setattr__(self, "_binary", str(resolved_binary))
-        object.__setattr__(
-            self, "_binary_identity", (binary_metadata.st_dev, binary_metadata.st_ino)
-        )
         object.__setattr__(self, "_home", home)
         object.__setattr__(self, "_home_identity", (home_metadata.st_dev, home_metadata.st_ino))
+        object.__setattr__(self, "_launcher", launcher)
+        object.__setattr__(self, "_launcher_anchor", launcher)
         object.__setattr__(self, "_process_factory", process_factory)
         object.__setattr__(self, "_process_factory_anchor", process_factory)
         object.__setattr__(self, "_sealed", True)
@@ -148,36 +143,40 @@ class CodexAuthGuard:
     def __repr__(self) -> str:
         return "<CodexAuthGuard redacted>"
 
+    def _trusted_snapshot(self) -> tuple[PinnedLauncher, Path, tuple[int, int]]:
+        if (
+            type(self) is not CodexAuthGuard
+            or self._launcher is not self._launcher_anchor
+            or self._process_factory is not self._process_factory_anchor
+        ):
+            raise CodexAuthError(_AUTH_ERROR)
+        try:
+            self._launcher_anchor.verify()
+            home = _safe_directory(self._home)
+            metadata = home.stat()
+            if (metadata.st_dev, metadata.st_ino) != self._home_identity:
+                raise CodexAuthError(_AUTH_ERROR)
+            return self._launcher_anchor, home, self._home_identity
+        except (CodexAuthError, LauncherError):
+            raise CodexAuthError(_AUTH_ERROR) from None
+        except Exception:
+            raise CodexAuthError(_AUTH_ERROR) from None
+
     async def check(self) -> None:
         for name in ("OPENAI_API_KEY", "CODEX_API_KEY"):
             if name in os.environ and os.environ[name] != "":
                 raise CodexAuthError(f"{name} 환경 변수는 허용되지 않습니다.")
-        if self._process_factory is not self._process_factory_anchor:
-            raise CodexAuthError(_AUTH_ERROR)
-        try:
-            binary_metadata = os.stat(self._binary, follow_symlinks=False)
-            home = _safe_directory(self._home)
-            home_metadata = home.stat()
-            if (
-                not stat.S_ISREG(binary_metadata.st_mode)
-                or (binary_metadata.st_dev, binary_metadata.st_ino) != self._binary_identity
-                or (home_metadata.st_dev, home_metadata.st_ino) != self._home_identity
-            ):
-                raise CodexAuthError(_AUTH_ERROR)
-        except CodexAuthError:
-            raise
-        except Exception:
-            raise CodexAuthError(_AUTH_ERROR) from None
+        launcher, home, _identity = self._trusted_snapshot()
         env = {
-            "CODEX_HOME": str(self._home),
-            "HOME": str(self._home),
+            "CODEX_HOME": str(home),
+            "HOME": str(home),
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
         }
         process: object | None = None
         try:
             process = await self._process_factory_anchor(
-                self._binary,
+                *launcher.argv_prefix,
                 "login",
                 "status",
                 stdin=asyncio.subprocess.DEVNULL,

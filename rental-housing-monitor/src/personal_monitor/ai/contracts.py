@@ -117,17 +117,13 @@ class WorkerRequest(RedactedModel):
         return self
 
 
-class WorkerSuccess(RedactedModel):
-    ok: Literal[True]
-    result: ResultModel
-
-
 class WorkerFailure(StrictModel):
     ok: Literal[False]
     error_code: Literal[
         "invalid_request",
         "auth_failed",
         "protocol_failed",
+        "busy",
         "worker_failed",
     ]
 
