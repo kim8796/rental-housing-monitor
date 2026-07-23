@@ -10,7 +10,9 @@ import sys
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import asdict
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -66,6 +68,16 @@ def build_parser() -> argparse.ArgumentParser:
     import_rental.add_argument("--owner", required=True)
     import_rental.add_argument("--target", required=True)
     import_rental.add_argument("--dry-run", action="store_true")
+    shadow_run = migration_subcommands.add_parser("shadow-run")
+    shadow_run.add_argument("--source", type=Path, required=True)
+    shadow_run.add_argument("--database", type=Path, required=True)
+    shadow_run.add_argument("--run-date", required=True)
+    duplicate_probe = migration_subcommands.add_parser("duplicate-probe")
+    duplicate_probe.add_argument("--database", type=Path, required=True)
+    duplicate_probe.add_argument("--monitor", required=True)
+    migration_status = migration_subcommands.add_parser("status")
+    migration_status.add_argument("--database", type=Path, required=True)
+    migration_status.add_argument("--as-of")
     return parser
 
 
@@ -117,13 +129,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("run-once failed", file=sys.stderr)
             return 1
     if arguments.command == "migration":
-        return _migration_import_rental(
-            arguments.source,
-            arguments.database,
-            arguments.owner,
-            arguments.target,
-            dry_run=arguments.dry_run,
-        )
+        if arguments.migration_action == "import-rental":
+            return _migration_import_rental(
+                arguments.source,
+                arguments.database,
+                arguments.owner,
+                arguments.target,
+                dry_run=arguments.dry_run,
+            )
+        if arguments.migration_action == "shadow-run":
+            return _migration_shadow_run(
+                arguments.source,
+                arguments.database,
+                arguments.run_date,
+            )
+        if arguments.migration_action == "duplicate-probe":
+            return _migration_duplicate_probe(
+                arguments.database,
+                arguments.monitor,
+            )
+        return _migration_status(arguments.database, arguments.as_of)
     return 2
 
 
@@ -390,3 +415,152 @@ def _migration_import_rental(
         return 1
     print(canonical_json(asdict(report)))
     return 0
+
+
+def _migration_shadow_run(source: Path, database: Path, run_date: str) -> int:
+    from personal_monitor.adapters.rental_housing import production_rental_housing_adapter
+    from personal_monitor.migration.import_rental import _normalized_absolute_path
+    from personal_monitor.migration.shadow import ShadowRepository, run_shadow_fetch
+    from personal_monitor.service import NullDeliverySender
+    from personal_monitor.storage.schema import canonical_json
+
+    connection: sqlite3.Connection | None = None
+    try:
+        key = os.environ.get("PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY")
+        if type(key) is not str or not key:
+            raise ValueError("data key is unavailable")
+        target = _normalized_absolute_path(database)
+        requested = _canonical_cli_date(run_date)
+        connection = open_existing_database(target)
+        result = asyncio.run(
+            run_shadow_fetch(
+                source,
+                ShadowRepository(connection),
+                requested,
+                adapter=production_rental_housing_adapter(key),
+                sender=NullDeliverySender(),
+            )
+        )
+        print(canonical_json(_shadow_result_output(result)))
+        return 0
+    except Exception:
+        print("rental shadow failed", file=sys.stderr)
+        return 1
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _migration_duplicate_probe(database: Path, monitor: str) -> int:
+    from personal_monitor.adapters.rental_housing import production_rental_housing_adapter
+    from personal_monitor.migration.import_rental import _normalized_absolute_path
+    from personal_monitor.migration.shadow import ShadowRepository, run_duplicate_probe
+    from personal_monitor.service import NullDeliverySender
+    from personal_monitor.storage.schema import canonical_json
+
+    connection: sqlite3.Connection | None = None
+    try:
+        key = os.environ.get("PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY")
+        if type(key) is not str or not key:
+            raise ValueError("data key is unavailable")
+        target = _normalized_absolute_path(database)
+        connection = open_existing_database(target)
+        result = asyncio.run(
+            run_duplicate_probe(
+                ShadowRepository(connection),
+                monitor,
+                adapter=production_rental_housing_adapter(key),
+                sender=NullDeliverySender(),
+            )
+        )
+        print(
+            canonical_json(
+                {
+                    "monitor_id": result.monitor_id,
+                    "run_date": result.run_date.isoformat(),
+                    "current_hash": result.current_hash,
+                    "passed": result.passed,
+                    "missing_ids": result.missing_ids,
+                    "conflicting_ids": result.conflicting_ids,
+                }
+            )
+        )
+        return 0
+    except Exception:
+        print("rental duplicate probe failed", file=sys.stderr)
+        return 1
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _migration_status(database: Path, as_of: str | None) -> int:
+    from personal_monitor.migration.import_rental import _normalized_absolute_path
+    from personal_monitor.migration.shadow import ShadowRepository
+    from personal_monitor.storage.schema import canonical_json
+
+    connection: sqlite3.Connection | None = None
+    try:
+        requested = (
+            datetime.now(ZoneInfo("Asia/Seoul")).date()
+            if as_of is None
+            else _canonical_cli_date(as_of)
+        )
+        target = _normalized_absolute_path(database)
+        connection = open_existing_database(target)
+        status = ShadowRepository(connection).status(requested)
+        print(
+            canonical_json(
+                {
+                    "consecutive_matches": status.consecutive_matches,
+                    "last_match_date": (
+                        status.last_match_date.isoformat()
+                        if status.last_match_date is not None
+                        else None
+                    ),
+                    "unresolved_differences": status.unresolved_differences,
+                    "state_imported": status.state_imported,
+                    "duplicate_probe_passed": status.duplicate_probe_passed,
+                    "cutover_ready": status.cutover_ready,
+                }
+            )
+        )
+        return 0
+    except Exception:
+        print("rental migration status failed", file=sys.stderr)
+        return 1
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _canonical_cli_date(value: object) -> date:
+    if type(value) is not str or len(value) != 10:
+        raise ValueError("date is invalid")
+    parsed = date.fromisoformat(value)
+    if parsed.isoformat() != value:
+        raise ValueError("date is invalid")
+    return parsed
+
+
+def _shadow_result_output(result: object) -> dict[str, object]:
+    from personal_monitor.migration.shadow import ShadowResult
+
+    if type(result) is not ShadowResult:
+        raise ValueError("shadow result is invalid")
+    return {
+        "run_date": result.run_date.isoformat(),
+        "old_hash": result.old_hash,
+        "new_hash": result.new_hash,
+        "matched": result.matched,
+        "differences": tuple(
+            {
+                "agency": difference.agency,
+                "missing_ids": difference.missing_ids,
+                "extra_ids": difference.extra_ids,
+            }
+            for difference in result.differences
+        ),
+        "old_status": result.old_status,
+        "new_status": result.new_status,
+    }

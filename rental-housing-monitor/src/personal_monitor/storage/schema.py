@@ -112,12 +112,27 @@ CREATE TABLE health_write_probe(
 );
 """
 
+_MIGRATION_6 = """
+CREATE TABLE rental_shadow_results(
+  run_date TEXT PRIMARY KEY, old_hash TEXT NOT NULL, new_hash TEXT NOT NULL,
+  matched INTEGER NOT NULL, differences_json TEXT NOT NULL,
+  old_status_json TEXT NOT NULL, new_status_json TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+CREATE TABLE rental_duplicate_probe_results(
+  monitor_id TEXT PRIMARY KEY, run_date TEXT NOT NULL, current_hash TEXT NOT NULL,
+  passed INTEGER NOT NULL, differences_json TEXT NOT NULL, recorded_at TEXT NOT NULL,
+  FOREIGN KEY(monitor_id) REFERENCES monitors(id)
+);
+"""
+
 _MIGRATIONS = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
     (4, _MIGRATION_4),
     (5, _MIGRATION_5),
+    (6, _MIGRATION_6),
 )
 
 

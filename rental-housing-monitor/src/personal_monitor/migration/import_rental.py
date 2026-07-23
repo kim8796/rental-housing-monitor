@@ -11,10 +11,11 @@ import threading
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import quote, urlsplit
+from zoneinfo import ZoneInfo
 
 from personal_monitor.adapters.rental_housing import (
     RENTAL_ANNOUNCEMENT_FIELDS,
@@ -96,6 +97,7 @@ _EXPECTED_LEGACY_SQL = {
     """,
 }
 _IMPORT_LOCK = threading.RLock()
+_SEOUL = ZoneInfo("Asia/Seoul")
 
 
 class RentalImportError(RuntimeError):
@@ -645,6 +647,114 @@ def _read_source(path: Path, expected_identity: _FileIdentity) -> _SourceSnapsho
         raise
     except sqlite3.Error:
         raise RentalImportError("legacy database validation failed") from None
+    finally:
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def _read_legacy_shadow_snapshot(
+    value: str | Path,
+    run_date: date,
+    *,
+    now: datetime,
+) -> tuple[tuple[_AnnouncementRow, ...], Mapping[str, str]]:
+    """Read one authoritative run without exposing a live connection or delivery data."""
+    try:
+        if type(run_date) is not date:
+            raise RentalImportError("legacy shadow date is invalid")
+        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+            raise RentalImportError("legacy shadow clock is invalid")
+        local_today = now.astimezone(_SEOUL).date()
+        if run_date > local_today or local_today - run_date > timedelta(days=31):
+            raise RentalImportError("legacy shadow date is outside the operational window")
+        path = _normalized_absolute_path(value)
+        metadata = _regular_file_stat(path, required=True)
+        assert metadata is not None
+        expected_identity = _identity(metadata)
+        for suffix in ("-wal", "-shm", "-journal"):
+            if Path(f"{path}{suffix}").exists():
+                raise RentalImportError("legacy database is not a closed snapshot")
+        return _read_legacy_shadow_rows(path, expected_identity, run_date, now)
+    except RentalImportError:
+        raise
+    except Exception:
+        raise RentalImportError("legacy shadow validation failed") from None
+
+
+def _read_legacy_shadow_rows(
+    path: Path,
+    expected_identity: _FileIdentity,
+    run_date: date,
+    now: datetime,
+) -> tuple[tuple[_AnnouncementRow, ...], Mapping[str, str]]:
+    connection: sqlite3.Connection | None = None
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        if _identity(os.fstat(descriptor)) != expected_identity:
+            raise RentalImportError("legacy database identity changed")
+        connection = _read_only_connection(path, immutable=True)
+        if _identity(path.lstat()) != expected_identity:
+            raise RentalImportError("legacy database identity changed")
+        connection.execute("BEGIN")
+        _validate_source_schema(connection)
+        _validate_source_integrity(connection)
+        run_rows = _bounded_rows(
+            connection,
+            "SELECT id, started_at, finished_at, status, new_count, agency_status "
+            "FROM runs ORDER BY id",
+            "runs",
+        )
+        candidates: list[tuple[datetime, datetime | None, str, Mapping[str, str]]] = []
+        for row in run_rows:
+            _validate_run(row)
+            started = datetime.fromisoformat(_canonical_timestamp(row["started_at"]))
+            if started.astimezone(_SEOUL).date() != run_date:
+                continue
+            finished = (
+                None
+                if row["finished_at"] is None
+                else datetime.fromisoformat(_canonical_timestamp(row["finished_at"]))
+            )
+            statuses = _agency_status(row["agency_status"])
+            candidates.append((started, finished, row["status"], statuses))
+        if not candidates:
+            raise RentalImportError("legacy shadow run is unavailable")
+        latest_start = max(item[0] for item in candidates)
+        latest = [item for item in candidates if item[0] == latest_start]
+        if len(latest) != 1:
+            raise RentalImportError("legacy shadow run is ambiguous")
+        started, finished, status, statuses = latest[0]
+        if (
+            status not in {"success", "partial_failure"}
+            or finished is None
+            or finished > now.astimezone(UTC)
+            or set(statuses) != {"LH", "SH", "GH"}
+        ):
+            raise RentalImportError("legacy shadow run is not authoritative")
+        announcement_rows = _bounded_rows(
+            connection,
+            "SELECT announcement_key, source_id, title, agency, region, housing_type, "
+            "target, announcement_date, application_start_date, application_end_date, "
+            "url, first_seen_at, last_seen_at FROM announcements ORDER BY announcement_key",
+            "announcements",
+        )
+        announcements = tuple(_announcement(row) for row in announcement_rows)
+        selected = tuple(
+            row
+            for row in announcements
+            if started <= datetime.fromisoformat(row.last_seen_at) <= finished
+        )
+        connection.rollback()
+        return selected, statuses
+    except RentalImportError:
+        raise
+    except sqlite3.Error:
+        raise RentalImportError("legacy shadow validation failed") from None
     finally:
         try:
             if connection is not None:

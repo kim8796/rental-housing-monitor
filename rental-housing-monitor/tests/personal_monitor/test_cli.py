@@ -4,11 +4,19 @@ import json
 import sqlite3
 import subprocess
 import sys
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
 from personal_monitor.cli import build_parser, main
+from personal_monitor.migration.shadow import (
+    DuplicateProbeResult,
+    MigrationStatus,
+    ShadowComparator,
+    ShadowSnapshot,
+)
+from personal_monitor.storage import open_database as initialize_database
 
 
 def valid_spec() -> dict[str, object]:
@@ -381,3 +389,234 @@ def test_service_cli_boundaries_redact_raw_sqlite_errors(
     assert captured.out == ""
     assert captured.err == expected
     assert "private" not in captured.err
+
+
+def test_migration_parser_exposes_only_fixed_shadow_probe_and_status_fields() -> None:
+    parser = build_parser()
+
+    shadow = parser.parse_args(
+        [
+            "migration",
+            "shadow-run",
+            "--source",
+            "/tmp/legacy.db",
+            "--database",
+            "/tmp/personal.db",
+            "--run-date",
+            "2026-07-29",
+        ]
+    )
+    probe = parser.parse_args(
+        [
+            "migration",
+            "duplicate-probe",
+            "--database",
+            "/tmp/personal.db",
+            "--monitor",
+            "rental-housing-seoul-gyeonggi",
+        ]
+    )
+    status = parser.parse_args(["migration", "status", "--database", "/tmp/personal.db"])
+
+    assert (shadow.migration_action, shadow.run_date) == ("shadow-run", "2026-07-29")
+    assert (probe.migration_action, probe.monitor) == (
+        "duplicate-probe",
+        "rental-housing-seoul-gyeonggi",
+    )
+    assert (status.migration_action, status.as_of) == ("status", None)
+
+
+def test_migration_status_prints_exact_canonical_json_without_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    database = tmp_path / "personal.db"
+    initialize_database(database).close()
+    expected = MigrationStatus(
+        consecutive_matches=7,
+        last_match_date=date(2026, 7, 29),
+        unresolved_differences=0,
+        state_imported=True,
+        duplicate_probe_passed=True,
+        cutover_ready=True,
+    )
+    monkeypatch.setattr(
+        "personal_monitor.migration.shadow.ShadowRepository.status",
+        lambda _self, as_of: expected if as_of == date(2026, 7, 30) else None,
+    )
+    monkeypatch.delenv("PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY", raising=False)
+    monkeypatch.delenv("PERSONAL_MONITOR_TELEGRAM_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    assert (
+        main(
+            [
+                "migration",
+                "status",
+                "--database",
+                str(database),
+                "--as-of",
+                "2026-07-30",
+            ]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == (
+        '{"consecutive_matches":7,"cutover_ready":true,'
+        '"duplicate_probe_passed":true,"last_match_date":"2026-07-29",'
+        '"state_imported":true,"unresolved_differences":0}\n'
+    )
+
+
+def test_shadow_cli_uses_only_data_key_null_sender_and_safe_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    database = tmp_path / "personal.db"
+    source = tmp_path / "legacy.db"
+    initialize_database(database).close()
+    source.touch()
+    adapter = object()
+    key = "sensitive-data-go-kr-key"
+    monkeypatch.setenv("PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY", key)
+    monkeypatch.delenv("PERSONAL_MONITOR_TELEGRAM_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "personal_monitor.adapters.rental_housing.production_rental_housing_adapter",
+        lambda value: adapter if value == key else None,
+    )
+
+    async def fake_run(source_path, repository, run_date, *, adapter: object, sender: object):
+        from personal_monitor.service import NullDeliverySender
+
+        assert source_path == source
+        assert repository.connection is not None
+        assert run_date == date(2026, 7, 29)
+        assert adapter is not None
+        assert type(sender) is NullDeliverySender
+        empty = ShadowSnapshot(items=(), source_status={"LH": "ok", "SH": "ok", "GH": "ok"})
+        return ShadowComparator(clock=lambda: datetime(2026, 7, 29, tzinfo=UTC)).compare(
+            empty, empty, run_date
+        )
+
+    monkeypatch.setattr(
+        "personal_monitor.migration.shadow.run_shadow_fetch",
+        fake_run,
+    )
+
+    assert (
+        main(
+            [
+                "migration",
+                "shadow-run",
+                "--source",
+                str(source),
+                "--database",
+                str(database),
+                "--run-date",
+                "2026-07-29",
+            ]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out)["matched"] is True
+    assert key not in captured.out
+
+
+def test_duplicate_probe_cli_uses_null_sender_and_fixed_monitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    database = tmp_path / "personal.db"
+    initialize_database(database).close()
+    adapter = object()
+    monkeypatch.setenv("PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY", "data-key")
+    monkeypatch.setattr(
+        "personal_monitor.adapters.rental_housing.production_rental_housing_adapter",
+        lambda _value: adapter,
+    )
+
+    async def fake_probe(repository, monitor_id, *, adapter: object, sender: object):
+        from personal_monitor.service import NullDeliverySender
+
+        assert repository.connection is not None
+        assert monitor_id == "rental-housing-seoul-gyeonggi"
+        assert adapter is not None
+        assert type(sender) is NullDeliverySender
+        return DuplicateProbeResult(
+            monitor_id=monitor_id,
+            run_date=date(2026, 7, 30),
+            current_hash="d" * 64,
+            passed=True,
+            missing_ids=(),
+            conflicting_ids=(),
+            recorded_at=datetime(2026, 7, 30, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(
+        "personal_monitor.migration.shadow.run_duplicate_probe",
+        fake_probe,
+    )
+
+    assert (
+        main(
+            [
+                "migration",
+                "duplicate-probe",
+                "--database",
+                str(database),
+                "--monitor",
+                "rental-housing-seoul-gyeonggi",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        "conflicting_ids": [],
+        "current_hash": "d" * 64,
+        "missing_ids": [],
+        "monitor_id": "rental-housing-seoul-gyeonggi",
+        "passed": True,
+        "run_date": "2026-07-30",
+    }
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    (
+        ("shadow-run", "rental shadow failed\n"),
+        ("duplicate-probe", "rental duplicate probe failed\n"),
+    ),
+)
+def test_fetch_migration_commands_require_data_key_with_fixed_redacted_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    action: str,
+    expected: str,
+) -> None:
+    database = tmp_path / "personal.db"
+    source = tmp_path / "secret-source.db"
+    initialize_database(database).close()
+    source.touch()
+    monkeypatch.delenv("PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY", raising=False)
+    arguments = ["migration", action, "--database", str(database)]
+    if action == "shadow-run":
+        arguments += ["--source", str(source), "--run-date", "2026-07-29"]
+    else:
+        arguments += ["--monitor", "rental-housing-seoul-gyeonggi"]
+
+    assert main(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected
+    assert "secret-source" not in captured.err
