@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 from personal_monitor.ports import DeliverySender, OperatorHealthSink
@@ -37,6 +38,7 @@ class OutboxWorker:
         now: datetime,
         limit: int = 50,
         monitor_id: str | None = None,
+        outbox_ids: Sequence[str] | None = None,
     ) -> int:
         delivered_count = 0
         for row in self.runtime.claim_due_outbox(
@@ -44,6 +46,7 @@ class OutboxWorker:
             now=now,
             limit=limit,
             monitor_id=monitor_id,
+            outbox_ids=outbox_ids,
         ):
             try:
                 target = self.registry.get_delivery_target(row.target_id)

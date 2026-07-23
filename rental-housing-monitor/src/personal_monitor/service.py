@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from personal_monitor.storage.runtime import MonitorLease
 
 _LOGGER = logging.getLogger(__name__)
+_MAX_COMPONENT_FAILURES = 5
 
 
 class ServiceFailure(RuntimeError):
@@ -119,6 +120,7 @@ class PersonalMonitorService:
             raise ValueError("shutdown grace must be nonnegative")
         dependencies = (
             (telegram_api, "get_updates"),
+            (telegram_api, "ensure_webhook_disabled"),
             (telegram_gateway, "handle_update"),
             (scheduler, "tick"),
             (runner, "run"),
@@ -199,6 +201,7 @@ class PersonalMonitorService:
         try:
             try:
                 installed = self._install_signal_handlers()
+                await self.telegram_api.ensure_webhook_disabled()
                 async with asyncio.TaskGroup() as group:
                     self._task_group = group
                     periodic = (
@@ -253,10 +256,15 @@ class PersonalMonitorService:
                 for update in updates:
                     if self.stopping:
                         return
-                    await self.telegram_gateway.handle_update(update, now=self._now())
                     update_id = getattr(update, "update_id", None)
                     if type(update_id) is not int or update_id < self._telegram_offset:
                         raise RuntimeError("invalid Telegram update sequence")
+                    try:
+                        await self.telegram_gateway.handle_update(update, now=self._now())
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        _safe_log("telegram_update_failed", error)
                     self._telegram_offset = update_id + 1
                     self._telegram_last_update = self._now()
                 # A real long poll suspends. This explicit checkpoint also prevents a
@@ -265,8 +273,7 @@ class PersonalMonitorService:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                failures += 1
-                _safe_log("telegram_iteration_failed", error, retry_count=failures)
+                failures = _component_failure("telegram_iteration_failed", error, failures)
                 await self.sleeper(min(30.0, float(2 ** min(failures - 1, 5))))
 
     async def _scheduler_loop(self) -> None:
@@ -286,8 +293,7 @@ class PersonalMonitorService:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                failures += 1
-                _safe_log("scheduler_iteration_failed", error, retry_count=failures)
+                failures = _component_failure("scheduler_iteration_failed", error, failures)
             deadline = _next_deadline(deadline, 15.0, self.monotonic())
             await self.sleeper(max(0.0, deadline - self.monotonic()))
 
@@ -301,12 +307,12 @@ class PersonalMonitorService:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                failures += 1
-                _safe_log("outbox_iteration_failed", error, retry_count=failures)
+                failures = _component_failure("outbox_iteration_failed", error, failures)
             deadline = _next_deadline(deadline, 5.0, self.monotonic())
             await self.sleeper(max(0.0, deadline - self.monotonic()))
 
     async def _maintenance_loop(self) -> None:
+        failures = 0
         while not self.stopping:
             now = self._now()
             scheduled = next_maintenance_run(now, self.timezone)
@@ -319,10 +325,11 @@ class PersonalMonitorService:
                 result = self.maintenance.run(now=self._now())
                 if inspect.isawaitable(result):
                     await result
+                failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                _safe_log("maintenance_iteration_failed", error)
+                failures = _component_failure("maintenance_iteration_failed", error, failures)
 
     async def _heartbeat_loop(self) -> None:
         deadline = self.monotonic()
@@ -334,8 +341,7 @@ class PersonalMonitorService:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                failures += 1
-                _safe_log("heartbeat_iteration_failed", error, retry_count=failures)
+                failures = _component_failure("heartbeat_iteration_failed", error, failures)
             deadline = _next_deadline(deadline, 60.0, self.monotonic())
             await self.sleeper(max(0.0, deadline - self.monotonic()))
 
@@ -437,6 +443,14 @@ def _safe_log(event: str, error: BaseException, **context: object) -> None:
         )
     except BaseException:
         return
+
+
+def _component_failure(event: str, error: Exception, previous: int) -> int:
+    failures = previous + 1
+    _safe_log(event, error, retry_count=failures)
+    if failures >= _MAX_COMPONENT_FAILURES:
+        raise ServiceFailure from None
+    return failures
 
 
 def _next_deadline(previous: float, interval: float, now: float) -> float:
@@ -830,8 +844,12 @@ async def run_monitor_once(
             worker_id=worker_id,
             now=datetime.now(UTC),
         )
-        await runner.run(lease)
-        await outbox.drain_once(now=datetime.now(UTC), monitor_id=monitor_id)
+        result = await runner.run(lease)
+        await outbox.drain_once(
+            now=datetime.now(UTC),
+            monitor_id=monitor_id,
+            outbox_ids=result.outbox_ids,
+        )
         return 0
     finally:
         for resource in ((telegram,) if telegram is not None else ()) + resources:

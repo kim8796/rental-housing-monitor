@@ -308,15 +308,19 @@ class RuntimeRepository:
         *,
         lease: MonitorLease,
         worker_id: str,
+        return_new_only: bool = False,
     ) -> list[str]:
         with transaction(self.connection, immediate=True):
             if batch.monitor_id != lease.monitor_id:
                 raise ValueError("batch monitor does not match lease")
             self._assert_monitor_lease(lease, worker_id)
             self._upsert_items(batch)
-            return [self._enqueue_delivery(batch.monitor_id, candidate) for candidate in candidates]
+            results = [
+                self._enqueue_delivery(batch.monitor_id, candidate) for candidate in candidates
+            ]
+            return [outbox_id for outbox_id, created in results if created or not return_new_only]
 
-    def _enqueue_delivery(self, monitor_id: str, candidate: DeliveryCandidate) -> str:
+    def _enqueue_delivery(self, monitor_id: str, candidate: DeliveryCandidate) -> tuple[str, bool]:
         ownership = self.connection.execute(
             "SELECT m.owner_id AS monitor_owner, t.owner_id AS target_owner "
             "FROM monitors AS m JOIN delivery_targets AS t ON t.id = ? WHERE m.id = ?",
@@ -333,7 +337,7 @@ class RuntimeRepository:
         if existing is not None:
             if existing["monitor_id"] != monitor_id or existing["target_id"] != candidate.target_id:
                 raise ValueError("delivery dedupe key belongs to another aggregate")
-            return existing["id"]
+            return existing["id"], False
         outbox_id = uuid4().hex
         created_at = utc_now().isoformat()
         self.connection.execute(
@@ -349,7 +353,7 @@ class RuntimeRepository:
                 created_at,
             ),
         )
-        return outbox_id
+        return outbox_id, True
 
     def _assert_monitor_lease(self, lease: MonitorLease, worker_id: str) -> None:
         owned = self.connection.execute(
@@ -367,6 +371,7 @@ class RuntimeRepository:
         lease_seconds: int = 300,
         limit: int = 50,
         monitor_id: str | None = None,
+        outbox_ids: Sequence[str] | None = None,
     ) -> list[OutboxRow]:
         now_timestamp = utc_timestamp(now, parameter="now")
         if lease_seconds <= 0:
@@ -375,14 +380,30 @@ class RuntimeRepository:
             raise ValueError("limit must be positive")
         if monitor_id is not None and (type(monitor_id) is not str or not monitor_id):
             raise ValueError("monitor_id must be nonempty")
+        exact_ids: tuple[str, ...] | None = None
+        if outbox_ids is not None:
+            exact_ids = tuple(outbox_ids)
+            if not exact_ids:
+                return []
+            if (
+                len(exact_ids) > 100
+                or len(set(exact_ids)) != len(exact_ids)
+                or any(type(value) is not str or not 1 <= len(value) <= 128 for value in exact_ids)
+            ):
+                raise ValueError("outbox_ids are invalid")
         lease_expires_at = utc_timestamp(
             now + timedelta(seconds=lease_seconds), parameter="lease_expires_at"
         )
         monitor_clause = "" if monitor_id is None else "AND monitor_id = ? "
+        exact_clause = (
+            "" if exact_ids is None else f"AND id IN ({', '.join('?' for _ in exact_ids)}) "
+        )
         parameters: tuple[object, ...] = (
-            (now_timestamp, now_timestamp, limit)
-            if monitor_id is None
-            else (now_timestamp, now_timestamp, monitor_id, limit)
+            now_timestamp,
+            now_timestamp,
+            *((monitor_id,) if monitor_id is not None else ()),
+            *(exact_ids or ()),
+            limit,
         )
         with transaction(self.connection, immediate=True):
             rows = self.connection.execute(
@@ -390,6 +411,7 @@ class RuntimeRepository:
                 "WHERE status = 'pending' AND available_at <= ? "
                 "AND (lease_expires_at IS NULL OR lease_expires_at <= ?) "
                 f"{monitor_clause}"
+                f"{exact_clause}"
                 "ORDER BY available_at, created_at, id LIMIT ?",
                 parameters,
             ).fetchall()

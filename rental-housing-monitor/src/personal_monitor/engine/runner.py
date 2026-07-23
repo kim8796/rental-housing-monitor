@@ -44,6 +44,7 @@ class RunResult:
     status: Literal["success", "partial_failure", "failed"]
     matched_count: int
     warning_count: int
+    outbox_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,13 +186,18 @@ class MonitorRunner:
             run_status = "success"
         else:
             run_status = "success"
-        self.runtime.apply_snapshot_and_deliveries(
-            batch, candidates, lease=lease, worker_id=self.worker_id
+        outbox_ids = self.runtime.apply_snapshot_and_deliveries(
+            batch,
+            candidates,
+            lease=lease,
+            worker_id=self.worker_id,
+            return_new_only=True,
         )
         return RunResult(
             status=run_status,
             matched_count=matched_count,
             warning_count=len(batch.warnings),
+            outbox_ids=tuple(outbox_ids),
         )
 
     async def _complete_started_run(

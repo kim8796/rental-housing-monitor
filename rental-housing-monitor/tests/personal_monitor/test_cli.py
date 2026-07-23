@@ -349,3 +349,35 @@ def test_run_once_passes_only_explicit_delivery_mode_to_safe_boundary(
         == 0
     )
     assert calls == [(tmp_path / "db", "monitor-private", "enabled")]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "boundary", "expected"),
+    [
+        (["serve"], "_serve_command", "personal monitor service failed\n"),
+        (
+            ["run-once", "--database", "/tmp/db", "--monitor", "monitor-1"],
+            "_run_once_command",
+            "run-once failed\n",
+        ),
+    ],
+)
+def test_service_cli_boundaries_redact_raw_sqlite_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    arguments: list[str],
+    boundary: str,
+    expected: str,
+) -> None:
+    import personal_monitor.cli as cli_module
+
+    def fail(*_args) -> int:
+        raise sqlite3.OperationalError("token=private query=select private")
+
+    monkeypatch.setattr(cli_module, boundary, fail)
+
+    assert main(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected
+    assert "private" not in captured.err

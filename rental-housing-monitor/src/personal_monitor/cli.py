@@ -85,7 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "serve":
         try:
             return _serve_command()
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
             print("personal monitor service failed", file=sys.stderr)
             return 1
     if arguments.command == "ai-worker":
@@ -94,7 +94,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         try:
             return _ai_worker_command(arguments.socket)
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
             print("ai worker failed", file=sys.stderr)
             return 1
     if arguments.command == "run-once":
@@ -104,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.monitor,
                 arguments.delivery,
             )
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
             print("run-once failed", file=sys.stderr)
             return 1
     return 2

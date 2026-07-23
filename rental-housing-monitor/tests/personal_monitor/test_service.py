@@ -23,6 +23,10 @@ class FakeTelegram:
         self.offsets: list[int] = []
         self.closed = 0
         self.sent: list[tuple[object, str]] = []
+        self.preflight_calls = 0
+
+    async def ensure_webhook_disabled(self) -> None:
+        self.preflight_calls += 1
 
     async def get_updates(self, *, offset: int, timeout: int = 30):
         self.concurrent += 1
@@ -129,6 +133,7 @@ def test_service_runs_exactly_one_sequential_poller_and_periodic_components() ->
     asyncio.run(service.run())
 
     assert telegram.max_concurrent == 1
+    assert telegram.preflight_calls == 1
     assert telegram.offsets[0] == 0
     assert gateway.ids == [7]
     assert service.telegram_offset == 8
@@ -233,3 +238,119 @@ def test_next_maintenance_run_is_the_next_local_0330_without_drift() -> None:
     assert next_maintenance_run(exact, seoul).astimezone(seoul) == datetime(
         2026, 7, 24, 3, 30, tzinfo=seoul
     )
+
+
+def test_webhook_preflight_failure_starts_no_component_loop_and_closes() -> None:
+    telegram = FakeTelegram()
+    scheduler = FakeScheduler()
+
+    async def fail_preflight() -> None:
+        telegram.preflight_calls += 1
+        raise RuntimeError("private webhook detail")
+
+    telegram.ensure_webhook_disabled = fail_preflight
+    heartbeat = StopHeartbeat()
+    service = PersonalMonitorService(
+        telegram_api=telegram,
+        telegram_gateway=FakeGateway(),
+        scheduler=scheduler,
+        runner=FakeRunner(),
+        outbox=FakePeriodic(),
+        maintenance=FakePeriodic(),
+        heartbeat=heartbeat,
+        resources=(telegram,),
+        clock=lambda: datetime(2026, 7, 23, tzinfo=UTC),
+        sleeper=immediate_sleep,
+    )
+    heartbeat.service = service
+
+    with pytest.raises(Exception, match="personal monitor service failed"):
+        asyncio.run(service.run())
+
+    assert telegram.preflight_calls == 1
+    assert telegram.offsets == []
+    assert scheduler.calls == 0
+    assert telegram.closed == 1
+
+
+@pytest.mark.parametrize(
+    "component",
+    ["telegram", "scheduler", "outbox", "maintenance", "heartbeat"],
+)
+def test_persistent_component_failure_escalates_to_service_failure(component: str) -> None:
+    class AlwaysFails:
+        async def get_updates(self, **_kwargs):
+            raise RuntimeError("private")
+
+        def tick(self, _now):
+            raise RuntimeError("private")
+
+        async def drain_once(self, **_kwargs):
+            raise RuntimeError("private")
+
+        def run(self, **_kwargs):
+            raise RuntimeError("private")
+
+        async def beat(self, **_kwargs):
+            raise RuntimeError("private")
+
+    failing = AlwaysFails()
+    telegram = FakeTelegram()
+    if component == "telegram":
+        telegram.get_updates = failing.get_updates
+    service = PersonalMonitorService(
+        telegram_api=telegram,
+        telegram_gateway=FakeGateway(),
+        scheduler=failing if component == "scheduler" else FakeScheduler(),
+        runner=FakeRunner(),
+        outbox=failing if component == "outbox" else FakePeriodic(),
+        maintenance=failing if component == "maintenance" else FakePeriodic(),
+        heartbeat=failing if component == "heartbeat" else StopHeartbeat(),
+        clock=lambda: datetime(2026, 7, 23, tzinfo=UTC),
+        sleeper=immediate_sleep,
+    )
+    if component != "heartbeat":
+        # A healthy heartbeat must not stop the service while another component is
+        # proving its bounded failure policy.
+        service.heartbeat = FakePeriodicHeartbeat()
+
+    with pytest.raises(Exception, match="personal monitor service failed"):
+        asyncio.run(service.run())
+
+
+class FakePeriodicHeartbeat:
+    async def beat(self, **_kwargs) -> None:
+        await asyncio.sleep(0)
+
+
+def test_transient_scheduler_failure_recovers_and_resets_failure_budget() -> None:
+    class Recovers:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.service: PersonalMonitorService | None = None
+
+        def tick(self, _now):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("private")
+            assert self.service is not None
+            self.service.request_stop()
+            return []
+
+    scheduler = Recovers()
+    service = PersonalMonitorService(
+        telegram_api=FakeTelegram(),
+        telegram_gateway=FakeGateway(),
+        scheduler=scheduler,
+        runner=FakeRunner(),
+        outbox=FakePeriodic(),
+        maintenance=FakePeriodic(),
+        heartbeat=FakePeriodicHeartbeat(),
+        clock=lambda: datetime(2026, 7, 23, tzinfo=UTC),
+        sleeper=immediate_sleep,
+    )
+    scheduler.service = service
+
+    asyncio.run(service.run())
+
+    assert scheduler.calls == 2

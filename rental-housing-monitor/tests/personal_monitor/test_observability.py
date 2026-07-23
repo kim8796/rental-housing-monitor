@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -59,6 +59,23 @@ def test_json_formatter_emits_only_exact_allowlisted_keys() -> None:
     assert "private" not in json.dumps(value)
 
 
+def test_json_formatter_rejects_regex_valid_but_untrusted_event_name() -> None:
+    record = logging.LogRecord(
+        "personal_monitor.test",
+        logging.INFO,
+        __file__,
+        1,
+        "",
+        (),
+        None,
+    )
+    record.event = "attacker_valid_event"
+
+    value = json.loads(JsonLogFormatter().format(record))
+
+    assert value["event"] == "log_event"
+
+
 def test_repeated_logger_setup_has_one_rotating_handler(tmp_path: Path) -> None:
     path = tmp_path / "logs" / "monitor.jsonl"
 
@@ -72,6 +89,27 @@ def test_repeated_logger_setup_has_one_rotating_handler(tmp_path: Path) -> None:
     assert len(handlers) == 1
     assert handlers[0].maxBytes == 10 * 1024 * 1024
     assert handlers[0].backupCount == 5
+
+
+def test_logger_setup_rejects_existing_world_writable_directory(tmp_path: Path) -> None:
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o777)
+
+    with pytest.raises(ValueError, match="log parent"):
+        configure_json_logging(unsafe / "monitor.jsonl", logger_name="personal_monitor.unsafe")
+
+    assert unsafe.stat().st_mode & 0o777 == 0o777
+
+
+def test_logger_setup_rejects_a_symlink_parent(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "linked"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="log parent"):
+        configure_json_logging(link / "monitor.jsonl", logger_name="personal_monitor.symlink")
 
 
 def test_operator_event_enqueue_is_durable_and_deduplicated(tmp_path: Path) -> None:
@@ -149,5 +187,40 @@ def test_heartbeat_records_each_probe_independently_and_enqueues_failures(
         assert snapshot.codex_login.healthy
         assert snapshot.backup.healthy
         assert connection.execute("SELECT COUNT(*) FROM operator_events").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_heartbeat_marks_old_scheduler_and_telegram_successes_stale(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "monitor.db"
+    connection = open_database(database_path)
+    backup_path = tmp_path / "backup.json"
+    backup_path.write_text(
+        '{"schema_version":1,"status":"ok","updated_at":"2026-07-23T00:00:00Z"}',
+        encoding="utf-8",
+    )
+
+    class HealthyAuth:
+        async def check(self) -> None:
+            return None
+
+    now = datetime(2026, 7, 23, 1, tzinfo=UTC)
+    monitor = HeartbeatMonitor(
+        connection=connection,
+        database_path=database_path,
+        backup_status_path=backup_path,
+        auth_guard=HealthyAuth(),
+        operator_events=OperatorEventRepository(connection),
+        scheduler_last_loop=lambda: now - timedelta(seconds=46),
+        telegram_last_poll=lambda: now - timedelta(seconds=91),
+    )
+    try:
+        snapshot = asyncio.run(monitor.collect(now=now))
+
+        assert snapshot.scheduler_loop.code == "scheduler_loop_stale"
+        assert snapshot.telegram_poll.code == "telegram_poll_stale"
+        assert connection.execute("SELECT COUNT(*) FROM operator_events").fetchone()[0] == 2
     finally:
         connection.close()

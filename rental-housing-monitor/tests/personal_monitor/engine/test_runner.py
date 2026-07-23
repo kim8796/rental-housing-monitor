@@ -217,7 +217,10 @@ def test_successful_run_queues_only_idempotent_outbox_and_releases_lease(
     assert first.status == "success"
     assert (first.matched_count, first.warning_count) == (1, 0)
     assert runtime.load_items(monitor_id) == list(batch.items)
-    row = connection.execute("SELECT dedupe_key, target_id, payload_json FROM outbox").fetchone()
+    row = connection.execute(
+        "SELECT id, dedupe_key, target_id, payload_json FROM outbox"
+    ).fetchone()
+    assert first.outbox_ids == (row["id"],)
     assert row["dedupe_key"] == f"{monitor_id}:listing-1:new_item"
     assert row["target_id"] == "target-1"
     assert "real-chat-address" not in row["payload_json"]

@@ -11,7 +11,7 @@ import stat
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Final
@@ -37,9 +37,22 @@ _SENSITIVE_KEY_PARTS: Final = (
     "html",
     "message_text",
 )
-_EVENT_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
+_TRUSTED_EVENTS: Final = frozenset(
+    {
+        "heartbeat_iteration_failed",
+        "maintenance_iteration_failed",
+        "monitor_run_failed",
+        "outbox_iteration_failed",
+        "scheduler_iteration_failed",
+        "telegram_iteration_failed",
+        "telegram_update_failed",
+    }
+)
 _SAFE_VALUE = re.compile(r"[A-Za-z0-9_.:-]{1,256}\Z")
 _MAX_BACKUP_STATUS_BYTES: Final = 16 * 1024
+_SCHEDULER_MAX_AGE = timedelta(seconds=45)
+_TELEGRAM_POLL_MAX_AGE = timedelta(seconds=90)
+_MAX_CLOCK_SKEW = timedelta(seconds=5)
 
 
 def _normalized_key(value: object) -> str:
@@ -137,7 +150,7 @@ class JsonLogFormatter(logging.Formatter):
             raw_event = getattr(record, "event", None)
             event = (
                 raw_event
-                if type(raw_event) is str and _EVENT_CODE.fullmatch(raw_event) is not None
+                if type(raw_event) is str and raw_event in _TRUSTED_EVENTS
                 else "log_event"
             )
             value: dict[str, object] = {
@@ -205,10 +218,30 @@ def configure_json_logging(
 
 
 def _ensure_log_parent(parent: Path) -> None:
-    parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-    metadata = parent.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or parent.is_symlink():
+    if not parent.is_absolute() or parent != Path(os.path.normpath(parent)):
         raise ValueError("log parent is not a directory")
+    ancestor = parent.parent
+    try:
+        ancestor_metadata = ancestor.lstat()
+        if (
+            not stat.S_ISDIR(ancestor_metadata.st_mode)
+            or ancestor.is_symlink()
+            or ancestor_metadata.st_mode & 0o022
+            or ancestor_metadata.st_uid not in {0, os.geteuid()}
+        ):
+            raise ValueError
+        with suppress(FileExistsError):
+            os.mkdir(parent, 0o700)
+        metadata = parent.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or parent.is_symlink()
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ValueError
+    except (OSError, ValueError):
+        raise ValueError("log parent is not a private owned directory") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,9 +405,21 @@ class HeartbeatMonitor:
     async def collect(self, *, now: datetime) -> HeartbeatSnapshot:
         checked_at = now.astimezone(UTC)
         db_write = self._db_probe(checked_at)
-        scheduler = self._time_probe(self.scheduler_last_loop, "scheduler_loop_missing")
+        scheduler = self._time_probe(
+            self.scheduler_last_loop,
+            checked_at=checked_at,
+            missing_code="scheduler_loop_missing",
+            stale_code="scheduler_loop_stale",
+            max_age=_SCHEDULER_MAX_AGE,
+        )
         disk = self._disk_probe()
-        telegram = self._time_probe(self.telegram_last_poll, "telegram_poll_missing")
+        telegram = self._time_probe(
+            self.telegram_last_poll,
+            checked_at=checked_at,
+            missing_code="telegram_poll_missing",
+            stale_code="telegram_poll_stale",
+            max_age=_TELEGRAM_POLL_MAX_AGE,
+        )
         telegram_update = self._optional_time_probe(self.telegram_last_update)
         backlog = self._backlog_probe()
         codex = await self._codex_probe()
@@ -434,14 +479,28 @@ class HeartbeatMonitor:
         except Exception:
             return ProbeResult(False, "db_write_failed")
 
-    def _time_probe(self, source: object, missing_code: str) -> ProbeResult:
+    def _time_probe(
+        self,
+        source: object,
+        *,
+        checked_at: datetime,
+        missing_code: str,
+        stale_code: str,
+        max_age: timedelta,
+    ) -> ProbeResult:
         try:
             value = source() if callable(source) else source
             if value is None:
                 return ProbeResult(False, missing_code)
             if not isinstance(value, datetime) or value.tzinfo is None:
                 raise ValueError
-            return ProbeResult(True, "ok", value.astimezone(UTC))
+            observed_at = value.astimezone(UTC)
+            age = checked_at - observed_at
+            if age < -_MAX_CLOCK_SKEW:
+                return ProbeResult(False, missing_code)
+            if age > max_age:
+                return ProbeResult(False, stale_code, observed_at)
+            return ProbeResult(True, "ok", observed_at)
         except Exception:
             return ProbeResult(False, missing_code)
 

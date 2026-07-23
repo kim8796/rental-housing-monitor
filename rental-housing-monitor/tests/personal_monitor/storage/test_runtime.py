@@ -588,6 +588,53 @@ def test_claim_due_outbox_can_be_scoped_to_one_operator_selected_monitor(
     )
 
 
+def test_claim_due_outbox_exact_ids_excludes_older_same_monitor_rows(
+    repositories: tuple[RegistryRepository, RuntimeRepository],
+    connection: sqlite3.Connection,
+) -> None:
+    registry, runtime = repositories
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    older = seed_outbox(
+        connection,
+        dedupe_key="older",
+        monitor_id=monitor_id,
+        target_id="target-1",
+        payload={"text": "older"},
+        available_at=OUTBOX_AT,
+    )
+    produced = seed_outbox(
+        connection,
+        dedupe_key="produced",
+        monitor_id=monitor_id,
+        target_id="target-1",
+        payload={"text": "produced"},
+        available_at=OUTBOX_AT,
+    )
+
+    rows = runtime.claim_due_outbox(
+        worker_id="operator",
+        now=OUTBOX_AT,
+        outbox_ids=(produced,),
+    )
+
+    assert [row.id for row in rows] == [produced]
+    assert (
+        connection.execute(
+            "SELECT lease_owner FROM outbox WHERE id = ?",
+            (older,),
+        ).fetchone()[0]
+        is None
+    )
+    assert (
+        runtime.claim_due_outbox(
+            worker_id="empty",
+            now=OUTBOX_AT,
+            outbox_ids=(),
+        )
+        == []
+    )
+
+
 def test_two_workers_cannot_claim_the_same_unexpired_outbox_lease(
     repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
 ) -> None:
