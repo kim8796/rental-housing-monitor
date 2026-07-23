@@ -13,6 +13,7 @@ from personal_monitor.telegram.types import CallbackQuery, TelegramMessage, Tele
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_IDENTIFIER: Final = 2**63 - 1
+_MAX_EXCEPTION_GROUP_NODES: Final = 4_096
 _TOKEN_RE: Final = re.compile(r"(confirm|cancel|edit):([A-Za-z0-9_-]{32})\Z")
 
 
@@ -334,11 +335,24 @@ def _valid_identifier(value: object) -> bool:
 
 
 def _is_fatal_exception(error: BaseException) -> bool:
-    if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-        return True
-    return isinstance(error, BaseExceptionGroup) and any(
-        _is_fatal_exception(nested) for nested in error.exceptions
-    )
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if len(seen) > _MAX_EXCEPTION_GROUP_NODES:
+            return True
+        if isinstance(current, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            return True
+        if isinstance(current, BaseExceptionGroup):
+            nested = current.exceptions
+            if len(nested) > _MAX_EXCEPTION_GROUP_NODES - len(seen):
+                return True
+            pending.extend(nested)
+    return False
 
 
 def _valid_log_identifier(value: object) -> bool:

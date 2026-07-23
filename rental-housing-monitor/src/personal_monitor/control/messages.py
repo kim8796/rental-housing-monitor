@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ _MAX_ROWS: Final = 8
 _MAX_BUTTONS: Final = 8
 _CALLBACK_RE: Final = re.compile(r"(?:confirm|cancel|edit):[A-Za-z0-9_-]{32}\Z")
 _EMBEDDED_URL_RE: Final = re.compile(r"https?://[^\s<>{}\\]+", re.IGNORECASE)
+_APPROVAL_URL_RE: Final = re.compile(r"""https?://[^\s<>{}\\'"]+""", re.IGNORECASE)
+_MAX_APPROVAL_SOURCE_CHARS: Final = MAX_CONTROL_REPLY_CHARS * 8
 _STATUS_LABELS: Final = {
     MonitorStatus.ACTIVE: "사용 중",
     MonitorStatus.PAUSED_USER: "사용자 일시정지",
@@ -61,6 +64,44 @@ def safe_plain(value: object, *, limit: int) -> str:
     return _normalize_plain(redacted, limit=limit)
 
 
+def safe_approval_value(
+    value: str | int | float | bool,
+    *,
+    limit: int = MAX_CONTROL_REPLY_CHARS,
+) -> str:
+    if type(limit) is not int or not 1 <= limit <= MAX_CONTROL_REPLY_CHARS:
+        raise ValueError("invalid approval value limit")
+    if type(value) is str:
+        if len(value) > _MAX_APPROVAL_SOURCE_CHARS:
+            raise ValueError("approval value is too large")
+        transformed = _APPROVAL_URL_RE.sub(
+            lambda match: _approval_url_text(match.group(0)),
+            value,
+        )
+        redacted = redact_sensitive_text(transformed)
+        rendered = (
+            redacted
+            if redacted == "[숨김]"
+            else json.dumps(redacted, ensure_ascii=False, allow_nan=False)
+        )
+    elif type(value) in {int, float, bool}:
+        rendered = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    else:
+        raise ValueError("invalid approval value")
+    rendered = rendered.replace("<", r"\u003c").replace(">", r"\u003e")
+    try:
+        if (
+            not 1 <= len(rendered) <= limit
+            or len(rendered.encode("utf-8", errors="strict")) > limit * 4
+            or contains_sensitive_text(rendered)
+            or not _direct_text_is_safe(rendered)
+        ):
+            raise ValueError
+    except (UnicodeError, ValueError):
+        raise ValueError("invalid approval value") from None
+    return rendered
+
+
 def _normalize_plain(value: str, *, limit: int) -> str:
     normalized = " ".join(
         "".join(
@@ -91,6 +132,21 @@ def safe_url(value: object, *, limit: int = 300) -> str:
             pass
     redacted = redact_sensitive_text(result).replace("<", "‹").replace(">", "›")
     return _normalize_plain(redacted, limit=limit)
+
+
+def _approval_url_text(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        ):
+            return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
+    except Exception:
+        pass
+    return "[확인할 수 없는 URL]"
 
 
 def status_label(value: MonitorStatus) -> str:

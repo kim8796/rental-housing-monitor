@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import FrozenInstanceError
@@ -158,6 +159,13 @@ def _run(value: Any) -> Any:
     return asyncio.run(value)
 
 
+def _deep_exception_group(leaf: BaseException, *, depth: int = 1_105) -> BaseExceptionGroup:
+    result = BaseExceptionGroup("leaf", [leaf])
+    for index in range(depth):
+        result = BaseExceptionGroup(f"group-{index}", [result])
+    return result
+
+
 def _proposal(actions: PendingActionService) -> ProposedMonitor:
     spec = _spec()
     candidate = "1" * 32
@@ -232,6 +240,49 @@ def _planned_update() -> PlannedMonitor:
         robots=RobotsDecision(True, None, NOW, True),
         warnings=(),
     )
+
+
+def _text_rule_update_reply(rule: dict[str, object]) -> tuple[ControlReply, int, int]:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    current_payload = _spec().model_dump(mode="json")
+    current_payload["extract"]["fields"]["title"] = {
+        "selector": ".title",
+        "type": "text",
+    }
+    current = MonitorSpec.model_validate(current_payload)
+    monitor_id = registry.create_monitor(current, created_by=OWNER)
+    payload = current.model_dump(mode="json")
+    payload["rules"] = [rule]
+    planned = PlannedMonitor(
+        spec=MonitorSpec.model_validate(payload),
+        preview_items=(PreviewItem({"title": "검증"}),),
+        resolved_strategy=FetchStrategy.HTTP,
+        robots=RobotsDecision(True, None, NOW, True),
+        warnings=(),
+    )
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text="조건을 바꿔줘",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(planned, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("조건을 바꿔줘")))
+    version_count = connection.execute("SELECT count(*) FROM monitor_versions").fetchone()[0]
+    action_count = connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0]
+    connection.close()
+    return reply, version_count, action_count
 
 
 def test_control_reply_is_immutable_bounded_and_redacted() -> None:
@@ -870,10 +921,15 @@ def test_nested_cancellation_group_from_create_planner_is_reraised_unchanged() -
         now_source=lambda: NOW,
     )
 
-    with pytest.raises(BaseExceptionGroup) as caught:
+    observed = "not-raised"
+    try:
         _run(service.handle(_request("새 상품을 모니터해줘")))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException as error:
+        observed = "original" if error is fatal else "different"
 
-    assert caught.value is fatal
+    assert observed == "original"
     assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
     assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
     connection.close()
@@ -911,10 +967,100 @@ def test_nested_cancellation_group_during_create_reply_revokes_pending_and_rerai
         now_source=lambda: NOW,
     )
 
-    with pytest.raises(BaseExceptionGroup) as caught:
+    observed = "not-raised"
+    try:
         _run(service.handle(_request("새 상품을 모니터해줘")))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException as error:
+        observed = "original" if error is fatal else "different"
 
-    assert caught.value is fatal
+    assert observed == "original"
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
+    connection.close()
+
+
+def test_depth_1100_cancellation_group_from_planner_is_reraised_unchanged() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    fatal = _deep_exception_group(asyncio.CancelledError())
+
+    class DeepGroupPlanner:
+        action_service = actions
+
+        async def propose(self, *_args: object, **_kwargs: object) -> object:
+            raise fatal
+
+    intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=_spec().target_url,
+        condition_text="새 상품",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        DeepGroupPlanner(),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    observed = "not-raised"
+    try:
+        _run(service.handle(_request("새 상품을 모니터해줘")))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException as error:
+        observed = "original" if error is fatal else "different"
+
+    assert observed == "original"
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
+    connection.close()
+
+
+def test_depth_1100_cancellation_group_from_reply_revokes_and_reraises() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    proposal = _proposal(actions)
+    fatal = _deep_exception_group(asyncio.CancelledError())
+
+    class FatalSpec:
+        @property
+        def owner_id(self) -> str:
+            raise fatal
+
+    object.__setattr__(proposal, "spec", FatalSpec())
+    intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=_spec().target_url,
+        condition_text="새 상품",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakePlanner(proposal, actions),
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    observed = "not-raised"
+    try:
+        _run(service.handle(_request("새 상품을 모니터해줘")))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException as error:
+        observed = "original" if error is fatal else "different"
+
+    assert observed == "original"
     assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
     assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
     connection.close()
@@ -1177,6 +1323,103 @@ def test_keyword_preview_preserves_long_safe_keyword_without_ellipsis() -> None:
     assert "…" not in reply.text
     assert len(reply.text) <= 3_500
     connection.close()
+
+
+def test_approval_preview_preserves_exact_239_character_repeated_spaces() -> None:
+    keyword = "시작" + " " * 235 + "종료"
+    assert len(keyword) == 239
+
+    reply, versions, actions = _text_rule_update_reply(
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": [keyword],
+        }
+    )
+
+    assert f"키워드={json.dumps(keyword, ensure_ascii=False)}" in reply.text
+    assert keyword in reply.text
+    assert "…" not in reply.text
+    assert (versions, actions) == (2, 1)
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    (
+        "공백  두개",
+        '탭\t줄\n따옴표"역슬래시\\유니코드-한글-💡',
+        "조합-e\u0301-완성-é",
+    ),
+)
+def test_approval_preview_json_escapes_without_losing_keyword_semantics(
+    keyword: str,
+) -> None:
+    reply, versions, actions = _text_rule_update_reply(
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": [keyword],
+        }
+    )
+
+    assert f"키워드={json.dumps(keyword, ensure_ascii=False)}" in reply.text
+    assert "…" not in reply.text
+    assert (versions, actions) == (2, 1)
+
+
+def test_distinct_whitespace_keywords_produce_distinct_complete_previews() -> None:
+    compact = "서울 경기"
+    repeated = "서울  경기"
+
+    compact_reply, _, _ = _text_rule_update_reply(
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": [compact],
+        }
+    )
+    repeated_reply, _, _ = _text_rule_update_reply(
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": [repeated],
+        }
+    )
+
+    assert compact_reply.text != repeated_reply.text
+    assert json.dumps(compact, ensure_ascii=False) in compact_reply.text
+    assert json.dumps(repeated, ensure_ascii=False) in repeated_reply.text
+
+
+def test_approval_preview_preserves_long_status_string_with_visible_escapes() -> None:
+    value = ('상태  값\t줄\n"인용"\\경로-유니코드💡' * 20) + "끝"
+
+    reply, versions, actions = _text_rule_update_reply(
+        {
+            "kind": "status_equals",
+            "field": "title",
+            "value": value,
+        }
+    )
+
+    assert f"값={json.dumps(value, ensure_ascii=False)}" in reply.text
+    assert "…" not in reply.text
+    assert (versions, actions) == (2, 1)
+
+
+def test_approval_escape_expansion_overflow_rolls_back_without_writes() -> None:
+    keywords = [f"키워드-{index}" + "\t " * 80 + "끝" for index in range(50)]
+
+    reply, versions, actions = _text_rule_update_reply(
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": keywords,
+        }
+    )
+
+    assert "처리하지 못했습니다" in reply.text
+    assert (versions, actions) == (1, 0)
 
 
 def test_status_value_preview_preserves_long_safe_value_without_ellipsis() -> None:

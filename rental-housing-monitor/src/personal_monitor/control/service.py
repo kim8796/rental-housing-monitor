@@ -11,8 +11,8 @@ from typing import Final
 from personal_monitor.ai.contracts import IntentKind, IntentResult
 from personal_monitor.control.actions import ConsumedAction, PendingActionService
 from personal_monitor.control.messages import (
-    MAX_CONTROL_REPLY_CHARS,
     ControlReply,
+    safe_approval_value,
     safe_plain,
     safe_url,
     status_label,
@@ -840,18 +840,15 @@ def _rule_summary(rule: RuleSpec, index: int) -> str:
     if rule.operator is not None:
         parts.append(f"연산자={_exact_rule_text(rule.operator)}")
     if rule.value is not None:
-        parts.append(f"값={_exact_rule_text(str(rule.value))}")
+        parts.append(f"값={_exact_rule_text(rule.value)}")
     if rule.keywords:
         keywords = ", ".join(_exact_rule_text(keyword) for keyword in rule.keywords)
         parts.append(f"키워드={keywords}")
     return ", ".join(parts)
 
 
-def _exact_rule_text(value: str) -> str:
-    rendered = safe_plain(value, limit=MAX_CONTROL_REPLY_CHARS)
-    if rendered != safe_plain(value, limit=MAX_CONTROL_REPLY_CHARS + 1):
-        raise ValueError("rule value cannot be rendered exactly")
-    return rendered
+def _exact_rule_text(value: str | int | float | bool) -> str:
+    return safe_approval_value(value)
 
 
 def _bounded_reply(lines: list[str]) -> ControlReply:

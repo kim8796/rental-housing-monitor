@@ -148,6 +148,13 @@ def run(value: object) -> object:
     return asyncio.run(value)  # type: ignore[arg-type]
 
 
+def _deep_exception_group(leaf: BaseException, *, depth: int = 1_105) -> BaseExceptionGroup:
+    result = BaseExceptionGroup("leaf", [leaf])
+    for index in range(depth):
+        result = BaseExceptionGroup(f"group-{index}", [result])
+    return result
+
+
 def test_authorized_natural_language_routes_exactly_once_with_redacted_request(
     gateway_parts, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -286,10 +293,15 @@ def test_nested_cancellation_group_from_router_is_reraised_after_receipt_cleanup
     gateway = TelegramGateway(7, 42, router, actions, api)
     pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
 
-    with pytest.raises(BaseExceptionGroup) as caught:
+    observed = "not-raised"
+    try:
         run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException as error:
+        observed = "original" if error is fatal else "different"
 
-    assert caught.value is fatal
+    assert observed == "original"
     assert len(router.calls) == 1
     assert actions.claim(router.calls[0]) is False
     assert api.answers == []
@@ -313,10 +325,120 @@ def test_nested_cancellation_group_from_send_is_reraised_after_receipt_cleanup()
     gateway = TelegramGateway(7, 42, router, actions, api)
     pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
 
-    with pytest.raises(BaseExceptionGroup) as caught:
+    observed = "not-raised"
+    try:
         run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException as error:
+        observed = "original" if error is fatal else "different"
 
-    assert caught.value is fatal
+    assert observed == "original"
+    assert len(router.calls) == 1
+    assert actions.claim(router.calls[0]) is False
+    assert api.answers == []
+    connection.close()
+
+
+def test_depth_1100_cancellation_group_from_router_reraises_original_after_cleanup() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = FakeRouter(actions)
+    fatal = _deep_exception_group(asyncio.CancelledError())
+    router.error = fatal
+    api = FakeApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    observed = "not-raised"
+    try:
+        run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException as error:
+        observed = "original" if error is fatal else "different"
+
+    assert observed == "original"
+    assert len(router.calls) == 1
+    assert actions.claim(router.calls[0]) is False
+    assert api.answers == []
+    connection.close()
+
+
+def test_depth_1100_cancellation_group_from_send_reraises_original_after_cleanup() -> None:
+    fatal = _deep_exception_group(asyncio.CancelledError())
+
+    class FatalSendApi(FakeApi):
+        async def send_message(self, *args: object, **kwargs: object) -> str:
+            raise fatal
+
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = ReplyRouter(actions)
+    api = FatalSendApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    observed = "not-raised"
+    try:
+        run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException as error:
+        observed = "original" if error is fatal else "different"
+
+    assert observed == "original"
+    assert len(router.calls) == 1
+    assert actions.claim(router.calls[0]) is False
+    assert api.answers == []
+    connection.close()
+
+
+def test_depth_1100_ordinary_exception_group_remains_safe_ordinary_failure() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = FakeRouter(actions)
+    ordinary = _deep_exception_group(RuntimeError("ordinary"))
+    router.error = ordinary
+    api = FakeApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    observed = "safe"
+    try:
+        run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+    except RecursionError:
+        observed = "recursion"
+    except BaseException:
+        observed = "different"
+
+    assert observed == "safe"
+    assert len(router.calls) == 1
+    assert actions.claim(router.calls[0]) is False
+    assert api.answers == [("cb-1", "결과 전달에 실패했습니다. 모니터 상태를 확인해 주세요.", True)]
+    connection.close()
+
+
+def test_oversized_exception_group_fails_closed_by_reraising_original() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = FakeRouter(actions)
+    oversized = BaseExceptionGroup(
+        "oversized",
+        [RuntimeError(f"ordinary-{index}") for index in range(5_000)],
+    )
+    router.error = oversized
+    api = FakeApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    observed = "not-raised"
+    try:
+        run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+    except BaseException as error:
+        observed = "original" if error is oversized else "different"
+
+    assert observed == "original"
     assert len(router.calls) == 1
     assert actions.claim(router.calls[0]) is False
     assert api.answers == []
