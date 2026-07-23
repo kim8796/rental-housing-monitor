@@ -14,8 +14,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from personal_monitor.control.actions import PendingActionService
+from personal_monitor.control.messages import ControlReply
 from personal_monitor.storage import open_database
-from personal_monitor.telegram import CallbackQuery, TelegramMessage, TelegramUpdate
+from personal_monitor.telegram import CallbackQuery, InlineButton, TelegramMessage, TelegramUpdate
 from personal_monitor.telegram.gateway import ControlRequest, TelegramGateway
 
 NOW = datetime(2026, 7, 23, tzinfo=UTC)
@@ -25,11 +26,23 @@ OWNER = "telegram-user:7"
 class FakeApi:
     def __init__(self) -> None:
         self.answers: list[tuple[str, str | None, bool]] = []
+        self.messages: list[tuple[str, str, object]] = []
 
     async def answer_callback(
         self, callback_query_id: str, *, text: str | None = None, show_alert: bool = False
     ) -> None:
         self.answers.append((callback_query_id, text, show_alert))
+
+    async def send_message(
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        buttons: object = None,
+        disable_web_page_preview: bool = True,
+    ) -> str:
+        self.messages.append((str(chat_id), text, buttons))
+        return "88"
 
 
 class FakeRouter:
@@ -41,6 +54,15 @@ class FakeRouter:
         self.calls.append(value)
         if self.error is not None:
             raise self.error
+
+
+class ReplyRouter(FakeRouter):
+    async def route(self, value: object) -> ControlReply:
+        self.calls.append(value)
+        return ControlReply(
+            "안전한 처리 결과",
+            ((InlineButton("확인", "confirm:" + "z" * 32),),),
+        )
 
 
 class CountingProtocolBoundary:
@@ -135,6 +157,44 @@ def test_authorized_natural_language_routes_exactly_once_with_redacted_request(
     assert api.answers == []
     with pytest.raises(FrozenInstanceError):
         request.text = "changed"  # type: ignore[attr-defined]
+
+
+def test_gateway_sends_validated_reply_for_messages_and_confirmed_callbacks() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = ReplyRouter()
+    api = FakeApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+
+    run(gateway.handle_update(_message(), now=NOW))
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+    run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+
+    assert [message[:2] for message in api.messages] == [
+        ("42", "안전한 처리 결과"),
+        ("42", "안전한 처리 결과"),
+    ]
+    assert api.answers == [("cb-1", "처리되었습니다", False)]
+    connection.close()
+
+
+def test_edit_callback_is_requester_bound_single_use_and_dispatched_without_confirmation() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    router = ReplyRouter()
+    api = FakeApi()
+    gateway = TelegramGateway(7, 42, router, actions, api)
+    pending = actions.create(OWNER, "update", {"owner_id": OWNER}, now=NOW)
+
+    run(gateway.handle_update(_callback(f"edit:{pending.token}"), now=NOW))
+    run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+
+    assert len(router.calls) == 1
+    assert router.calls[0].owner_id == OWNER
+    assert router.calls[0].operation == "edit"
+    assert len(api.messages) == 1
+    assert api.answers == [("cb-1", "수정 안내를 보냈습니다", False)]
+    connection.close()
 
 
 @pytest.mark.parametrize(

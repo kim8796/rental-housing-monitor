@@ -136,6 +136,22 @@ class ConfirmedProposal:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class PlannedMonitor:
+    spec: MonitorSpec
+    preview_items: tuple[PreviewItem, ...]
+    resolved_strategy: FetchStrategy
+    robots: RobotsDecision
+    warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "preview_items", tuple(self.preview_items))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+
+    def __repr__(self) -> str:
+        return "<PlannedMonitor redacted>"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _Dependency:
     root: object
     owner: object | None
@@ -267,6 +283,89 @@ class MonitorPlanner:
         if validated_input is None or not self._all_dependencies_intact():
             raise PlanningFailed
         safe_request, safe_intent = validated_input
+        spec_value, items, trusted_probe = await self._build_candidate(
+            safe_request,
+            safe_intent,
+        )
+        return self._persist_proposal(spec_value, items, trusted_probe)
+
+    async def plan_update(
+        self,
+        request: ControlRequest,
+        intent: IntentResult,
+        current_spec: MonitorSpec,
+    ) -> PlannedMonitor:
+        safe_request: ControlRequest | None = None
+        create_intent: IntentResult | None = None
+        with suppress(Exception):
+            if (
+                type(request) is not ControlRequest
+                or type(intent) is not IntentResult
+                or type(current_spec) is not MonitorSpec
+            ):
+                raise TypeError
+            safe_request = ControlRequest(request.owner_id, request.chat_id, request.text)
+            update = IntentResult.model_validate(intent.model_dump(mode="python"))
+            current = MonitorSpec.model_validate(current_spec.model_dump(mode="json"))
+            if (
+                update.kind is not IntentKind.UPDATE
+                or len(update.target_monitor_ids) != 1
+                or update.target_url is not None
+                or update.clarification is not None
+                or update.confidence < 0.75
+                or (update.condition_text is None and update.schedule_text is None)
+                or current.owner_id != safe_request.owner_id
+            ):
+                raise ValueError
+            create_intent = IntentResult(
+                kind=IntentKind.CREATE,
+                target_monitor_ids=[],
+                target_url=current.target_url,
+                condition_text=update.condition_text,
+                schedule_text=update.schedule_text,
+                clarification=None,
+                confidence=update.confidence,
+            )
+        if safe_request is None or create_intent is None or not self._all_dependencies_intact():
+            raise PlanningFailed
+        validated_input = _validate_input(safe_request, create_intent)
+        if validated_input is None:
+            raise PlanningFailed
+        safe_request, create_intent = validated_input
+        spec_value, items, trusted_probe = await self._build_candidate(
+            safe_request,
+            create_intent,
+        )
+        snapshot = _capture_proposal_snapshot(spec_value, items, trusted_probe)
+        rebuilt = (
+            None
+            if snapshot is None
+            else _rebuild_proposal_inputs(
+                snapshot,
+                live_spec=spec_value,
+                live_items=items,
+                live_probe=trusted_probe,
+            )
+        )
+        if rebuilt is None:
+            raise PlanningFailed
+        fresh_spec, fresh_items, fresh_probe = rebuilt
+        previews = tuple(_preview_item(item, fresh_spec) for item in fresh_items[:3])
+        if not _valid_previews(previews, fresh_spec):
+            raise PlanningFailed
+        return PlannedMonitor(
+            spec=fresh_spec,
+            preview_items=previews,
+            resolved_strategy=fresh_probe.document.strategy,
+            robots=fresh_probe.robots,
+            warnings=fresh_probe.warnings,
+        )
+
+    async def _build_candidate(
+        self,
+        safe_request: ControlRequest,
+        safe_intent: IntentResult,
+    ) -> tuple[MonitorSpec, tuple[ObservedItem, ...], ProbeResult]:
         target = await self._validate_target(safe_intent.target_url)
         result = await self._probe_once(safe_request.owner_id, target)
         projection = _project_worker_input(safe_request, safe_intent, result)
@@ -323,7 +422,7 @@ class MonitorPlanner:
                 feedback.append(category)
                 continue
             spec_value, items, trusted_probe = candidate
-            return self._persist_proposal(spec_value, items, trusted_probe)
+            return spec_value, items, trusted_probe
         raise PlanningFailed
 
     async def _validate_target(self, url: str | None) -> ResolvedTarget:
@@ -680,6 +779,7 @@ def reconstruct_confirmed_spec(
             or action.action != "create"
             or type(owner_id) is not str
             or _OWNER_RE.fullmatch(owner_id) is None
+            or action.owner_id != owner_id
             or type(action.payload) not in {dict, MappingProxyType}
             or set(action.payload) != {"candidate_version_id", "spec_hash", "binding_hash", "spec"}
             or not isinstance(action.payload["spec"], Mapping)

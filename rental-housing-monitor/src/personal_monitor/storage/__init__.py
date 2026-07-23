@@ -1,6 +1,8 @@
 from personal_monitor.storage.recovery import DiagnosticSnapshot, RecoveryRepository
 from personal_monitor.storage.registry import (
     ActiveMonitor,
+    CandidateVersion,
+    ControlMonitor,
     DeliveryTargetRow,
     MonitorRow,
     RegistryRepository,
@@ -15,6 +17,8 @@ from personal_monitor.storage.schema import open_database, open_existing_databas
 
 __all__ = [
     "ActiveMonitor",
+    "CandidateVersion",
+    "ControlMonitor",
     "DeliveryTargetRow",
     "DeliveryCandidate",
     "DiagnosticSnapshot",

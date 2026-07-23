@@ -78,9 +78,15 @@ class PendingAction:
 class ConsumedAction:
     action: str
     payload: Mapping[str, object]
+    owner_id: str
+    operation: str = "confirm"
 
     def __post_init__(self) -> None:
-        if _valid_action(self.action) is None:
+        if (
+            _valid_action(self.action) is None
+            or _valid_owner(self.owner_id) is None
+            or self.operation not in {"confirm", "edit"}
+        ):
             raise ValueError("invalid consumed action")
         try:
             _, frozen = _validated_payload(self.payload)
@@ -177,6 +183,7 @@ class PendingActionService:
         owner_id: str,
         *,
         now: datetime,
+        operation: str = "confirm",
     ) -> ConsumedAction:
         safe_token = _valid_token(token)
         owner = _valid_owner(owner_id)
@@ -186,6 +193,7 @@ class PendingActionService:
             or safe_token is None
             or owner is None
             or normalized_now is None
+            or operation not in {"confirm", "edit"}
             or self._connection_anchor.in_transaction
         ):
             raise ActionDenied("pending action denied")
@@ -221,12 +229,32 @@ class PendingActionService:
                 )
                 if cursor.rowcount != 1:
                     raise _RejectAction
-                result = ConsumedAction(action, payload)
+                result = ConsumedAction(action, payload, owner, operation)
         except Exception:
             failed = True
         if failed or result is None:
             raise ActionDenied("pending action denied") from None
         return result
+
+    def revoke(self, token: str, owner_id: str) -> None:
+        safe_token = _valid_token(token)
+        owner = _valid_owner(owner_id)
+        if (
+            not self._integrity_ok()
+            or safe_token is None
+            or owner is None
+            or self._connection_anchor.in_transaction
+        ):
+            raise ValueError("invalid pending action")
+        try:
+            with transaction(self._connection_anchor, immediate=True):
+                self._connection_anchor.execute(
+                    "DELETE FROM pending_actions WHERE token_hash = ? AND owner_id = ? "
+                    "AND consumed_at IS NULL",
+                    (_token_hash(safe_token), owner),
+                )
+        except Exception:
+            raise ValueError("invalid pending action") from None
 
     def _integrity_ok(self) -> bool:
         try:

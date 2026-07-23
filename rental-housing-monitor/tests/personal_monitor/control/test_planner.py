@@ -241,6 +241,71 @@ def pending_count(connection: sqlite3.Connection) -> int:
     return connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0]
 
 
+def test_update_planning_reuses_hardened_probe_without_persisting_an_action(
+    connection: sqlite3.Connection,
+) -> None:
+    updated = spec(schedule="0 9 * * *")
+    value, policy, page_probe, worker = planner(connection, [plan(updated)])
+    update = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=["monitor-1"],
+        target_url=None,
+        condition_text=None,
+        schedule_text="매일 오전 9시",
+        clarification=None,
+        confidence=0.98,
+    )
+
+    candidate = run(value.plan_update(request(), update, spec()))
+
+    assert candidate.spec == updated.model_copy(update={"fetch_strategy": FetchStrategy.HTTP})
+    assert len(policy.calls) == len(page_probe.calls) == len(worker.calls) == 1
+    assert pending_count(connection) == 0
+
+
+def test_update_planning_keeps_query_and_profile_out_of_worker_then_rebinds_them(
+    connection: sqlite3.Connection,
+) -> None:
+    private_value = "opaque-private-query-value"
+    profile = "private-profile-ref"
+    url = f"{TARGET_URL}?ref={private_value}"
+    projected = projected_url(url)
+    url_policy = FakePolicy(target(url))
+    page_probe = FakeProbe(
+        probe_result(
+            value=target(url),
+            source=document(final_url=url),
+            profile=profile,
+        )
+    )
+    candidate_spec = spec(url=projected, schedule="0 9 * * *")
+    value, _, _, worker = planner(
+        connection,
+        [plan(candidate_spec)],
+        policy=url_policy,
+        probe=page_probe,
+    )
+    update = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=["monitor-1"],
+        target_url=None,
+        condition_text=None,
+        schedule_text="매일 오전 9시",
+        clarification=None,
+        confidence=0.98,
+    )
+
+    candidate = run(value.plan_update(request(), update, spec(url=url, profile=profile)))
+
+    sent = worker.calls[0][0].model_dump_json()
+    assert candidate.spec.target_url == url
+    assert candidate.spec.auth_profile_ref == profile
+    assert private_value not in sent
+    assert profile not in sent
+    assert "?" not in worker.calls[0][0].intent.target_url
+    assert pending_count(connection) == 0
+
+
 def mutate_planner_local(name: str, mutation: object) -> None:
     frame = inspect.currentframe()
     try:
@@ -1270,7 +1335,7 @@ def test_confirmation_rejects_every_tampered_payload_without_oracle(
     else:
         payload["extra"] = "smuggled"
 
-    action = ConsumedAction("create", payload)
+    action = ConsumedAction("create", payload, OWNER)
     with pytest.raises(PlanningFailed) as caught:
         reconstruct_confirmed_spec(action, owner_id=OWNER)
 

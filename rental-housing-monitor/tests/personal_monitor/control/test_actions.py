@@ -337,4 +337,4 @@ def test_service_anchors_cryptographic_randomness_source(
 
 def test_consumed_action_cannot_be_constructed_with_mutable_or_invalid_values() -> None:
     with pytest.raises(ValueError, match="invalid consumed action"):
-        ConsumedAction("unknown", {})
+        ConsumedAction("unknown", {}, OWNER)

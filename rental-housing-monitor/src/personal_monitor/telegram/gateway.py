@@ -12,7 +12,7 @@ from personal_monitor.telegram.types import CallbackQuery, TelegramMessage, Tele
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_IDENTIFIER: Final = 2**63 - 1
-_TOKEN_RE: Final = re.compile(r"(confirm|cancel):([A-Za-z0-9_-]{32})\Z")
+_TOKEN_RE: Final = re.compile(r"(confirm|cancel|edit):([A-Za-z0-9_-]{32})\Z")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -38,7 +38,7 @@ class ControlRequest:
 
 
 class ControlRouter(Protocol):
-    async def route(self, value: ControlRequest | ConsumedAction) -> None: ...
+    async def route(self, value: ControlRequest | ConsumedAction) -> object | None: ...
 
 
 class CallbackApi(Protocol):
@@ -49,6 +49,15 @@ class CallbackApi(Protocol):
         text: str | None = None,
         show_alert: bool = False,
     ) -> None: ...
+
+    async def send_message(
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        buttons: tuple[tuple[object, ...], ...] | None = None,
+        disable_web_page_preview: bool = True,
+    ) -> str: ...
 
 
 class TelegramGateway:
@@ -64,6 +73,7 @@ class TelegramGateway:
         "_command_chat_id_anchor",
         "_consume_anchor",
         "_route_anchor",
+        "_send_message_anchor",
         "_router",
         "_router_anchor",
     )
@@ -84,6 +94,7 @@ class TelegramGateway:
         route = None
         consume = None
         answer_callback = None
+        send_message = None
         capture_failed = not configuration_valid
         if configuration_valid:
             try:
@@ -92,6 +103,9 @@ class TelegramGateway:
                 consume = actions.consume
                 if not all(callable(item) for item in (route, consume, answer_callback)):
                     capture_failed = True
+                candidate_send = getattr(api, "send_message", None)
+                if callable(candidate_send):
+                    send_message = candidate_send
             except Exception:
                 capture_failed = True
         if capture_failed:
@@ -109,6 +123,7 @@ class TelegramGateway:
         object.__setattr__(self, "_api", api)
         object.__setattr__(self, "_api_anchor", api)
         object.__setattr__(self, "_answer_callback_anchor", answer_callback)
+        object.__setattr__(self, "_send_message_anchor", send_message)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("TelegramGateway composition is sealed")
@@ -140,7 +155,8 @@ class TelegramGateway:
                 return
             if not self._integrity_ok():
                 return
-            await self._route_anchor(request)
+            reply = await self._route_anchor(request)
+            await self._deliver_reply(message.chat_id, reply)
             return
 
         callback = update.callback_query
@@ -163,7 +179,12 @@ class TelegramGateway:
         owner_id = f"telegram-user:{callback.from_user_id}"
         consumed_at = datetime.now(UTC) if now is None else now
         try:
-            action = self._consume_anchor(token, owner_id, now=consumed_at)
+            action = self._consume_anchor(
+                token,
+                owner_id,
+                now=consumed_at,
+                operation="edit" if operation == "edit" else "confirm",
+            )
         except ActionDenied:
             return
         if operation == "cancel":
@@ -173,11 +194,30 @@ class TelegramGateway:
                 show_alert=False,
             )
             return
-        await self._route_anchor(action)
+        reply = await self._route_anchor(action)
+        await self._deliver_reply(callback.chat_id, reply)
         await self._answer_callback_anchor(
             callback.id,
-            text="처리되었습니다",
+            text="수정 안내를 보냈습니다" if operation == "edit" else "처리되었습니다",
             show_alert=False,
+        )
+
+    async def _deliver_reply(self, chat_id: int, value: object) -> None:
+        from personal_monitor.control.messages import ControlReply
+
+        if value is None:
+            return
+        if type(value) is not ControlReply or self._send_message_anchor is None:
+            return
+        try:
+            reply = ControlReply(value.text, value.buttons)
+        except Exception:
+            return
+        await self._send_message_anchor(
+            chat_id,
+            reply.text,
+            buttons=reply.buttons or None,
+            disable_web_page_preview=True,
         )
 
     def _authorized(self, user_id: object, chat_id: object) -> bool:
@@ -237,6 +277,14 @@ class TelegramGateway:
                     self._api_anchor,
                     "answer_callback",
                 )
+                and (
+                    self._send_message_anchor is None
+                    or _callable_still_attached(
+                        self._send_message_anchor,
+                        self._api_anchor,
+                        "send_message",
+                    )
+                )
             )
         except Exception:
             return False
@@ -292,7 +340,7 @@ def _valid_text(value: object) -> bool:
 
 
 def _parse_callback(value: object) -> tuple[str, str] | None:
-    if type(value) is not str or len(value) not in {39, 40}:
+    if type(value) is not str or len(value) not in {37, 39, 40}:
         return None
     matched = _TOKEN_RE.fullmatch(value)
     if matched is None:

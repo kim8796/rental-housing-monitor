@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
@@ -38,6 +40,34 @@ class MonitorRow:
     name: str
     status: MonitorStatus
     next_run_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ControlMonitor:
+    id: str
+    owner_id: str
+    name: str
+    status: MonitorStatus
+    active_version_id: str
+    next_run_at: datetime | None
+    last_success_at: datetime | None
+    spec: MonitorSpec
+
+    def __repr__(self) -> str:
+        return "<ControlMonitor redacted>"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CandidateVersion:
+    id: str
+    monitor_id: str
+    owner_id: str
+    expected_active_version_id: str
+    created_by: str
+    spec: MonitorSpec
+
+    def __repr__(self) -> str:
+        return "<CandidateVersion redacted>"
 
 
 class RegistryRepository:
@@ -271,6 +301,294 @@ class RegistryRepository:
             for row in rows
         ]
 
+    def list_control_monitors(self, owner_id: str) -> tuple[ControlMonitor, ...]:
+        rows = self.connection.execute(
+            "SELECT id FROM monitors WHERE owner_id = ? AND status != ? ORDER BY created_at, id",
+            (owner_id, MonitorStatus.DISABLED.value),
+        ).fetchall()
+        try:
+            return tuple(self.get_control_monitor(row["id"], owner_id=owner_id) for row in rows)
+        except Exception:
+            raise ValueError("control monitor unavailable") from None
+
+    def get_control_monitor(self, monitor_id: str, *, owner_id: str) -> ControlMonitor:
+        try:
+            row = self.connection.execute(
+                "SELECT m.id, m.owner_id, m.name, m.status, m.active_version_id, "
+                "m.next_run_at, v.spec_json, "
+                "(SELECT r.finished_at FROM runs AS r WHERE r.monitor_id = m.id "
+                "AND r.status = 'success' AND r.finished_at IS NOT NULL "
+                "ORDER BY r.finished_at DESC, r.id DESC LIMIT 1) AS last_success_at "
+                "FROM monitors AS m "
+                "JOIN monitor_versions AS v ON v.id = m.active_version_id "
+                "WHERE m.id = ? AND m.owner_id = ? AND m.status != ?",
+                (monitor_id, owner_id, MonitorStatus.DISABLED.value),
+            ).fetchone()
+            if row is None:
+                raise ValueError
+            status = MonitorStatus(row["status"])
+            next_run_at = _safe_optional_timestamp(row["next_run_at"])
+            last_success_at = _safe_optional_timestamp(row["last_success_at"])
+            spec = MonitorSpec.model_validate_json(row["spec_json"])
+            if spec.owner_id != owner_id:
+                raise ValueError
+            return ControlMonitor(
+                id=row["id"],
+                owner_id=row["owner_id"],
+                name=row["name"],
+                status=status,
+                active_version_id=row["active_version_id"],
+                next_run_at=next_run_at,
+                last_success_at=last_success_at,
+                spec=spec,
+            )
+        except Exception:
+            raise ValueError("control monitor unavailable") from None
+
+    def transition_status_exact(
+        self,
+        monitor_id: str,
+        *,
+        owner_id: str,
+        expected_status: MonitorStatus,
+        expected_active_version_id: str,
+        target_status: MonitorStatus,
+        changed_at: datetime,
+    ) -> None:
+        timestamp = utc_timestamp(changed_at, parameter="changed_at")
+        allowed = {
+            (MonitorStatus.ACTIVE, MonitorStatus.PAUSED_USER),
+            (MonitorStatus.PAUSED_USER, MonitorStatus.ACTIVE),
+        }
+        if (expected_status, target_status) not in allowed:
+            raise ValueError("lifecycle precondition failed")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE monitors SET status = ?, updated_at = ? "
+                "WHERE id = ? AND owner_id = ? AND status = ? AND active_version_id = ?",
+                (
+                    target_status.value,
+                    timestamp,
+                    monitor_id,
+                    owner_id,
+                    expected_status.value,
+                    expected_active_version_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lifecycle precondition failed")
+
+    def soft_delete_exact(
+        self,
+        monitor_id: str,
+        *,
+        owner_id: str,
+        expected_status: MonitorStatus,
+        expected_active_version_id: str,
+        disabled_at: datetime,
+    ) -> None:
+        timestamp = utc_timestamp(disabled_at, parameter="disabled_at")
+        if expected_status is MonitorStatus.DISABLED:
+            raise ValueError("lifecycle precondition failed")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE monitors SET status = ?, disabled_at = ?, lease_owner = NULL, "
+                "lease_expires_at = NULL, updated_at = ? "
+                "WHERE id = ? AND owner_id = ? AND status = ? AND active_version_id = ?",
+                (
+                    MonitorStatus.DISABLED.value,
+                    timestamp,
+                    timestamp,
+                    monitor_id,
+                    owner_id,
+                    expected_status.value,
+                    expected_active_version_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lifecycle precondition failed")
+
+    def stage_candidate_action(
+        self,
+        monitor_id: str,
+        *,
+        owner_id: str,
+        expected_status: MonitorStatus,
+        expected_active_version_id: str,
+        spec: MonitorSpec,
+        action_kind: str,
+        actions: object,
+        now: datetime,
+        reply_factory: Callable[[object, str, str], object],
+    ) -> object:
+        from personal_monitor.control.actions import PendingActionService
+        from personal_monitor.control.messages import ControlReply
+
+        if (
+            type(actions) is not PendingActionService
+            or actions.connection is not self.connection
+            or action_kind not in {"update", "schedule_change"}
+            or expected_status not in {MonitorStatus.ACTIVE, MonitorStatus.PAUSED_USER}
+            or type(spec) is not MonitorSpec
+            or spec.owner_id != owner_id
+            or not callable(reply_factory)
+        ):
+            raise ValueError("lifecycle precondition failed")
+        timestamp = utc_timestamp(now, parameter="now")
+        fresh = MonitorSpec.model_validate(spec.model_dump(mode="json"))
+        canonical = canonical_json(fresh.model_dump(mode="json"))
+        spec_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        candidate_id = uuid4().hex
+        with transaction(self.connection, immediate=True):
+            monitor = self.connection.execute(
+                "SELECT name FROM monitors WHERE id = ? AND owner_id = ? AND status = ? "
+                "AND active_version_id = ?",
+                (
+                    monitor_id,
+                    owner_id,
+                    expected_status.value,
+                    expected_active_version_id,
+                ),
+            ).fetchone()
+            if monitor is None:
+                raise ValueError("lifecycle precondition failed")
+            next_version = self.connection.execute(
+                "SELECT COALESCE(MAX(version_number), 0) + 1 FROM monitor_versions "
+                "WHERE monitor_id = ?",
+                (monitor_id,),
+            ).fetchone()[0]
+            self.connection.execute(
+                "INSERT INTO monitor_versions(id, monitor_id, version_number, spec_json, "
+                "created_by, created_at, approved_by, approved_at) "
+                "VALUES (?, ?, ?, ?, 'codex-control', ?, NULL, NULL)",
+                (candidate_id, monitor_id, next_version, canonical, timestamp),
+            )
+            pending = actions.create(
+                owner_id,
+                action_kind,
+                {
+                    "owner_id": owner_id,
+                    "monitor_id": monitor_id,
+                    "monitor_name": monitor["name"],
+                    "expected_status": expected_status.value,
+                    "expected_active_version_id": expected_active_version_id,
+                    "candidate_version_id": candidate_id,
+                    "spec_hash": spec_hash,
+                    "action_kind": action_kind,
+                },
+                now=now,
+            )
+            reply = reply_factory(pending, candidate_id, spec_hash)
+            if type(reply) is not ControlReply:
+                raise ValueError("lifecycle precondition failed")
+            result = ControlReply(reply.text, reply.buttons)
+        return result
+
+    def activate_candidate_exact(
+        self,
+        monitor_id: str,
+        candidate_version_id: str,
+        *,
+        owner_id: str,
+        expected_status: MonitorStatus,
+        expected_active_version_id: str,
+        expected_created_by: str,
+        spec_hash: str,
+        activated_at: datetime,
+        target_status: MonitorStatus | None = None,
+    ) -> MonitorSpec:
+        if expected_created_by not in {"codex-control", "scrapling-adaptive"}:
+            raise ValueError("lifecycle precondition failed")
+        timestamp = utc_timestamp(activated_at, parameter="activated_at")
+        resulting_status = expected_status if target_status is None else target_status
+        if expected_created_by == "scrapling-adaptive" and (
+            expected_status is not MonitorStatus.NEEDS_REVIEW
+            or resulting_status is not MonitorStatus.ACTIVE
+        ):
+            raise ValueError("lifecycle precondition failed")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT v.spec_json FROM monitor_versions AS v "
+                "JOIN monitors AS m ON m.id = v.monitor_id "
+                "WHERE v.id = ? AND v.monitor_id = ? AND v.created_by = ? "
+                "AND v.approved_at IS NULL AND m.owner_id = ? AND m.status = ? "
+                "AND m.active_version_id = ?",
+                (
+                    candidate_version_id,
+                    monitor_id,
+                    expected_created_by,
+                    owner_id,
+                    expected_status.value,
+                    expected_active_version_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ValueError("lifecycle precondition failed")
+            spec = MonitorSpec.model_validate_json(row["spec_json"])
+            canonical = canonical_json(spec.model_dump(mode="json"))
+            if (
+                spec.owner_id != owner_id
+                or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != spec_hash
+            ):
+                raise ValueError("lifecycle precondition failed")
+            approved = self.connection.execute(
+                "UPDATE monitor_versions SET approved_by = ?, approved_at = ? "
+                "WHERE id = ? AND monitor_id = ? AND approved_at IS NULL",
+                (owner_id, timestamp, candidate_version_id, monitor_id),
+            )
+            if approved.rowcount != 1:
+                raise ValueError("lifecycle precondition failed")
+            activated = self.connection.execute(
+                "UPDATE monitors SET active_version_id = ?, name = ?, status = ?, "
+                "updated_at = ? WHERE id = ? AND owner_id = ? AND status = ? "
+                "AND active_version_id = ?",
+                (
+                    candidate_version_id,
+                    spec.name,
+                    resulting_status.value,
+                    timestamp,
+                    monitor_id,
+                    owner_id,
+                    expected_status.value,
+                    expected_active_version_id,
+                ),
+            )
+            if activated.rowcount != 1:
+                raise ValueError("lifecycle precondition failed")
+        return spec
+
+    def find_repair_candidate(
+        self,
+        monitor_id: str,
+        *,
+        owner_id: str,
+    ) -> CandidateVersion | None:
+        try:
+            row = self.connection.execute(
+                "SELECT v.id, v.monitor_id, v.created_by, v.spec_json, "
+                "m.active_version_id, m.owner_id FROM monitor_versions AS v "
+                "JOIN monitors AS m ON m.id = v.monitor_id "
+                "WHERE m.id = ? AND m.owner_id = ? AND m.status = ? "
+                "AND v.created_by = 'scrapling-adaptive' AND v.approved_at IS NULL "
+                "ORDER BY v.version_number DESC, v.id DESC LIMIT 1",
+                (monitor_id, owner_id, MonitorStatus.NEEDS_REVIEW.value),
+            ).fetchone()
+            if row is None:
+                return None
+            spec = MonitorSpec.model_validate_json(row["spec_json"])
+            if spec.owner_id != owner_id:
+                raise ValueError
+            return CandidateVersion(
+                id=row["id"],
+                monitor_id=row["monitor_id"],
+                owner_id=row["owner_id"],
+                expected_active_version_id=row["active_version_id"],
+                created_by=row["created_by"],
+                spec=spec,
+            )
+        except Exception:
+            raise ValueError("control monitor unavailable") from None
+
     def transition_status(
         self,
         monitor_id: str,
@@ -298,3 +616,14 @@ class RegistryRepository:
             )
             if cursor.rowcount != 1:
                 raise ValueError("monitor does not exist for owner")
+
+
+def _safe_optional_timestamp(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if type(value) is not str or len(value) > 64:
+        raise ValueError
+    parsed = parse_timestamp(value)
+    if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError
+    return parsed
