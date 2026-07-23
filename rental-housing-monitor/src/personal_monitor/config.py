@@ -39,6 +39,7 @@ class Settings:
     log_path: Path
     timezone: ZoneInfo
     backup_status_path: Path
+    data_go_kr_service_key: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -48,7 +49,7 @@ class Settings:
             "egress_proxy=<redacted>, database_path=<redacted>, "
             "profiles_root=<redacted>, diagnostics_root=<redacted>, "
             "adaptive_root=<redacted>, log_path=<redacted>, timezone=<redacted>, "
-            "backup_status_path=<redacted>)"
+            "backup_status_path=<redacted>, data_go_kr_service_key=<redacted>)"
         )
 
     @classmethod
@@ -62,6 +63,10 @@ class Settings:
         codex_socket = _required_path(values, "PERSONAL_MONITOR_CODEX_SOCKET")
         proxy = _required_text(values, "PERSONAL_MONITOR_EGRESS_PROXY")
         _validate_proxy(proxy, "PERSONAL_MONITOR_EGRESS_PROXY")
+        data_go_kr_service_key = _optional_secret(
+            values,
+            "PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY",
+        )
         database_path = _optional_path(
             values,
             "PERSONAL_MONITOR_DATABASE_PATH",
@@ -116,6 +121,7 @@ class Settings:
             log_path=log_path,
             timezone=timezone,
             backup_status_path=backup_status_path,
+            data_go_kr_service_key=data_go_kr_service_key,
         )
 
 
@@ -124,6 +130,20 @@ def _required_text(values: Mapping[str, str], name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ConfigurationError(f"{name}: required value is missing")
     if len(value) > 4096 or any(ord(character) < 32 for character in value):
+        raise ConfigurationError(f"{name}: value is invalid")
+    return value
+
+
+def _optional_secret(values: Mapping[str, str], name: str) -> str | None:
+    value = values.get(name)
+    if value is None or value == "":
+        return None
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or len(value) > 4096
+        or any(ord(character) < 32 for character in value)
+    ):
         raise ConfigurationError(f"{name}: value is invalid")
     return value
 

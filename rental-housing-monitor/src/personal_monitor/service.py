@@ -621,6 +621,7 @@ def _runtime_components(
     from personal_monitor.adapters._policy import BoundedPolicyHttpClient
     from personal_monitor.adapters.official_api import OfficialJsonAdapter
     from personal_monitor.adapters.registry import DefaultAdapterRegistry
+    from personal_monitor.adapters.rental_housing import RentalHousingAdapter
     from personal_monitor.adapters.scrapling import ScraplingSourceAdapter
     from personal_monitor.engine.outbox import OutboxWorker
     from personal_monitor.engine.runner import MonitorRunner
@@ -661,7 +662,16 @@ def _runtime_components(
             rate_limiter=limiter,
             http_client=official_client,
         )
-        adapters = DefaultAdapterRegistry(scrapling=scrapling, official_api=official)
+        rental_housing = (
+            RentalHousingAdapter.production(settings.data_go_kr_service_key)
+            if settings.data_go_kr_service_key is not None
+            else None
+        )
+        adapters = DefaultAdapterRegistry(
+            scrapling=scrapling,
+            official_api=official,
+            rental_housing=rental_housing,
+        )
         registry = RegistryRepository(connection)
         runtime = RuntimeRepository(connection)
         runner = MonitorRunner(

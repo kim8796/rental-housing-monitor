@@ -27,8 +27,39 @@ def test_settings_loads_required_values_and_safe_defaults(tmp_path: Path) -> Non
     assert settings.delivery_chat_id == 987654
     assert settings.database_path == Path("/srv/personal-monitor/db/monitor.db")
     assert settings.timezone.key == "Asia/Seoul"
+    assert settings.data_go_kr_service_key is None
     assert "private-token" not in repr(settings)
     assert "password" not in repr(settings)
+
+
+def test_optional_data_go_kr_key_is_loaded_without_repr_or_error_leakage(
+    tmp_path: Path,
+) -> None:
+    secret = "encoded-service-key%2Fprivate"
+    environment = _environment(tmp_path)
+    environment["PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY"] = secret
+
+    settings = Settings.from_env(environment)
+
+    assert settings.data_go_kr_service_key == secret
+    assert secret not in repr(settings)
+    assert "data_go_kr_service_key=<redacted>" in repr(settings)
+
+    for malformed in (" leading-space", "trailing-space ", "line\nbreak"):
+        environment["PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY"] = malformed
+        with pytest.raises(ConfigurationError) as caught:
+            Settings.from_env(environment)
+        assert str(caught.value) == ("PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY: value is invalid")
+        assert malformed not in str(caught.value)
+        assert secret not in repr(caught.value)
+
+
+def test_blank_optional_data_go_kr_key_is_treated_as_unconfigured(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    environment["PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY"] = ""
+    environment["DATA_GO_KR_SERVICE_KEY"] = "legacy-runner-secret"
+
+    assert Settings.from_env(environment).data_go_kr_service_key is None
 
 
 @pytest.mark.parametrize(

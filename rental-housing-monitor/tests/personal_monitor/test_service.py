@@ -2,10 +2,27 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import personal_monitor.adapters._policy as adapter_policy_module
+import personal_monitor.adapters.official_api as official_module
+import personal_monitor.adapters.rental_housing as rental_module
+import personal_monitor.adapters.scrapling as scrapling_module
+import personal_monitor.engine.outbox as outbox_module
+import personal_monitor.engine.runner as runner_module
+import personal_monitor.observability as observability_module
+import personal_monitor.scraping.profiles as profiles_module
+import personal_monitor.security.rate_limit as rate_limit_module
+import personal_monitor.security.url_policy as url_policy_module
+import personal_monitor.security.vault as vault_module
+import personal_monitor.service as service_module
+import personal_monitor.storage as storage_module
+from personal_monitor.domain.spec import SourceAdapterKind
+from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.service import (
     NullDeliverySender,
     PersonalMonitorService,
@@ -154,6 +171,122 @@ def test_null_delivery_never_calls_remote_and_returns_stable_nonempty_id() -> No
 
     assert first == second
     assert first
+
+
+def _composed_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    service_key: str | None,
+):
+    created_keys: list[str] = []
+    rental_adapter = object()
+
+    class Resource:
+        def close(self) -> None:
+            pass
+
+    class Vault(Resource):
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class ProfileStore(Resource):
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class Scrapling:
+        def __init__(self, *args, **kwargs) -> None:
+            self._backend = Resource()
+
+    class Official:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class RentalFactory:
+        @classmethod
+        def production(cls, key: str):
+            created_keys.append(key)
+            return rental_adapter
+
+    class Repository:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+
+    class Runner:
+        def __init__(self, **values) -> None:
+            self.__dict__.update(values)
+
+    class Outbox:
+        def __init__(self, **values) -> None:
+            self.__dict__.update(values)
+
+    monkeypatch.setattr(service_module, "_private_root", lambda _path: None)
+    monkeypatch.setattr(vault_module, "CredentialVault", Vault)
+    monkeypatch.setattr(profiles_module, "BrowserProfileStore", ProfileStore)
+    monkeypatch.setattr(url_policy_module, "UrlPolicy", lambda *_args: object())
+    monkeypatch.setattr(rate_limit_module, "HostRateLimiter", lambda: object())
+    monkeypatch.setattr(scrapling_module, "ScraplingSourceAdapter", Scrapling)
+    monkeypatch.setattr(
+        adapter_policy_module, "BoundedPolicyHttpClient", lambda **_kwargs: object()
+    )
+    monkeypatch.setattr(official_module, "OfficialJsonAdapter", Official)
+    monkeypatch.setattr(rental_module, "RentalHousingAdapter", RentalFactory)
+    monkeypatch.setattr(storage_module, "RegistryRepository", Repository)
+    monkeypatch.setattr(storage_module, "RuntimeRepository", Repository)
+    monkeypatch.setattr(runner_module, "MonitorRunner", Runner)
+    monkeypatch.setattr(outbox_module, "OutboxWorker", Outbox)
+    monkeypatch.setattr(observability_module, "OperatorEventRepository", Repository)
+
+    settings = SimpleNamespace(
+        profiles_root=tmp_path / "profiles",
+        master_key_path=tmp_path / "master.key",
+        egress_proxy="http://proxy.example:8080",
+        data_go_kr_service_key=service_key,
+    )
+    runner, _outbox, _resources, _registry, _runtime = service_module._runtime_components(
+        settings,
+        object(),
+        sender=object(),
+        worker_id="worker",
+    )
+    return runner, created_keys, rental_adapter
+
+
+def test_runtime_composition_registers_only_configured_rental_factory_without_key_leak(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    secret = "encoded-data-go-key-private"
+
+    runner, created_keys, rental_adapter = _composed_runner(
+        monkeypatch,
+        tmp_path,
+        service_key=secret,
+    )
+
+    assert created_keys == [secret]
+    assert (
+        runner.adapters.resolve(SourceAdapterKind.PYTHON_PLUGIN, "rental_housing") is rental_adapter
+    )
+    assert secret not in repr(runner.adapters)
+
+
+def test_runtime_composition_without_key_keeps_builtins_and_rejects_only_rental(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner, created_keys, _rental_adapter = _composed_runner(
+        monkeypatch,
+        tmp_path,
+        service_key=None,
+    )
+
+    assert created_keys == []
+    assert runner.adapters.resolve(SourceAdapterKind.SCRAPLING, None) is runner.adapters.scrapling
+    with pytest.raises(MonitorError) as caught:
+        runner.adapters.resolve(SourceAdapterKind.PYTHON_PLUGIN, "rental_housing")
+    assert caught.value.error_class is ErrorClass.POLICY
+    assert "key" not in str(caught.value).casefold()
 
 
 def test_telegram_delivery_uses_configured_address_not_untrusted_outbox_address() -> None:

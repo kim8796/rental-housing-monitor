@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import threading
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -285,6 +288,206 @@ def test_cancellation_propagates_instead_of_becoming_a_warning() -> None:
     cancelled = adapter_for([], asyncio.CancelledError(), [])
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(cancelled.fetch("m", rental_spec()))
+
+
+def test_repeated_cancellation_joins_collectors_before_context_exit() -> None:
+    started = 0
+    finished = 0
+    lock = threading.Lock()
+    release = threading.Event()
+    context_exited = threading.Event()
+
+    class BlockingCollector:
+        def __init__(self, agency: Agency) -> None:
+            self.agency = agency
+
+        def collect(self) -> list[Announcement]:
+            nonlocal started, finished
+            with lock:
+                started += 1
+            release.wait(timeout=5)
+            with lock:
+                finished += 1
+            return []
+
+    collectors = tuple(BlockingCollector(agency) for agency in Agency)
+
+    @contextmanager
+    def factory():
+        try:
+            yield collectors
+        finally:
+            with lock:
+                assert finished == 3
+            context_exited.set()
+
+    async def scenario() -> None:
+        adapter = RentalHousingAdapter(factory, clock=lambda: NOW)
+        task = asyncio.create_task(
+            adapter.fetch("m", rental_spec()),
+            name="cancelled-rental-fetch",
+        )
+        while True:
+            with lock:
+                if started == 3:
+                    break
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not context_exited.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not context_exited.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert context_exited.is_set()
+        assert not [
+            pending
+            for pending in asyncio.all_tasks()
+            if pending is not asyncio.current_task()
+            and pending.get_name().startswith("rental-housing-collector:")
+        ]
+
+    asyncio.run(scenario())
+    assert finished == 3
+
+
+def test_fatal_collector_base_exception_propagates_after_other_threads_join() -> None:
+    class Fatal(BaseException):
+        pass
+
+    finished: list[Agency] = []
+    context_exited = False
+
+    class FatalCollector(FakeCollector):
+        def collect(self) -> object:
+            finished.append(self.agency)
+            if self.agency is Agency.SH:
+                raise Fatal
+            return []
+
+    collectors = tuple(FatalCollector(agency, []) for agency in Agency)
+
+    @contextmanager
+    def factory():
+        nonlocal context_exited
+        try:
+            yield collectors
+        finally:
+            assert set(finished) == set(Agency)
+            context_exited = True
+
+    with pytest.raises(Fatal):
+        asyncio.run(RentalHousingAdapter(factory, clock=lambda: NOW).fetch("m", rental_spec()))
+
+    assert context_exited is True
+
+
+def test_fatal_collector_error_wins_over_concurrent_fetch_cancellation() -> None:
+    class Fatal(BaseException):
+        pass
+
+    started = threading.Event()
+    release = threading.Event()
+    context_exited = False
+
+    class FatalCollector(FakeCollector):
+        def collect(self) -> object:
+            if self.agency is Agency.SH:
+                started.set()
+                release.wait(timeout=5)
+                raise Fatal
+            release.wait(timeout=5)
+            return []
+
+    collectors = tuple(FatalCollector(agency, []) for agency in Agency)
+
+    @contextmanager
+    def factory():
+        nonlocal context_exited
+        try:
+            yield collectors
+        finally:
+            context_exited = True
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            RentalHousingAdapter(factory, clock=lambda: NOW).fetch("m", rental_spec())
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        release.set()
+        with pytest.raises(Fatal):
+            await task
+
+    asyncio.run(scenario())
+    assert context_exited is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:credential-marker@example.com/notice",
+        "javascript://example.com/credential-marker",
+        "https://example.com/\ncredential-marker",
+        "https://exa\uff0fmple.com/?credential-marker",
+        "https:///credential-marker",
+    ],
+)
+@pytest.mark.parametrize("source_id", [None, "fixed-source-id"])
+def test_malformed_announcement_url_is_isolated_without_secret_leak(
+    url: str,
+    source_id: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    malformed = announcement(Agency.SH, source_id or "temporary")
+    object.__setattr__(malformed, "source_id", source_id)
+    object.__setattr__(malformed, "url", url)
+    caplog.set_level(logging.DEBUG)
+
+    batch = asyncio.run(
+        adapter_for(
+            [announcement(Agency.LH)],
+            [malformed],
+            [announcement(Agency.GH)],
+        ).fetch("m", rental_spec())
+    )
+
+    assert batch.source_status == {"LH": "ok", "SH": "failed", "GH": "ok"}
+    assert [(warning.source, warning.stage, warning.detail) for warning in batch.warnings] == [
+        ("SH", "collection", "invalid collector result")
+    ]
+    assert {item.fields["agency"] for item in batch.items} == {"LH", "GH"}
+    for exposed in (
+        repr(batch),
+        batch.source_hash,
+        repr(batch.warnings),
+        caplog.text,
+    ):
+        assert "credential-marker" not in exposed
+
+
+def test_hostile_source_id_canonical_key_is_an_isolated_safe_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    malformed = announcement(Agency.SH)
+    object.__setattr__(malformed, "source_id", "\ud800credential-marker")
+    caplog.set_level(logging.DEBUG)
+
+    batch = asyncio.run(
+        adapter_for(
+            [announcement(Agency.LH)],
+            [malformed],
+            [announcement(Agency.GH)],
+        ).fetch("m", rental_spec())
+    )
+
+    assert batch.source_status == {"LH": "ok", "SH": "failed", "GH": "ok"}
+    assert batch.warnings[0].detail == "invalid collector result"
+    for exposed in (repr(batch), batch.source_hash, repr(batch.warnings), caplog.text):
+        assert "credential-marker" not in exposed
 
 
 def test_injected_collectors_are_not_closed() -> None:
