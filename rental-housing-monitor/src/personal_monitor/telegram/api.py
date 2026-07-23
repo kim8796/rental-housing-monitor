@@ -5,6 +5,7 @@ import logging
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from typing import Any, Final
 
 import httpx
@@ -24,35 +25,62 @@ MAX_BUTTON_TEXT_CHARS: Final = 64
 MAX_CALLBACK_DATA_BYTES: Final = 64
 MAX_CALLBACK_ID_CHARS: Final = 256
 MAX_CALLBACK_ANSWER_CHARS: Final = 200
+MAX_JSON_NESTING: Final = 64
+MAX_JSON_INTEGER_DIGITS: Final = 19
 
 _INVALID: Final = object()
-_SAFE_DESCRIPTION_RE: Final = re.compile(
-    r"(?:https?://|www\.|token|authorization|bearer|cookie|secret|credential|"
-    r"api[-_ ]?key|header|chat[-_ ]?id|callback|message|\d)",
-    re.IGNORECASE,
-)
+_UNSUPPORTED: Final = object()
+_TELEGRAM_BOT_PATH_RE: Final = re.compile(r"^/bot[^/]+(?P<endpoint>/.*)?$")
 
 
 class _TelegramUrlRedactionFilter(logging.Filter):
+    _personal_monitor_telegram_redactor = True
+
     def filter(self, record: logging.LogRecord) -> bool:
         if not isinstance(record.args, tuple):
             return True
         redacted: list[object] = []
         changed = False
         for value in record.args:
-            if isinstance(value, httpx.URL) and value.host == "api.telegram.org":
-                redacted.append("https://api.telegram.org/<redacted>")
-                changed = True
-            else:
-                redacted.append(value)
+            replacement = _redacted_telegram_url(value)
+            redacted.append(replacement)
+            changed = changed or replacement is not value
         if changed:
             record.args = tuple(redacted)
         return True
 
 
 _HTTPX_LOGGER = logging.getLogger("httpx")
-if not any(isinstance(item, _TelegramUrlRedactionFilter) for item in _HTTPX_LOGGER.filters):
-    _HTTPX_LOGGER.addFilter(_TelegramUrlRedactionFilter())
+_HTTPX_REDACTOR = _TelegramUrlRedactionFilter()
+
+
+def _redacted_telegram_url(value: object) -> object:
+    if not isinstance(value, httpx.URL) or value.host != "api.telegram.org":
+        return value
+    matched = _TELEGRAM_BOT_PATH_RE.fullmatch(value.path)
+    if matched is None:
+        return value
+    endpoint = matched.group("endpoint") or ""
+    return f"https://api.telegram.org/bot<redacted>{endpoint}"
+
+
+def _ensure_httpx_redactor_first() -> bool:
+    filters = _HTTPX_LOGGER.filters
+    if type(filters) is not list:
+        return False
+    try:
+        retained = [
+            item
+            for item in filters
+            if not getattr(item, "_personal_monitor_telegram_redactor", False)
+        ]
+        filters[:] = [_HTTPX_REDACTOR, *retained]
+    except Exception:
+        return False
+    return bool(filters) and filters[0] is _HTTPX_REDACTOR
+
+
+_ensure_httpx_redactor_first()
 
 
 class TelegramApiError(RuntimeError):
@@ -63,9 +91,21 @@ class TelegramApiError(RuntimeError):
 
 
 class TelegramApi:
-    __slots__ = ("_base_url", "_client")
+    __slots__ = (
+        "_base_url",
+        "_client",
+        "_client_anchor",
+        "_hooks_anchor",
+        "_mounts_anchor",
+        "_transport_anchor",
+    )
 
-    def __init__(self, client: httpx.AsyncClient, bot_token: str) -> None:
+    def __init__(
+        self,
+        bot_token: str,
+        *,
+        transport: httpx.MockTransport | None = None,
+    ) -> None:
         token = _bounded_string(
             bot_token,
             min_chars=1,
@@ -75,11 +115,48 @@ class TelegramApi:
         )
         if token is None or not token.strip():
             raise ValueError("invalid Telegram bot token")
-        self._client = client
-        self._base_url = f"https://api.telegram.org/bot{token}"
+        if transport is not None and type(transport) is not httpx.MockTransport:
+            raise ValueError("invalid Telegram test transport")
+        client = httpx.AsyncClient(transport=transport, trust_env=False)
+        hooks = MappingProxyType({"request": (), "response": ()})
+        mounts = MappingProxyType(dict(client._mounts))
+        object.__setattr__(client, "_event_hooks", hooks)
+        object.__setattr__(client, "_mounts", mounts)
+        object.__setattr__(self, "_client", client)
+        object.__setattr__(self, "_client_anchor", client)
+        object.__setattr__(self, "_hooks_anchor", hooks)
+        object.__setattr__(self, "_mounts_anchor", mounts)
+        object.__setattr__(self, "_transport_anchor", client._transport)
+        object.__setattr__(self, "_base_url", f"https://api.telegram.org/bot{token}")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("TelegramApi composition is sealed")
 
     def __repr__(self) -> str:
         return "<TelegramApi redacted>"
+
+    async def aclose(self) -> None:
+        close_failed = False
+        try:
+            await self._client_anchor.aclose()
+        except Exception:
+            close_failed = True
+        if close_failed:
+            raise TelegramApiError("Telegram client close failed") from None
+
+    def _client_integrity_ok(self) -> bool:
+        try:
+            client = self._client
+            return (
+                type(client) is httpx.AsyncClient
+                and client is self._client_anchor
+                and client._event_hooks is self._hooks_anchor
+                and client._mounts is self._mounts_anchor
+                and client._transport is self._transport_anchor
+                and client.event_hooks == {"request": (), "response": ()}
+            )
+        except Exception:
+            return False
 
     async def get_updates(self, *, offset: int, timeout: int = 30) -> list[TelegramUpdate]:
         if not _is_int_in_range(offset, minimum=0, maximum=MAX_IDENTIFIER):
@@ -220,6 +297,11 @@ class TelegramApi:
         json_body: Mapping[str, object] | None = None,
         timeout: float,
     ) -> dict[str, Any]:
+        if not self._client_integrity_ok() or self._client.is_closed:
+            raise TelegramApiError("Telegram client integrity failure")
+        if not _ensure_httpx_redactor_first():
+            raise TelegramApiError("Telegram logging integrity failure")
+
         request_failed = False
         status_code = 0
         body = bytearray()
@@ -241,7 +323,7 @@ class TelegramApi:
             status_code = 200
             body = bytearray()
             response_too_large = True
-        except httpx.HTTPError:
+        except Exception:
             request_failed = True
             response_too_large = False
         else:
@@ -263,9 +345,6 @@ class TelegramApi:
     def _result(payload: Mapping[str, Any]) -> Any:
         ok = payload.get("ok", _INVALID)
         if ok is False:
-            description = _safe_description(payload.get("description"))
-            if description is not None:
-                raise TelegramApiError(f"Telegram API request failed: {description}")
             raise TelegramApiError("Telegram API request failed")
         if ok is not True or "result" not in payload:
             raise TelegramApiError("invalid Telegram response shape")
@@ -288,22 +367,52 @@ class _ResponseTooLarge(Exception):
 def _decode_json(body: bytes) -> object:
     try:
         text = body.decode("utf-8", errors="strict")
-        return json.loads(text)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        if not _json_nesting_is_safe(text):
+            return _INVALID
+        return json.loads(
+            text,
+            parse_int=_limited_json_int,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeError, ValueError, RecursionError):
         return _INVALID
 
 
-def _safe_description(value: object) -> str | None:
-    description = _bounded_string(
-        value,
-        min_chars=1,
-        max_chars=160,
-        max_bytes=640,
-        allow_layout_controls=False,
-    )
-    if description is None or _SAFE_DESCRIPTION_RE.search(description):
-        return None
-    return description
+def _json_nesting_is_safe(value: str) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_JSON_NESTING:
+                return False
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_string
+
+
+def _limited_json_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if not digits or len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("invalid JSON integer")
+    return int(value)
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("invalid JSON constant")
 
 
 def _is_int_in_range(value: object, *, minimum: int, maximum: int) -> bool:
@@ -419,16 +528,22 @@ def _parse_update(value: object) -> TelegramUpdate | None:
         message = _parse_message(value["message"])
         if message is None:
             return None
+        if message is _UNSUPPORTED:
+            return TelegramUpdate(update_id, None, None)
+        assert isinstance(message, TelegramMessage)
         return TelegramUpdate(update_id, message, None)
     if has_callback:
         callback = _parse_callback(value["callback_query"])
         if callback is None:
             return None
+        if callback is _UNSUPPORTED:
+            return TelegramUpdate(update_id, None, None)
+        assert isinstance(callback, CallbackQuery)
         return TelegramUpdate(update_id, None, callback)
     return TelegramUpdate(update_id, None, None)
 
 
-def _parse_message(value: object) -> TelegramMessage | None:
+def _parse_message(value: object) -> TelegramMessage | object | None:
     if not isinstance(value, dict):
         return None
     chat = value.get("chat")
@@ -443,6 +558,8 @@ def _parse_message(value: object) -> TelegramMessage | None:
         for item in (message_id, chat_id, from_user_id)
     ):
         return None
+    if "text" not in value:
+        return _UNSUPPORTED
     text = _bounded_string(
         value.get("text"),
         min_chars=1,
@@ -455,24 +572,14 @@ def _parse_message(value: object) -> TelegramMessage | None:
     return TelegramMessage(message_id, chat_id, from_user_id, text)
 
 
-def _parse_callback(value: object) -> CallbackQuery | None:
+def _parse_callback(value: object) -> CallbackQuery | object | None:
     if not isinstance(value, dict):
         return None
     sender = value.get("from")
-    message = value.get("message")
-    if not isinstance(sender, dict) or not isinstance(message, dict):
+    if not isinstance(sender, dict):
         return None
-    chat = message.get("chat")
-    if not isinstance(chat, dict):
-        return None
-
     from_user_id = sender.get("id")
-    chat_id = chat.get("id")
-    message_id = message.get("message_id")
-    if not all(
-        _is_int_in_range(item, minimum=1, maximum=MAX_IDENTIFIER)
-        for item in (from_user_id, chat_id, message_id)
-    ):
+    if not _is_int_in_range(from_user_id, minimum=1, maximum=MAX_IDENTIFIER):
         return None
     callback_id = _bounded_string(
         value.get("id"),
@@ -489,5 +596,36 @@ def _parse_callback(value: object) -> CallbackQuery | None:
         allow_layout_controls=False,
     )
     if callback_id is None or data is None:
+        return None
+
+    has_message = "message" in value
+    has_inline_message = "inline_message_id" in value
+    if has_message and has_inline_message:
+        return None
+    if has_inline_message:
+        inline_message_id = _bounded_string(
+            value.get("inline_message_id"),
+            min_chars=1,
+            max_chars=MAX_CALLBACK_ID_CHARS,
+            max_bytes=1024,
+            allow_layout_controls=False,
+        )
+        if inline_message_id is None:
+            return None
+        return _UNSUPPORTED
+    if not has_message:
+        return None
+
+    message = value.get("message")
+    if not isinstance(message, dict):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, dict):
+        return None
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    if not all(
+        _is_int_in_range(item, minimum=1, maximum=MAX_IDENTIFIER) for item in (chat_id, message_id)
+    ):
         return None
     return CallbackQuery(callback_id, from_user_id, chat_id, message_id, data)
