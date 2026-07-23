@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
+import zlib
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from typing import Any
@@ -562,6 +564,11 @@ class _TrackingResponseStream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         self.close_calls += 1
+
+
+class _UnavailableResponseHeaders:
+    def get(self, _key: str, _default: str = "") -> str:
+        raise RuntimeError("response headers unavailable")
 
 
 def test_review_preexisting_httpx_filter_never_observes_tokenized_url() -> None:
@@ -1233,6 +1240,261 @@ def test_second_final_review_httpcore_diagnostics_are_suppressed_without_muting_
             unrelated_logger.level,
             unrelated_logger.propagate,
         ) = original_unrelated
+
+
+def test_third_final_review_in_flight_httpcore_reconfiguration_cannot_emit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    parent_logger = logging.getLogger("httpcore")
+    probe_logger = logging.getLogger("httpcore.http11")
+    unrelated_logger = logging.getLogger("personal_monitor.telegram_third_review_probe")
+    original_parent = (
+        parent_logger.disabled,
+        parent_logger.level,
+        list(parent_logger.filters),
+        list(parent_logger.handlers),
+        parent_logger.propagate,
+    )
+    original_probe = (
+        probe_logger.disabled,
+        probe_logger.level,
+        list(probe_logger.filters),
+        list(probe_logger.handlers),
+        probe_logger.propagate,
+    )
+    original_unrelated = (
+        unrelated_logger.disabled,
+        unrelated_logger.level,
+        unrelated_logger.propagate,
+    )
+
+    def reconfigure_after_preflight(_request: httpx.Request) -> httpx.Response:
+        for logger in (parent_logger, probe_logger):
+            logger.disabled = False
+            logger.setLevel(logging.DEBUG)
+            logger.filters = []
+            logger.handlers = []
+            logger.addHandler(caplog.handler)
+            logger.propagate = True
+
+        future_logger = logging.getLogger("httpcore.future_notset_third_review_probe")
+        future_logger.disabled = False
+        future_logger.setLevel(logging.NOTSET)
+        future_logger.propagate = True
+        probe_logger.debug("httpcore-in-flight-secret")
+        probe_logger._log(logging.DEBUG, "httpcore-direct-log-secret", ())
+        direct_record = logging.LogRecord(
+            probe_logger.name,
+            logging.DEBUG,
+            __file__,
+            0,
+            "httpcore-direct-handle-secret",
+            (),
+            None,
+        )
+        probe_logger.handle(direct_record)
+        probe_logger.callHandlers(direct_record)
+        future_logger.debug("httpcore-future-child-secret")
+        unrelated_logger.warning("third-review-unrelated-marker")
+        return json_response({"ok": True, "result": []})
+
+    unrelated_logger.disabled = False
+    unrelated_logger.setLevel(logging.DEBUG)
+    unrelated_logger.propagate = True
+    caplog.set_level(logging.DEBUG)
+    harness = TelegramHarness([reconfigure_after_preflight])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert all("httpcore-" not in message for message in messages)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert any(record.name == "httpx" for record in caplog.records)
+        assert any(message == "third-review-unrelated-marker" for message in messages)
+    finally:
+        (
+            parent_logger.disabled,
+            parent_logger.level,
+            parent_logger.filters,
+            parent_logger.handlers,
+            parent_logger.propagate,
+        ) = original_parent
+        (
+            probe_logger.disabled,
+            probe_logger.level,
+            probe_logger.filters,
+            probe_logger.handlers,
+            probe_logger.propagate,
+        ) = original_probe
+        (
+            unrelated_logger.disabled,
+            unrelated_logger.level,
+            unrelated_logger.propagate,
+        ) = original_unrelated
+
+
+def test_third_final_review_installed_transport_loggers_are_immediately_sealed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unrelated_logger = logging.getLogger("personal_monitor.telegram_constructor_probe")
+    original_unrelated = (
+        unrelated_logger.disabled,
+        unrelated_logger.level,
+        unrelated_logger.propagate,
+    )
+    late_logger = logging.getLogger("httpcore.lazy_installed_transport_probe")
+    late_logger.disabled = False
+    late_logger.setLevel(logging.DEBUG)
+    api = TelegramApi(TOKEN)
+    installed_loggers = [
+        candidate
+        for name, candidate in logging.Logger.manager.loggerDict.items()
+        if name.startswith("httpcore.") and isinstance(candidate, logging.Logger)
+    ]
+    original_states = [
+        (
+            logger,
+            logger.disabled,
+            logger.level,
+            list(logger.filters),
+            list(logger.handlers),
+            logger.propagate,
+        )
+        for logger in installed_loggers
+    ]
+    unrelated_logger.disabled = False
+    unrelated_logger.setLevel(logging.DEBUG)
+    unrelated_logger.propagate = True
+    caplog.set_level(logging.DEBUG)
+    try:
+        assert installed_loggers
+        for logger in installed_loggers:
+            logger.disabled = False
+            logger.setLevel(logging.DEBUG)
+            logger.filters = []
+            logger.handlers = []
+            logger.addHandler(caplog.handler)
+            logger.propagate = True
+            logger.debug("installed-transport-httpcore-secret")
+        unrelated_logger.warning("constructor-unrelated-marker")
+        run(api.aclose())
+
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert any(
+            record.getMessage() == "constructor-unrelated-marker" for record in caplog.records
+        )
+    finally:
+        if not api._client.is_closed:
+            run(api.aclose())
+        for logger, disabled, level, filters, handlers, propagate in original_states:
+            logger.disabled = disabled
+            logger.level = level
+            logger.filters = filters
+            logger.handlers = handlers
+            logger.propagate = propagate
+        (
+            unrelated_logger.disabled,
+            unrelated_logger.level,
+            unrelated_logger.propagate,
+        ) = original_unrelated
+
+
+@pytest.mark.parametrize(
+    "content_encodings",
+    [
+        (b"",),
+        (b"gzip", b"deflate"),
+        (b"gzip, deflate",),
+        (b"gzip,gzip",),
+        (b"br",),
+        (b"zstd",),
+        (b"unknown",),
+        (b"\xff",),
+    ],
+)
+def test_third_final_review_invalid_content_encoding_fails_closed_and_closes_once(
+    content_encodings: tuple[bytes, ...],
+) -> None:
+    stream = _TrackingResponseStream(b'{"ok":true,"result":[]}')
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers=[(b"content-encoding", item) for item in content_encodings],
+            stream=stream,
+        )
+
+    harness = TelegramHarness([response])
+    with pytest.raises(TelegramApiError, match="Telegram request failed") as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert stream.close_calls == 1
+
+
+def test_third_final_review_unavailable_content_encoding_fails_closed_and_closes_once() -> None:
+    stream = _TrackingResponseStream(b'{"ok":true,"result":[]}')
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        result = httpx.Response(200, stream=stream)
+        result.headers = _UnavailableResponseHeaders()  # type: ignore[assignment]
+        return result
+
+    harness = TelegramHarness([response])
+    with pytest.raises(TelegramApiError, match="Telegram request failed"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert stream.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "encoded_body"),
+    [
+        (None, b'{"ok":true,"result":[]}'),
+        (b"identity", b'{"ok":true,"result":[]}'),
+        (b"gzip", gzip.compress(b'{"ok":true,"result":[]}')),
+        (b"deflate", zlib.compress(b'{"ok":true,"result":[]}')),
+    ],
+)
+def test_third_final_review_installed_content_decoders_are_preserved(
+    content_encoding: bytes | None,
+    encoded_body: bytes,
+) -> None:
+    stream = _TrackingResponseStream(encoded_body)
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        headers = [] if content_encoding is None else [(b"content-encoding", content_encoding)]
+        return httpx.Response(200, headers=headers, stream=stream)
+
+    harness = TelegramHarness([response])
+    assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+    run(harness.close())
+
+    assert stream.close_calls == 1
+
+
+def test_third_final_review_corrupt_gzip_fails_safely_and_closes_once() -> None:
+    stream = _TrackingResponseStream(b"not-a-gzip-stream")
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers=[(b"content-encoding", b"gzip")],
+            stream=stream,
+        )
+
+    harness = TelegramHarness([response])
+    with pytest.raises(TelegramApiError, match="Telegram request failed") as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert stream.close_calls == 1
 
 
 @pytest.mark.parametrize(

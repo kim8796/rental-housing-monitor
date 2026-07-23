@@ -56,27 +56,110 @@ _TELEGRAM_ENDPOINTS: Final = frozenset(
 _UNSUPPORTED_MEDIA_FIELDS: Final = frozenset(
     {"animation", "audio", "document", "photo", "sticker", "video", "video_note", "voice"}
 )
-_SAFE_CONTENT_ENCODINGS: Final = frozenset({"br", "deflate", "gzip", "identity", "zstd"})
+_SAFE_CONTENT_ENCODINGS: Final = frozenset({b"deflate", b"gzip", b"identity"})
+
+
+class _NoOpHttpcoreLogger(logging.Logger):
+    """A permanently inert logger that preserves references held by httpcore modules."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "level":
+            value = _HTTP_CORE_SUPPRESS_LEVEL
+        elif name == "disabled":
+            value = True
+        elif name in {"filters", "handlers"}:
+            value = ()
+        elif name == "propagate":
+            value = False
+        super().__setattr__(name, value)
+
+    def seal(self) -> None:
+        object.__setattr__(self, "level", _HTTP_CORE_SUPPRESS_LEVEL)
+        object.__setattr__(self, "disabled", True)
+        object.__setattr__(self, "filters", ())
+        object.__setattr__(self, "handlers", ())
+        object.__setattr__(self, "propagate", False)
+        self._cache.clear()
+
+    def setLevel(self, _level: object) -> None:
+        self.seal()
+
+    def addFilter(self, _filter: object) -> None:
+        return None
+
+    def removeFilter(self, _filter: object) -> None:
+        return None
+
+    def addHandler(self, _handler: object) -> None:
+        return None
+
+    def removeHandler(self, _handler: object) -> None:
+        return None
+
+    def isEnabledFor(self, _level: int) -> bool:
+        return False
+
+    def getEffectiveLevel(self) -> int:
+        return _HTTP_CORE_SUPPRESS_LEVEL
+
+    def hasHandlers(self) -> bool:
+        return False
+
+    def _log(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def handle(self, _record: logging.LogRecord) -> None:
+        return None
+
+    def callHandlers(self, _record: logging.LogRecord) -> None:
+        return None
+
+
+def _seal_httpcore_logger(logger: logging.Logger) -> bool:
+    try:
+        if type(logger) is not _NoOpHttpcoreLogger:
+            logger.__class__ = _NoOpHttpcoreLogger
+        logger.seal()
+        return (
+            type(logger) is _NoOpHttpcoreLogger
+            and logger.level == _HTTP_CORE_SUPPRESS_LEVEL
+            and logger.disabled
+            and logger.filters == ()
+            and logger.handlers == ()
+            and not logger.propagate
+            and not logger.isEnabledFor(logging.CRITICAL + 100)
+        )
+    except Exception:
+        return False
 
 
 def _suppress_httpcore_diagnostics() -> bool:
-    """Disable httpcore's process-wide raw wire diagnostics, without muting other loggers."""
+    """Permanently seal every registered httpcore diagnostic origin."""
     try:
         parent = logging.getLogger("httpcore")
-        parent.disabled = True
-        parent.setLevel(_HTTP_CORE_SUPPRESS_LEVEL)
-        for name, candidate in list(logging.Logger.manager.loggerDict.items()):
-            if name.startswith("httpcore.") and isinstance(candidate, logging.Logger):
-                candidate.disabled = True
-                candidate.setLevel(_HTTP_CORE_SUPPRESS_LEVEL)
-        return parent.disabled and parent.level == _HTTP_CORE_SUPPRESS_LEVEL
+        candidates = [parent]
+        candidates.extend(
+            candidate
+            for name, candidate in list(logging.Logger.manager.loggerDict.items())
+            if name.startswith("httpcore.") and isinstance(candidate, logging.Logger)
+        )
+        if not all(_seal_httpcore_logger(candidate) for candidate in candidates):
+            return False
+        return all(
+            type(candidate) is _NoOpHttpcoreLogger
+            and not candidate.isEnabledFor(logging.CRITICAL + 100)
+            for name, candidate in list(logging.Logger.manager.loggerDict.items())
+            if (name == "httpcore" or name.startswith("httpcore."))
+            and isinstance(candidate, logging.Logger)
+        )
     except Exception:
         return False
 
 
 # httpcore renders raw response headers and reason phrases inside the transport,
-# before this module can sanitize a response. Its diagnostic namespace therefore
-# stays disabled for the process; application and HTTPX request logs remain live.
+# before this module can sanitize a response. Its registered diagnostic origins
+# therefore remain permanent no-op loggers for the process; application and HTTPX
+# request logs remain live.
 _HTTPCORE_DIAGNOSTICS_SUPPRESSED: Final = _suppress_httpcore_diagnostics()
 
 
@@ -142,12 +225,22 @@ def _sanitized_request_url(value: httpx.URL) -> httpx.URL:
 
 def _safe_response_headers(response: httpx.Response) -> list[tuple[bytes, bytes]]:
     try:
-        encoding = response.headers.get("content-encoding", "").strip().lower()
+        raw_headers = response.headers.raw
+        encodings = [
+            value
+            for name, value in raw_headers
+            if isinstance(name, bytes) and name.lower() == b"content-encoding"
+        ]
     except Exception:
+        raise _UnsafeResponseMetadata from None
+    if not encodings:
         return []
-    if encoding in _SAFE_CONTENT_ENCODINGS:
-        return [(b"content-encoding", encoding.encode("ascii"))]
-    return []
+    if len(encodings) != 1 or not isinstance(encodings[0], bytes):
+        raise _UnsafeResponseMetadata
+    encoding = encodings[0].lower()
+    if encoding not in _SAFE_CONTENT_ENCODINGS:
+        raise _UnsafeResponseMetadata
+    return [(b"content-encoding", encoding)]
 
 
 class TelegramApiError(RuntimeError):
@@ -188,6 +281,8 @@ class TelegramApi:
         inner_transport: httpx.AsyncBaseTransport = (
             transport if transport is not None else httpx.AsyncHTTPTransport()
         )
+        if not _suppress_httpcore_diagnostics():
+            raise TelegramApiError("Telegram logging integrity failure")
         wrapped_transport = _SanitizingTransport(inner_transport)
         client = httpx.AsyncClient(transport=wrapped_transport, trust_env=False)
         hooks = MappingProxyType({"request": (), "response": ()})
@@ -437,6 +532,10 @@ class TelegramApi:
 
 
 class _ResponseTooLarge(Exception):
+    pass
+
+
+class _UnsafeResponseMetadata(Exception):
     pass
 
 
