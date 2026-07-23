@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import unicodedata
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final, Protocol
@@ -72,6 +74,7 @@ class TelegramGateway:
         "_command_chat_id",
         "_command_chat_id_anchor",
         "_consume_anchor",
+        "_discard_anchor",
         "_route_anchor",
         "_send_message_anchor",
         "_router",
@@ -93,6 +96,7 @@ class TelegramGateway:
         )
         route = None
         consume = None
+        discard = None
         answer_callback = None
         send_message = None
         capture_failed = not configuration_valid
@@ -101,11 +105,14 @@ class TelegramGateway:
                 route = router.route
                 answer_callback = api.answer_callback
                 consume = actions.consume
-                if not all(callable(item) for item in (route, consume, answer_callback)):
+                discard = actions.discard
+                candidate_send = api.send_message
+                if not all(
+                    callable(item)
+                    for item in (route, consume, discard, answer_callback, candidate_send)
+                ):
                     capture_failed = True
-                candidate_send = getattr(api, "send_message", None)
-                if callable(candidate_send):
-                    send_message = candidate_send
+                send_message = candidate_send
             except Exception:
                 capture_failed = True
         if capture_failed:
@@ -120,6 +127,7 @@ class TelegramGateway:
         object.__setattr__(self, "_actions", actions)
         object.__setattr__(self, "_actions_anchor", actions)
         object.__setattr__(self, "_consume_anchor", consume)
+        object.__setattr__(self, "_discard_anchor", discard)
         object.__setattr__(self, "_api", api)
         object.__setattr__(self, "_api_anchor", api)
         object.__setattr__(self, "_answer_callback_anchor", answer_callback)
@@ -188,31 +196,50 @@ class TelegramGateway:
         except ActionDenied:
             return
         if operation == "cancel":
+            self._discard_anchor(action)
             await self._answer_callback_anchor(
                 callback.id,
                 text="취소되었습니다",
                 show_alert=False,
             )
             return
-        reply = await self._route_anchor(action)
-        await self._deliver_reply(callback.chat_id, reply)
-        await self._answer_callback_anchor(
-            callback.id,
-            text="수정 안내를 보냈습니다" if operation == "edit" else "처리되었습니다",
-            show_alert=False,
-        )
+        try:
+            reply = await self._route_anchor(action)
+            if not self._integrity_ok():
+                raise RuntimeError("gateway integrity failure")
+            await self._deliver_reply(callback.chat_id, reply)
+            if not self._integrity_ok():
+                raise RuntimeError("gateway integrity failure")
+            await self._answer_callback_anchor(
+                callback.id,
+                text="수정 안내를 보냈습니다" if operation == "edit" else "처리되었습니다",
+                show_alert=False,
+            )
+        except asyncio.CancelledError:
+            self._discard_anchor(action)
+            raise
+        except Exception:
+            self._discard_anchor(action)
+            with suppress(Exception):
+                await self._answer_callback_anchor(
+                    callback.id,
+                    text="결과 전달에 실패했습니다. 모니터 상태를 확인해 주세요.",
+                    show_alert=True,
+                )
+            return
+        self._discard_anchor(action)
 
     async def _deliver_reply(self, chat_id: int, value: object) -> None:
         from personal_monitor.control.messages import ControlReply
 
         if value is None:
             return
-        if type(value) is not ControlReply or self._send_message_anchor is None:
-            return
+        if type(value) is not ControlReply:
+            raise RuntimeError("invalid control reply")
         try:
             reply = ControlReply(value.text, value.buttons)
         except Exception:
-            return
+            raise RuntimeError("invalid control reply") from None
         await self._send_message_anchor(
             chat_id,
             reply.text,
@@ -273,17 +300,19 @@ class TelegramGateway:
                     "consume",
                 )
                 and _callable_still_attached(
+                    self._discard_anchor,
+                    self._actions_anchor,
+                    "discard",
+                )
+                and _callable_still_attached(
                     self._answer_callback_anchor,
                     self._api_anchor,
                     "answer_callback",
                 )
-                and (
-                    self._send_message_anchor is None
-                    or _callable_still_attached(
-                        self._send_message_anchor,
-                        self._api_anchor,
-                        "send_message",
-                    )
+                and _callable_still_attached(
+                    self._send_message_anchor,
+                    self._api_anchor,
+                    "send_message",
                 )
             )
         except Exception:

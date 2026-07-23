@@ -70,8 +70,11 @@ class CountingProtocolBoundary:
         self.attribute = attribute
         self.accesses = 0
         self.call = AsyncMock()
+        self.send_call = AsyncMock(return_value="88")
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        if name == "send_message":
+            return self.send_call
         if name != self.attribute:
             raise AttributeError(name)
         self.accesses += 1
@@ -175,6 +178,35 @@ def test_gateway_sends_validated_reply_for_messages_and_confirmed_callbacks() ->
         ("42", "안전한 처리 결과"),
     ]
     assert api.answers == [("cb-1", "처리되었습니다", False)]
+    connection.close()
+
+
+def test_gateway_requires_send_message_at_construction() -> None:
+    connection = _connection()
+    actions = PendingActionService(connection)
+    api = SimpleNamespace(answer_callback=AsyncMock())
+
+    with pytest.raises(ValueError, match="invalid Telegram gateway configuration"):
+        TelegramGateway(7, 42, FakeRouter(), actions, api)
+
+    connection.close()
+
+
+def test_confirm_delivery_failure_gets_one_truthful_alert_after_consumption() -> None:
+    class FailingSendApi(FakeApi):
+        async def send_message(self, *args: object, **kwargs: object) -> str:
+            raise RuntimeError("delivery-secret")
+
+    connection = _connection()
+    actions = PendingActionService(connection)
+    api = FailingSendApi()
+    gateway = TelegramGateway(7, 42, ReplyRouter(), actions, api)
+    pending = actions.create(OWNER, "delete", {"owner_id": OWNER}, now=NOW)
+
+    run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+
+    assert api.answers == [("cb-1", "결과 전달에 실패했습니다. 모니터 상태를 확인해 주세요.", True)]
+    assert connection.execute("SELECT consumed_at FROM pending_actions").fetchone()[0] is not None
     connection.close()
 
 
@@ -374,13 +406,12 @@ def test_router_failure_does_not_resurrect_consumed_action(gateway_parts) -> Non
     pending = actions.create(OWNER, "create", {}, now=NOW)
     router.error = RuntimeError("router-private-error")
 
-    with pytest.raises(RuntimeError, match="router-private-error"):
-        run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
+    run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
     router.error = None
     run(gateway.handle_update(_callback(pending.confirm_callback), now=NOW))
 
     assert len(router.calls) == 1
-    assert api.answers == []
+    assert api.answers == [("cb-1", "결과 전달에 실패했습니다. 모니터 상태를 확인해 주세요.", True)]
 
 
 def test_router_cancellation_is_preserved_and_action_stays_consumed(gateway_parts) -> None:
@@ -458,10 +489,11 @@ def test_instance_level_async_callables_are_supported(
     gateway_parts,
 ) -> None:
     _, _, _, actions, _ = gateway_parts
-    route = AsyncMock()
+    route = AsyncMock(return_value=None)
     answer = AsyncMock()
+    send = AsyncMock(return_value="88")
     router = SimpleNamespace(route=route)
-    api = SimpleNamespace(answer_callback=answer)
+    api = SimpleNamespace(answer_callback=answer, send_message=send)
     gateway = TelegramGateway(7, 42, router, actions, api)
 
     run(gateway.handle_update(_message()))
@@ -519,6 +551,7 @@ def test_constructor_retrieves_each_protocol_callable_exactly_once(gateway_parts
         def __init__(self) -> None:
             self.accesses = 0
             self.call = AsyncMock()
+            self.send_message = AsyncMock(return_value="88")
 
         @property
         def answer_callback(self):  # type: ignore[no-untyped-def]
@@ -629,6 +662,9 @@ def test_changing_callable_descriptor_fails_closed_on_use(gateway_parts, boundar
     class ChangingApi:
         def __init__(self) -> None:
             self.calls: list[object] = []
+
+        async def send_message(self, *_args: object, **_kwargs: object) -> str:
+            return "88"
 
         @property
         def answer_callback(self):  # type: ignore[no-untyped-def]

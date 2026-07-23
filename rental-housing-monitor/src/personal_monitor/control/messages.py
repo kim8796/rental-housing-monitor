@@ -35,6 +35,7 @@ class ControlReply:
         if (
             not _safe_text(self.text, MAX_CONTROL_REPLY_CHARS, allow_layout=True)
             or contains_sensitive_text(self.text)
+            or not _direct_text_is_safe(self.text)
             or type(rows) is not tuple
             or any(type(row) is not tuple for row in rows)
             or len(rows) > _MAX_ROWS
@@ -117,6 +118,19 @@ def _safe_button(value: object) -> bool:
         and len(value.callback_data.encode("ascii")) <= 64
         and _CALLBACK_RE.fullmatch(value.callback_data) is not None
     )
+
+
+def _direct_text_is_safe(value: str) -> bool:
+    if "<" in value or ">" in value:
+        return False
+    try:
+        for matched in _EMBEDDED_URL_RE.finditer(value):
+            parsed = urlsplit(matched.group(0))
+            if parsed.query or parsed.fragment:
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def _safe_text(value: object, limit: int, *, allow_layout: bool = False) -> bool:

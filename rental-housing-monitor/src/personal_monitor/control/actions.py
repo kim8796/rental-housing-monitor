@@ -8,7 +8,7 @@ import secrets
 import sqlite3
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Final
@@ -74,12 +74,14 @@ class PendingAction:
         return "<PendingAction redacted>"
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
 class ConsumedAction:
     action: str
     payload: Mapping[str, object]
     owner_id: str
     operation: str = "confirm"
+    _issuer: object | None = field(default=None, init=False, repr=False)
+    _receipt: object | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if (
@@ -102,6 +104,10 @@ class PendingActionService:
     __slots__ = (
         "_connection",
         "_connection_anchor",
+        "_issued",
+        "_issued_anchor",
+        "_issuer",
+        "_issuer_anchor",
         "_token_source",
         "_token_source_anchor",
     )
@@ -111,6 +117,12 @@ class PendingActionService:
             raise ValueError("invalid pending action storage")
         object.__setattr__(self, "_connection", connection)
         object.__setattr__(self, "_connection_anchor", connection)
+        issuer = object()
+        issued: dict[object, tuple[ConsumedAction, str, str, str, str]] = {}
+        object.__setattr__(self, "_issuer", issuer)
+        object.__setattr__(self, "_issuer_anchor", issuer)
+        object.__setattr__(self, "_issued", issued)
+        object.__setattr__(self, "_issued_anchor", issued)
         object.__setattr__(self, "_token_source", _TOKEN_URLSAFE)
         object.__setattr__(self, "_token_source_anchor", _TOKEN_URLSAFE)
 
@@ -229,12 +241,51 @@ class PendingActionService:
                 )
                 if cursor.rowcount != 1:
                     raise _RejectAction
+                receipt = object()
                 result = ConsumedAction(action, payload, owner, operation)
+                object.__setattr__(result, "_issuer", self._issuer_anchor)
+                object.__setattr__(result, "_receipt", receipt)
+                self._issued_anchor[receipt] = (
+                    result,
+                    action,
+                    payload_json,
+                    owner,
+                    operation,
+                )
         except Exception:
             failed = True
+        if failed and result is not None and result._receipt is not None:
+            self._issued_anchor.pop(result._receipt, None)
         if failed or result is None:
             raise ActionDenied("pending action denied") from None
         return result
+
+    def claim(self, action: object) -> bool:
+        """Claim one exact issuer-bound receipt before any control mutation."""
+        if not self._integrity_ok() or type(action) is not ConsumedAction:
+            return False
+        try:
+            receipt = action._receipt
+            if action._issuer is not self._issuer_anchor or receipt is None:
+                return False
+            record = self._issued_anchor.pop(receipt, None)
+            if record is None:
+                return False
+            issued, expected_action, expected_payload, expected_owner, expected_operation = record
+            payload_json, _ = _validated_payload(action.payload)
+            return (
+                issued is action
+                and action.action == expected_action
+                and payload_json == expected_payload
+                and action.owner_id == expected_owner
+                and action.operation == expected_operation
+            )
+        except Exception:
+            return False
+
+    def discard(self, action: object) -> bool:
+        """Consume an unused in-memory receipt, such as a cancelled callback."""
+        return self.claim(action)
 
     def revoke(self, token: str, owner_id: str) -> None:
         safe_token = _valid_token(token)
@@ -261,6 +312,9 @@ class PendingActionService:
             return (
                 type(self._connection) is sqlite3.Connection
                 and self._connection is self._connection_anchor
+                and self._issuer is self._issuer_anchor
+                and type(self._issued) is dict
+                and self._issued is self._issued_anchor
                 and self._token_source is self._token_source_anchor
                 and self._token_source_anchor is _TOKEN_URLSAFE
             )

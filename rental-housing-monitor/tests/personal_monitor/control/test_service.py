@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from personal_monitor.ai.contracts import IntentKind, IntentResult
-from personal_monitor.control.actions import PendingActionService
+from personal_monitor.control.actions import ConsumedAction, PendingActionService
 from personal_monitor.control.messages import ControlReply, safe_plain
 from personal_monitor.control.planner import (
     PlannedMonitor,
@@ -23,6 +23,7 @@ from personal_monitor.control.planner import (
 )
 from personal_monitor.control.service import ControlService
 from personal_monitor.domain.spec import FetchStrategy, MonitorSpec, MonitorStatus
+from personal_monitor.engine.scheduler import next_run_at
 from personal_monitor.security.robots import RobotsDecision
 from personal_monitor.storage import RegistryRepository, open_database
 from personal_monitor.storage.schema import canonical_json
@@ -220,6 +221,19 @@ def test_safe_plain_strips_embedded_query_and_html_delimiters() -> None:
     assert "<html>" not in rendered
 
 
+@pytest.mark.parametrize(
+    "text",
+    (
+        "대상 https://example.com/path?ref=ordinary-private-value",
+        "대상 https://example.com/path#private-fragment",
+        "<b>안전해 보이는 HTML</b>",
+    ),
+)
+def test_control_reply_constructor_rejects_unstripped_urls_and_html(text: str) -> None:
+    with pytest.raises(ValueError, match="invalid control reply"):
+        ControlReply(text)
+
+
 def test_consumed_action_carries_exact_authenticated_owner_and_operation() -> None:
     connection = open_database(":memory:")
     connection.execute(
@@ -234,6 +248,67 @@ def test_consumed_action_carries_exact_authenticated_owner_and_operation() -> No
     assert consumed.owner_id == OWNER
     assert consumed.operation == "edit"
     assert OWNER not in repr(consumed)
+    connection.close()
+
+
+def test_forged_consumed_action_cannot_mutate_control_service() -> None:
+    registry, connection = _registry()
+    monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
+    active = registry.get_active_monitor(monitor_id)
+    actions = PendingActionService(connection)
+    service = ControlService(
+        FakeIntentRouter(_intent(IntentKind.LIST)),
+        registry,
+        UnusedPlanner(),
+        actions,
+        now_source=lambda: NOW,
+    )
+    forged = ConsumedAction(
+        "delete",
+        {
+            "owner_id": OWNER,
+            "monitor_id": monitor_id,
+            "monitor_name": "가격 감시",
+            "expected_status": MonitorStatus.ACTIVE.value,
+            "expected_active_version_id": active.version_id,
+        },
+        OWNER,
+    )
+
+    reply = _run(service.handle(forged))
+
+    assert "처리하지 못했습니다" in reply.text
+    assert registry.get_control_monitor(monitor_id, owner_id=OWNER).status is MonitorStatus.ACTIVE
+    connection.close()
+
+
+def test_consumed_action_receipt_is_bound_to_service_and_claimed_once() -> None:
+    registry, connection = _registry()
+    issuing_actions = PendingActionService(connection)
+    service_actions = PendingActionService(connection)
+    proposal = _proposal(issuing_actions)
+    foreign = issuing_actions.consume(proposal.pending_action.token, OWNER, now=NOW)
+    service = ControlService(
+        FakeIntentRouter(_intent(IntentKind.LIST)),
+        registry,
+        UnusedPlanner(),
+        service_actions,
+        now_source=lambda: NOW,
+    )
+
+    foreign_reply = _run(service.handle(foreign))
+
+    assert "처리하지 못했습니다" in foreign_reply.text
+    assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
+
+    own_proposal = _proposal(service_actions)
+    own = service_actions.consume(own_proposal.pending_action.token, OWNER, now=NOW)
+    first = _run(service.handle(own))
+    second = _run(service.handle(own))
+
+    assert "등록했습니다" in first.text
+    assert "처리하지 못했습니다" in second.text
+    assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 1
     connection.close()
 
 
@@ -565,6 +640,11 @@ def test_schedule_update_stages_unapproved_candidate_then_atomically_activates()
 
     assert "수정했습니다" in reply.text
     assert registry.get_active_monitor(monitor_id).version_id == candidate["id"]
+    assert registry.get_control_monitor(monitor_id, owner_id=OWNER).next_run_at == next_run_at(
+        _planned_update().spec,
+        monitor_id,
+        NOW,
+    )
     approved = connection.execute(
         "SELECT approved_by, approved_at FROM monitor_versions WHERE id = ?",
         (candidate["id"],),
@@ -572,6 +652,149 @@ def test_schedule_update_stages_unapproved_candidate_then_atomically_activates()
     assert approved["approved_by"] == OWNER
     assert approved["approved_at"] is not None
     connection.close()
+
+
+def test_condition_only_preview_summarizes_rules_and_validation_without_literals() -> None:
+    registry, connection = _registry()
+    monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
+    payload = _spec().model_dump(mode="json")
+    payload["rules"] = [
+        {
+            "kind": "numeric_threshold",
+            "field": "price",
+            "operator": "lt",
+            "value": 777777,
+        }
+    ]
+    planned = PlannedMonitor(
+        spec=MonitorSpec.model_validate(payload),
+        preview_items=(PreviewItem({"price": 777777}),),
+        resolved_strategy=FetchStrategy.HTTP,
+        robots=RobotsDecision(True, None, NOW, True),
+        warnings=(),
+    )
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text="가격 조건을 바꿔줘",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(planned),
+        PendingActionService(connection),
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("가격 조건만 바꿔줘")))
+
+    assert "조건 변경: 1개 → 1개" in reply.text
+    assert "검증 미리보기: 1개 항목 통과" in reply.text
+    assert "777777" not in reply.text
+    assert ".price" not in reply.text
+    connection.close()
+
+
+def test_schedule_only_update_rejects_every_hidden_spec_change_without_writes() -> None:
+    registry, connection = _registry()
+    monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
+    payload = _spec().model_dump(mode="json")
+    payload.update(
+        {
+            "schedule": "0 9 * * *",
+            "name": "몰래 바뀐 이름",
+            "notify_on_no_change": True,
+            "rules": [
+                {
+                    "kind": "numeric_threshold",
+                    "field": "price",
+                    "operator": "lt",
+                    "value": 1,
+                }
+            ],
+        }
+    )
+    hostile = PlannedMonitor(
+        spec=MonitorSpec.model_validate(payload),
+        preview_items=(PreviewItem({"price": 1}),),
+        resolved_strategy=FetchStrategy.HTTP,
+        robots=RobotsDecision(True, None, NOW, True),
+        warnings=(),
+    )
+    intent = IntentResult(
+        kind=IntentKind.UPDATE,
+        target_monitor_ids=[monitor_id],
+        target_url=None,
+        condition_text=None,
+        schedule_text="매일 오전 9시",
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(intent),
+        registry,
+        FakeUpdatePlanner(hostile),
+        PendingActionService(connection),
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("일정만 매일 오전 9시로 바꿔줘")))
+
+    assert "처리하지 못했습니다" in reply.text
+    assert connection.execute("SELECT count(*) FROM monitor_versions").fetchone()[0] == 1
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
+    connection.close()
+
+
+def test_router_cannot_swap_registry_database_across_await() -> None:
+    registry, connection = _registry()
+    other = open_database(":memory:")
+    RegistryRepository(other).create_user(OWNER, 7)
+    actions = PendingActionService(connection)
+    create_intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=_spec().target_url,
+        condition_text="새 상품",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+
+    class SwappingRouter:
+        async def route(self, _request: ControlRequest) -> IntentResult:
+            registry.connection = other
+            return create_intent
+
+    class RecordingPlanner:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def propose(self, *_args: object) -> object:
+            self.called = True
+            raise AssertionError("planner must not run after composition swap")
+
+    planner = RecordingPlanner()
+    service = ControlService(
+        SwappingRouter(),
+        registry,
+        planner,
+        actions,
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request("새 상품을 모니터해줘")))
+
+    assert "처리하지 못했습니다" in reply.text
+    assert planner.called is False
+    assert connection.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
+    assert other.execute("SELECT count(*) FROM monitors").fetchone()[0] == 0
+    connection.close()
+    other.close()
 
 
 def test_needs_review_status_offers_only_adaptive_repair_and_activates_exact_candidate() -> None:
@@ -616,6 +839,39 @@ def test_needs_review_status_offers_only_adaptive_repair_and_activates_exact_can
     assert repaired.status is MonitorStatus.ACTIVE
     assert repaired.active_version_id == adaptive
     assert repaired.active_version_id != active.version_id
+    connection.close()
+
+
+def test_adaptive_candidate_without_stored_current_parent_is_never_offered() -> None:
+    registry, connection = _registry()
+    monitor_id = registry.create_monitor(_spec(), created_by=OWNER)
+    candidate = registry.add_version(
+        monitor_id,
+        _spec(name="출처 없는 복구 후보"),
+        created_by="scrapling-adaptive",
+        approved=False,
+    )
+    connection.execute(
+        "UPDATE monitor_versions SET parent_version_id = NULL WHERE id = ?",
+        (candidate,),
+    )
+    connection.execute(
+        "UPDATE monitors SET status = ? WHERE id = ?",
+        (MonitorStatus.NEEDS_REVIEW.value, monitor_id),
+    )
+    service = ControlService(
+        FakeIntentRouter(_intent(IntentKind.STATUS, monitor_id)),
+        registry,
+        UnusedPlanner(),
+        PendingActionService(connection),
+        now_source=lambda: NOW,
+    )
+
+    reply = _run(service.handle(_request(f"/status {monitor_id}")))
+
+    assert "복구 적용" not in reply.text
+    assert reply.buttons == ()
+    assert connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0] == 0
     connection.close()
 
 

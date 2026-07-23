@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 from collections.abc import Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from personal_monitor.control.messages import (
 from personal_monitor.control.planner import (
     PlannedMonitor,
     reconstruct_confirmed_spec,
+    update_scope_is_valid,
 )
 from personal_monitor.control.preview import render_preview
 from personal_monitor.domain.spec import MonitorStatus
@@ -34,7 +36,26 @@ _EDIT_GUIDANCE: Final = "원하는 변경 내용을 새 메시지로 보내주�
 
 
 class ControlService:
-    __slots__ = ("_actions", "_now_source", "_planner", "_registry", "_router")
+    __slots__ = (
+        "_actions",
+        "_actions_anchor",
+        "_actions_methods_anchor",
+        "_claim_anchor",
+        "_connection_anchor",
+        "_now_source",
+        "_now_source_anchor",
+        "_now_call_anchor",
+        "_plan_update_anchor",
+        "_planner",
+        "_planner_anchor",
+        "_propose_anchor",
+        "_registry",
+        "_registry_anchor",
+        "_registry_methods_anchor",
+        "_route_anchor",
+        "_router",
+        "_router_anchor",
+    )
 
     def __init__(
         self,
@@ -53,23 +74,74 @@ class ControlService:
         ):
             raise ValueError("invalid control service composition")
         try:
-            if not callable(intent_router.route) or not callable(planner.propose):
+            route = intent_router.route
+            propose = planner.propose
+            plan_update = getattr(planner, "plan_update", None)
+            claim = actions.claim
+            registry_methods = tuple(
+                (name, getattr(registry, name))
+                for name in (
+                    "activate_candidate_exact",
+                    "create_monitor",
+                    "find_repair_candidate",
+                    "get_control_monitor",
+                    "list_control_monitors",
+                    "soft_delete_exact",
+                    "stage_candidate_action",
+                    "transition_status_exact",
+                )
+            )
+            actions_methods = tuple(
+                (name, getattr(actions, name))
+                for name in ("_integrity_ok", "claim", "create", "revoke")
+            )
+            now_call = _capture_callable(now_source)
+            if not callable(route) or not callable(propose) or not callable(claim):
+                raise TypeError
+            if not all(callable(method) for _, method in (*registry_methods, *actions_methods)):
                 raise TypeError
         except Exception:
             raise ValueError("invalid control service composition") from None
-        self._router = intent_router
-        self._registry = registry
-        self._planner = planner
-        self._actions = actions
-        self._now_source = now_source
+        object.__setattr__(self, "_router", intent_router)
+        object.__setattr__(self, "_router_anchor", intent_router)
+        object.__setattr__(self, "_route_anchor", route)
+        object.__setattr__(self, "_registry", registry)
+        object.__setattr__(self, "_registry_anchor", registry)
+        object.__setattr__(self, "_registry_methods_anchor", registry_methods)
+        object.__setattr__(self, "_connection_anchor", registry.connection)
+        object.__setattr__(self, "_planner", planner)
+        object.__setattr__(self, "_planner_anchor", planner)
+        object.__setattr__(self, "_propose_anchor", propose)
+        object.__setattr__(
+            self,
+            "_plan_update_anchor",
+            plan_update if callable(plan_update) else None,
+        )
+        object.__setattr__(self, "_actions", actions)
+        object.__setattr__(self, "_actions_anchor", actions)
+        object.__setattr__(self, "_actions_methods_anchor", actions_methods)
+        object.__setattr__(self, "_claim_anchor", claim)
+        object.__setattr__(self, "_now_source", now_source)
+        object.__setattr__(self, "_now_source_anchor", now_source)
+        object.__setattr__(self, "_now_call_anchor", now_call)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("ControlService composition is sealed")
+
+    def __repr__(self) -> str:
+        return "<ControlService redacted>"
 
     async def route(self, value: ControlRequest | ConsumedAction) -> ControlReply:
         return await self.handle(value)
 
     async def handle(self, value: ControlRequest | ConsumedAction) -> ControlReply:
+        if not self._integrity_ok():
+            return ControlReply(_SAFE_FAILURE)
         if type(value) is ControlRequest:
             return await self._handle_request(value)
         if type(value) is ConsumedAction:
+            if not self._claim_anchor(value) or not self._integrity_ok():
+                return ControlReply(_SAFE_FAILURE)
             return self._handle_action(value)
         return ControlReply(_SAFE_FAILURE)
 
@@ -84,10 +156,12 @@ class ControlService:
         except Exception:
             return ControlReply(_SAFE_FAILURE)
         try:
-            intent = await self._router.route(safe_request)
+            intent = await self._route_anchor(safe_request)
         except asyncio.CancelledError:
             raise
         except Exception:
+            return ControlReply(_SAFE_FAILURE)
+        if not self._integrity_ok():
             return ControlReply(_SAFE_FAILURE)
         if (
             safe_request.owner_id,
@@ -147,7 +221,9 @@ class ControlService:
     ) -> ControlReply:
         proposal: object | None = None
         try:
-            proposal = await self._planner.propose(request, intent)
+            proposal = await self._propose_anchor(request, intent)
+            if not self._integrity_ok():
+                raise ValueError
             if proposal.spec.owner_id != request.owner_id:
                 raise ValueError
             preview = render_preview(proposal)
@@ -166,6 +242,8 @@ class ControlService:
             return ControlReply(_SAFE_FAILURE)
 
     def _list_reply(self, owner_id: str) -> ControlReply:
+        if not self._integrity_ok():
+            return ControlReply(_SAFE_FAILURE)
         try:
             monitors = self._registry.list_control_monitors(owner_id)
         except Exception:
@@ -186,9 +264,12 @@ class ControlService:
         monitor_id: str,
     ) -> ControlReply:
         try:
+            if not self._integrity_ok() or self._plan_update_anchor is None:
+                raise ValueError
             current = self._registry.get_control_monitor(monitor_id, owner_id=request.owner_id)
-            plan_update = self._planner.plan_update
-            planned = await plan_update(request, intent, current.spec)
+            planned = await self._plan_update_anchor(request, intent, current.spec)
+            if not self._integrity_ok():
+                raise ValueError
             if type(planned) is not PlannedMonitor:
                 raise ValueError
             fresh_spec = type(current.spec).model_validate(planned.spec.model_dump(mode="json"))
@@ -197,6 +278,7 @@ class ControlService:
                 or fresh_spec.target_url != current.spec.target_url
                 or fresh_spec.auth_profile_ref != current.spec.auth_profile_ref
                 or fresh_spec.source_adapter != current.spec.source_adapter
+                or not update_scope_is_valid(current.spec, fresh_spec, intent)
             ):
                 raise ValueError
             action_kind = (
@@ -204,18 +286,37 @@ class ControlService:
                 if intent.schedule_text is not None and intent.condition_text is None
                 else "update"
             )
-            now = _safe_now(self._now_source())
+            now = _safe_now(self._call_now())
 
             def make_reply(pending: object, _candidate: str, _digest: str) -> ControlReply:
                 from personal_monitor.control.actions import PendingAction
 
                 if type(pending) is not PendingAction:
                     raise ValueError
+                lines = [
+                    f"모니터: {safe_plain(current.name, limit=120)}",
+                    f"대상: {safe_url(current.spec.target_url)}",
+                ]
+                if current.spec.schedule != fresh_spec.schedule:
+                    lines.append(
+                        "일정 변경: "
+                        f"{safe_plain(current.spec.schedule, limit=80)} → "
+                        f"{safe_plain(fresh_spec.schedule, limit=80)}"
+                    )
+                if current.spec.rules != fresh_spec.rules:
+                    kinds = ", ".join(sorted({rule.kind.value for rule in fresh_spec.rules}))
+                    lines.append(
+                        f"조건 변경: {len(current.spec.rules)}개 → {len(fresh_spec.rules)}개 "
+                        f"(종류: {safe_plain(kinds, limit=120)})"
+                    )
+                lines.extend(
+                    (
+                        f"검증 미리보기: {len(planned.preview_items)}개 항목 통과",
+                        "검증된 변경 후보입니다. 10분 안에 확인해 주세요.",
+                    )
+                )
                 return ControlReply(
-                    f"모니터: {safe_plain(fresh_spec.name, limit=120)}\n"
-                    f"대상: {safe_url(fresh_spec.target_url)}\n"
-                    f"변경 후 일정: {safe_plain(fresh_spec.schedule, limit=120)}\n"
-                    "검증된 변경 후보입니다. 10분 안에 확인해 주세요.",
+                    "\n".join(lines),
                     (
                         (
                             InlineButton("적용", pending.confirm_callback),
@@ -247,6 +348,8 @@ class ControlService:
             return ControlReply(_SAFE_FAILURE)
 
     def _status_reply(self, owner_id: str, monitor_id: str) -> ControlReply:
+        if not self._integrity_ok():
+            return ControlReply(_SAFE_FAILURE)
         try:
             monitor = self._registry.get_control_monitor(monitor_id, owner_id=owner_id)
         except Exception:
@@ -258,8 +361,10 @@ class ControlService:
         return _bounded_reply(_status_lines(monitor))
 
     def _repair_preview(self, monitor: ControlMonitor) -> ControlReply | None:
+        if not self._integrity_ok():
+            return None
         try:
-            now = _safe_now(self._now_source())
+            now = _safe_now(self._call_now())
             with transaction(self._registry.connection, immediate=True):
                 current = self._registry.get_control_monitor(
                     monitor.id,
@@ -322,6 +427,8 @@ class ControlService:
             return None
 
     def _clarification(self, owner_id: str) -> ControlReply:
+        if not self._integrity_ok():
+            return ControlReply(_CLARIFY)
         try:
             monitors = self._registry.list_control_monitors(owner_id)
         except Exception:
@@ -341,12 +448,14 @@ class ControlService:
         monitor_id: str,
         kind: IntentKind,
     ) -> ControlReply:
+        if not self._integrity_ok():
+            return ControlReply(_SAFE_FAILURE)
         expected = {
             IntentKind.PAUSE: MonitorStatus.ACTIVE,
             IntentKind.RESUME: MonitorStatus.PAUSED_USER,
         }.get(kind)
         try:
-            now = _safe_now(self._now_source())
+            now = _safe_now(self._call_now())
             with transaction(self._registry.connection, immediate=True):
                 monitor = self._registry.get_control_monitor(monitor_id, owner_id=owner_id)
                 if expected is not None and monitor.status is not expected:
@@ -383,12 +492,14 @@ class ControlService:
             return ControlReply(_NOT_FOUND)
 
     def _confirm_state(self, action: ConsumedAction, owner_id: str) -> ControlReply:
+        if not self._integrity_ok():
+            return ControlReply(_SAFE_FAILURE)
         values = _state_payload(action.payload)
         if values is None or values["owner_id"] != owner_id:
             return ControlReply(_SAFE_FAILURE)
         try:
             expected = MonitorStatus(values["expected_status"])
-            now = _safe_now(self._now_source())
+            now = _safe_now(self._call_now())
             if action.action == "pause":
                 self._registry.transition_status_exact(
                     values["monitor_id"],
@@ -423,6 +534,8 @@ class ControlService:
         return ControlReply(f"{safe_plain(values['monitor_name'], limit=120)} 모니터를 {outcome}")
 
     def _confirm_candidate(self, action: ConsumedAction, owner_id: str) -> ControlReply:
+        if not self._integrity_ok():
+            return ControlReply(_SAFE_FAILURE)
         values = _candidate_payload(action.payload)
         if (
             values is None
@@ -440,13 +553,15 @@ class ControlService:
                 expected_active_version_id=values["expected_active_version_id"],
                 expected_created_by="codex-control",
                 spec_hash=values["spec_hash"],
-                activated_at=_safe_now(self._now_source()),
+                activated_at=_safe_now(self._call_now()),
             )
         except Exception:
             return ControlReply(_SAFE_FAILURE)
         return ControlReply(f"{safe_plain(spec.name, limit=120)} 모니터를 수정했습니다.")
 
     def _confirm_repair(self, action: ConsumedAction, owner_id: str) -> ControlReply:
+        if not self._integrity_ok():
+            return ControlReply(_SAFE_FAILURE)
         values = _repair_payload(action.payload)
         if values is None or values["owner_id"] != owner_id:
             return ControlReply(_SAFE_FAILURE)
@@ -459,12 +574,63 @@ class ControlService:
                 expected_active_version_id=values["expected_active_version_id"],
                 expected_created_by="scrapling-adaptive",
                 spec_hash=values["spec_hash"],
-                activated_at=_safe_now(self._now_source()),
+                activated_at=_safe_now(self._call_now()),
                 target_status=MonitorStatus.ACTIVE,
             )
         except Exception:
             return ControlReply(_SAFE_FAILURE)
         return ControlReply(f"{safe_plain(spec.name, limit=120)} 모니터 복구를 적용했습니다.")
+
+    def _integrity_ok(self) -> bool:
+        try:
+            return (
+                self._router is self._router_anchor
+                and self._registry is self._registry_anchor
+                and self._planner is self._planner_anchor
+                and self._actions is self._actions_anchor
+                and self._now_source is self._now_source_anchor
+                and self._registry_anchor.connection is self._connection_anchor
+                and self._actions_anchor.connection is self._connection_anchor
+                and self._actions_anchor._integrity_ok()
+                and _callable_still_attached(self._route_anchor, self._router_anchor, "route")
+                and _callable_still_attached(
+                    self._propose_anchor,
+                    self._planner_anchor,
+                    "propose",
+                )
+                and (
+                    self._plan_update_anchor is None
+                    or _callable_still_attached(
+                        self._plan_update_anchor,
+                        self._planner_anchor,
+                        "plan_update",
+                    )
+                )
+                and _callable_still_attached(
+                    self._claim_anchor,
+                    self._actions_anchor,
+                    "claim",
+                )
+                and all(
+                    _callable_still_attached(method, self._registry_anchor, name)
+                    for name, method in self._registry_methods_anchor
+                )
+                and all(
+                    _callable_still_attached(method, self._actions_anchor, name)
+                    for name, method in self._actions_methods_anchor
+                )
+                and _captured_callable_intact(
+                    self._now_source_anchor,
+                    self._now_call_anchor,
+                )
+            )
+        except Exception:
+            return False
+
+    def _call_now(self) -> object:
+        if not self._integrity_ok():
+            raise ValueError("invalid control service composition")
+        return self._now_call_anchor[3]()
 
 
 def _fresh_intent(value: object) -> IntentResult | None:
@@ -472,6 +638,49 @@ def _fresh_intent(value: object) -> IntentResult | None:
         if type(value) is IntentResult:
             return IntentResult.model_validate(value.model_dump(mode="python"))
     return None
+
+
+def _callable_still_attached(captured: object, owner: object, name: str) -> bool:
+    try:
+        current = getattr(owner, name)
+    except Exception:
+        return False
+    if not callable(captured) or not callable(current):
+        return False
+    if current is captured:
+        return True
+    return (
+        getattr(captured, "__self__", None) is owner
+        and getattr(current, "__self__", None) is owner
+        and getattr(captured, "__func__", None) is getattr(current, "__func__", None)
+    )
+
+
+def _capture_callable(
+    value: object,
+) -> tuple[object, object | None, str | None, object]:
+    if inspect.ismethod(value) and value.__self__ is not None:
+        return value, value.__self__, value.__name__, value
+    if inspect.isfunction(value) or inspect.isbuiltin(value):
+        return value, None, None, value
+    call = value.__call__  # noqa: B004
+    if not callable(call):
+        raise TypeError
+    return value, value, "__call__", call
+
+
+def _captured_callable_intact(
+    value: object,
+    anchor: tuple[object, object | None, str | None, object],
+) -> bool:
+    root, owner, name, captured = anchor
+    if value is not root or not callable(captured):
+        return False
+    if owner is None:
+        return captured is value
+    if name is None:
+        return False
+    return _callable_still_attached(captured, owner, name)
 
 
 def _safe_now(value: object) -> datetime:

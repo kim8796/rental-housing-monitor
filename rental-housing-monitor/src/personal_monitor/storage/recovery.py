@@ -156,19 +156,22 @@ class RecoveryRepository:
             ).fetchone()[0]
             self.connection.execute(
                 "INSERT INTO monitor_versions(id, monitor_id, version_number, spec_json, "
-                "created_by, created_at, approved_by, approved_at) "
-                "VALUES (?, ?, ?, ?, 'scrapling-adaptive', ?, NULL, NULL)",
+                "created_by, created_at, approved_by, approved_at, parent_version_id) "
+                "VALUES (?, ?, ?, ?, 'scrapling-adaptive', ?, NULL, NULL, ?)",
                 (
                     candidate_id,
                     monitor_id,
                     next_version,
                     canonical_json(spec.model_dump(mode="json")),
                     timestamp,
+                    expected_active_version_id,
                 ),
             )
             self._insert_diagnostic(snapshot_id, monitor_id, diagnostic, created_at)
             cursor = self.connection.execute(
-                "UPDATE monitors SET status = ?, updated_at = ? "
+                "UPDATE monitors SET status = ?, next_run_at = NULL, "
+                "lease_owner = NULL, lease_expires_at = NULL, "
+                "lease_generation = lease_generation + 1, updated_at = ? "
                 "WHERE id = ? AND owner_id = ? AND status = ? AND active_version_id = ?",
                 (
                     MonitorStatus.NEEDS_REVIEW.value,

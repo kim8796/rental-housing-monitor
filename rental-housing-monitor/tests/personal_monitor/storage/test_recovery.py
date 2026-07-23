@@ -167,13 +167,20 @@ def test_candidate_commit_is_unapproved_atomic_and_never_changes_active_version(
     )
 
     row = connection.execute(
-        "SELECT created_by, approved_by, approved_at FROM monitor_versions WHERE id = ?",
+        "SELECT created_by, approved_by, approved_at, parent_version_id "
+        "FROM monitor_versions WHERE id = ?",
         (candidate_id,),
     ).fetchone()
-    assert tuple(row) == ("scrapling-adaptive", None, None)
+    assert tuple(row) == ("scrapling-adaptive", None, None, active_version_id)
     current = registry.get_active_monitor(monitor_id)
     assert current.version_id == active_version_id
     assert registry.list_monitors("owner")[0].status is MonitorStatus.NEEDS_REVIEW
+    monitor_state = connection.execute(
+        "SELECT next_run_at, lease_owner, lease_expires_at, lease_generation "
+        "FROM monitors WHERE id = ?",
+        (monitor_id,),
+    ).fetchone()
+    assert tuple(monitor_state) == (None, None, None, 1)
     assert (
         connection.execute(
             "SELECT count(*) FROM diagnostic_snapshots WHERE monitor_id = ?", (monitor_id,)

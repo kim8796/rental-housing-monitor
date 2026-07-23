@@ -71,8 +71,23 @@ class CandidateVersion:
 
 
 class RegistryRepository:
+    __slots__ = ("_connection", "_connection_anchor")
+
     def __init__(self, connection: sqlite3.Connection) -> None:
-        self.connection = connection
+        if type(connection) is not sqlite3.Connection:
+            raise ValueError("invalid registry storage")
+        object.__setattr__(self, "_connection", connection)
+        object.__setattr__(self, "_connection_anchor", connection)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("RegistryRepository composition is sealed")
+
+    def __repr__(self) -> str:
+        return "<RegistryRepository redacted>"
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._connection_anchor
 
     def create_user(self, user_id: str, telegram_user_id: int) -> None:
         with transaction(self.connection):
@@ -142,7 +157,7 @@ class RegistryRepository:
         created_at = utc_now().isoformat()
         with transaction(self.connection, immediate=True):
             monitor = self.connection.execute(
-                "SELECT owner_id FROM monitors WHERE id = ?", (monitor_id,)
+                "SELECT owner_id, active_version_id FROM monitors WHERE id = ?", (monitor_id,)
             ).fetchone()
             if monitor is None:
                 raise ValueError("monitor does not exist")
@@ -157,8 +172,8 @@ class RegistryRepository:
             ).fetchone()[0]
             self.connection.execute(
                 "INSERT INTO monitor_versions(id, monitor_id, version_number, spec_json, "
-                "created_by, created_at, approved_by, approved_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_by, created_at, approved_by, approved_at, parent_version_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     version_id,
                     monitor_id,
@@ -168,6 +183,7 @@ class RegistryRepository:
                     created_at,
                     created_by if approved else None,
                     created_at if approved else None,
+                    monitor["active_version_id"],
                 ),
             )
         return version_id
@@ -196,7 +212,8 @@ class RegistryRepository:
     def activate_version(self, monitor_id: str, version_id: str, *, owner_id: str) -> None:
         with transaction(self.connection, immediate=True):
             version = self.connection.execute(
-                "SELECT v.monitor_id, v.approved_at, m.owner_id FROM monitor_versions AS v "
+                "SELECT v.monitor_id, v.approved_at, v.spec_json, m.owner_id, m.status "
+                "FROM monitor_versions AS v "
                 "JOIN monitors AS m ON m.id = v.monitor_id WHERE v.id = ?",
                 (version_id,),
             ).fetchone()
@@ -206,9 +223,18 @@ class RegistryRepository:
                 raise ValueError("only the monitor owner may activate a version")
             if version["approved_at"] is None:
                 raise ValueError("version must be approved before activation")
+            changed_at = utc_now()
+            spec = MonitorSpec.model_validate_json(version["spec_json"])
+            scheduled_at = (
+                _next_run_at(spec, monitor_id, changed_at).isoformat()
+                if version["status"] == MonitorStatus.ACTIVE.value
+                else None
+            )
             cursor = self.connection.execute(
-                "UPDATE monitors SET active_version_id = ?, updated_at = ? WHERE id = ?",
-                (version_id, utc_now().isoformat(), monitor_id),
+                "UPDATE monitors SET active_version_id = ?, name = ?, next_run_at = ?, "
+                "lease_owner = NULL, lease_expires_at = NULL, "
+                "lease_generation = lease_generation + 1, updated_at = ? WHERE id = ?",
+                (version_id, spec.name, scheduled_at, changed_at.isoformat(), monitor_id),
             )
             if cursor.rowcount != 1:
                 raise ValueError("monitor does not exist")
@@ -363,11 +389,32 @@ class RegistryRepository:
         if (expected_status, target_status) not in allowed:
             raise ValueError("lifecycle precondition failed")
         with transaction(self.connection, immediate=True):
+            scheduled_at: str | None = None
+            if target_status is MonitorStatus.ACTIVE:
+                row = self.connection.execute(
+                    "SELECT v.spec_json FROM monitors AS m "
+                    "JOIN monitor_versions AS v ON v.id = m.active_version_id "
+                    "WHERE m.id = ? AND m.owner_id = ? AND m.status = ? "
+                    "AND m.active_version_id = ?",
+                    (
+                        monitor_id,
+                        owner_id,
+                        expected_status.value,
+                        expected_active_version_id,
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("lifecycle precondition failed")
+                spec = MonitorSpec.model_validate_json(row["spec_json"])
+                scheduled_at = _next_run_at(spec, monitor_id, changed_at).isoformat()
             cursor = self.connection.execute(
-                "UPDATE monitors SET status = ?, updated_at = ? "
+                "UPDATE monitors SET status = ?, next_run_at = ?, lease_owner = NULL, "
+                "lease_expires_at = NULL, lease_generation = lease_generation + 1, "
+                "updated_at = ? "
                 "WHERE id = ? AND owner_id = ? AND status = ? AND active_version_id = ?",
                 (
                     target_status.value,
+                    scheduled_at,
                     timestamp,
                     monitor_id,
                     owner_id,
@@ -393,7 +440,8 @@ class RegistryRepository:
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
                 "UPDATE monitors SET status = ?, disabled_at = ?, lease_owner = NULL, "
-                "lease_expires_at = NULL, updated_at = ? "
+                "lease_expires_at = NULL, lease_generation = lease_generation + 1, "
+                "next_run_at = NULL, updated_at = ? "
                 "WHERE id = ? AND owner_id = ? AND status = ? AND active_version_id = ?",
                 (
                     MonitorStatus.DISABLED.value,
@@ -459,9 +507,16 @@ class RegistryRepository:
             ).fetchone()[0]
             self.connection.execute(
                 "INSERT INTO monitor_versions(id, monitor_id, version_number, spec_json, "
-                "created_by, created_at, approved_by, approved_at) "
-                "VALUES (?, ?, ?, ?, 'codex-control', ?, NULL, NULL)",
-                (candidate_id, monitor_id, next_version, canonical, timestamp),
+                "created_by, created_at, approved_by, approved_at, parent_version_id) "
+                "VALUES (?, ?, ?, ?, 'codex-control', ?, NULL, NULL, ?)",
+                (
+                    candidate_id,
+                    monitor_id,
+                    next_version,
+                    canonical,
+                    timestamp,
+                    expected_active_version_id,
+                ),
             )
             pending = actions.create(
                 owner_id,
@@ -511,12 +566,14 @@ class RegistryRepository:
                 "SELECT v.spec_json FROM monitor_versions AS v "
                 "JOIN monitors AS m ON m.id = v.monitor_id "
                 "WHERE v.id = ? AND v.monitor_id = ? AND v.created_by = ? "
-                "AND v.approved_at IS NULL AND m.owner_id = ? AND m.status = ? "
+                "AND v.approved_at IS NULL AND v.parent_version_id = ? "
+                "AND m.owner_id = ? AND m.status = ? "
                 "AND m.active_version_id = ?",
                 (
                     candidate_version_id,
                     monitor_id,
                     expected_created_by,
+                    expected_active_version_id,
                     owner_id,
                     expected_status.value,
                     expected_active_version_id,
@@ -531,6 +588,11 @@ class RegistryRepository:
                 or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != spec_hash
             ):
                 raise ValueError("lifecycle precondition failed")
+            scheduled_at = (
+                _next_run_at(spec, monitor_id, activated_at).isoformat()
+                if resulting_status is MonitorStatus.ACTIVE
+                else None
+            )
             approved = self.connection.execute(
                 "UPDATE monitor_versions SET approved_by = ?, approved_at = ? "
                 "WHERE id = ? AND monitor_id = ? AND approved_at IS NULL",
@@ -540,12 +602,15 @@ class RegistryRepository:
                 raise ValueError("lifecycle precondition failed")
             activated = self.connection.execute(
                 "UPDATE monitors SET active_version_id = ?, name = ?, status = ?, "
-                "updated_at = ? WHERE id = ? AND owner_id = ? AND status = ? "
+                "next_run_at = ?, lease_owner = NULL, lease_expires_at = NULL, "
+                "lease_generation = lease_generation + 1, updated_at = ? "
+                "WHERE id = ? AND owner_id = ? AND status = ? "
                 "AND active_version_id = ?",
                 (
                     candidate_version_id,
                     spec.name,
                     resulting_status.value,
+                    scheduled_at,
                     timestamp,
                     monitor_id,
                     owner_id,
@@ -566,10 +631,12 @@ class RegistryRepository:
         try:
             row = self.connection.execute(
                 "SELECT v.id, v.monitor_id, v.created_by, v.spec_json, "
-                "m.active_version_id, m.owner_id FROM monitor_versions AS v "
+                "v.parent_version_id, m.active_version_id, m.owner_id "
+                "FROM monitor_versions AS v "
                 "JOIN monitors AS m ON m.id = v.monitor_id "
                 "WHERE m.id = ? AND m.owner_id = ? AND m.status = ? "
                 "AND v.created_by = 'scrapling-adaptive' AND v.approved_at IS NULL "
+                "AND v.parent_version_id = m.active_version_id "
                 "ORDER BY v.version_number DESC, v.id DESC LIMIT 1",
                 (monitor_id, owner_id, MonitorStatus.NEEDS_REVIEW.value),
             ).fetchone()
@@ -582,7 +649,7 @@ class RegistryRepository:
                 id=row["id"],
                 monitor_id=row["monitor_id"],
                 owner_id=row["owner_id"],
-                expected_active_version_id=row["active_version_id"],
+                expected_active_version_id=row["parent_version_id"],
                 created_by=row["created_by"],
                 spec=spec,
             )
@@ -598,10 +665,32 @@ class RegistryRepository:
         owner_id: str,
     ) -> None:
         with transaction(self.connection):
+            changed_at = utc_now()
+            scheduled_at: str | None = None
+            if target is MonitorStatus.ACTIVE:
+                row = self.connection.execute(
+                    "SELECT v.spec_json FROM monitors AS m "
+                    "JOIN monitor_versions AS v ON v.id = m.active_version_id "
+                    "WHERE m.id = ? AND m.owner_id = ? AND m.status = ?",
+                    (monitor_id, owner_id, expected.value),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("monitor is not in the expected status")
+                spec = MonitorSpec.model_validate_json(row["spec_json"])
+                scheduled_at = _next_run_at(spec, monitor_id, changed_at).isoformat()
             cursor = self.connection.execute(
-                "UPDATE monitors SET status = ?, updated_at = ? "
+                "UPDATE monitors SET status = ?, next_run_at = ?, lease_owner = NULL, "
+                "lease_expires_at = NULL, lease_generation = lease_generation + 1, "
+                "updated_at = ? "
                 "WHERE id = ? AND owner_id = ? AND status = ?",
-                (target.value, utc_now().isoformat(), monitor_id, owner_id, expected.value),
+                (
+                    target.value,
+                    scheduled_at,
+                    changed_at.isoformat(),
+                    monitor_id,
+                    owner_id,
+                    expected.value,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("monitor is not in the expected status")
@@ -611,7 +700,8 @@ class RegistryRepository:
         with transaction(self.connection):
             cursor = self.connection.execute(
                 "UPDATE monitors SET status = ?, disabled_at = ?, lease_owner = NULL, "
-                "lease_expires_at = NULL, updated_at = ? WHERE id = ? AND owner_id = ?",
+                "lease_expires_at = NULL, lease_generation = lease_generation + 1, "
+                "next_run_at = NULL, updated_at = ? WHERE id = ? AND owner_id = ?",
                 (MonitorStatus.DISABLED.value, timestamp, timestamp, monitor_id, owner_id),
             )
             if cursor.rowcount != 1:
@@ -627,3 +717,9 @@ def _safe_optional_timestamp(value: object) -> datetime | None:
     if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError
     return parsed
+
+
+def _next_run_at(spec: MonitorSpec, monitor_id: str, after: datetime) -> datetime:
+    from personal_monitor.engine.scheduler import next_run_at
+
+    return next_run_at(spec, monitor_id, after)

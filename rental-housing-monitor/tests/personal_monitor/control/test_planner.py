@@ -258,7 +258,7 @@ def test_update_planning_reuses_hardened_probe_without_persisting_an_action(
 
     candidate = run(value.plan_update(request(), update, spec()))
 
-    assert candidate.spec == updated.model_copy(update={"fetch_strategy": FetchStrategy.HTTP})
+    assert candidate.spec == updated
     assert len(policy.calls) == len(page_probe.calls) == len(worker.calls) == 1
     assert pending_count(connection) == 0
 

@@ -59,7 +59,7 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
     assert second.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert second.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     versions = second.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
     columns = {
         row["name"]: row for row in second.execute("PRAGMA table_info(diagnostic_snapshots)")
     }
@@ -92,6 +92,14 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
         "adaptive_features_namespace_idx",
         "adaptive_features_expiry_idx",
     } <= adaptive_indexes
+    version_columns = {
+        row["name"]: row for row in second.execute("PRAGMA table_info(monitor_versions)")
+    }
+    assert version_columns["parent_version_id"]["type"] == "TEXT"
+    assert any(
+        row["from"] == "parent_version_id" and row["table"] == "monitor_versions"
+        for row in second.execute("PRAGMA foreign_key_list(monitor_versions)")
+    )
     second.close()
 
 
@@ -113,7 +121,7 @@ def test_existing_v1_database_migrates_to_v2_atomically_and_reruns(tmp_path) -> 
 
     migrated = open_database(database_path)
     migrated_versions = migrated.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in migrated_versions] == [1, 2, 3]
+    assert [row["version"] for row in migrated_versions] == [1, 2, 3, 4]
     assert migrated.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='diagnostic_snapshots'"
     ).fetchone()
@@ -134,7 +142,7 @@ def test_schema_rejects_a_migration_newer_than_the_binary(tmp_path) -> None:
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
     )
     connection.execute(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (5, ?)",
         (datetime.now(UTC).isoformat(),),
     )
     connection.commit()
@@ -237,6 +245,40 @@ def test_schema_migration_rolls_back_every_statement_on_failure(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
     ).fetchall()
     assert remaining_tables == []
+    connection.close()
+
+
+def test_parent_provenance_migration_rolls_back_alter_and_history_together(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = sqlite3.connect(tmp_path / "broken-v4.db", isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    for version, script in schema._MIGRATIONS[:3]:
+        for statement in schema._statements(script):
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (version, datetime.now(UTC).isoformat()),
+        )
+    monkeypatch.setattr(
+        schema,
+        "_MIGRATIONS",
+        (*schema._MIGRATIONS[:3], (4, schema._MIGRATION_4 + "\nINVALID SQL;")),
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        schema._apply_migrations(connection)
+
+    assert [
+        row["version"] for row in connection.execute("SELECT version FROM schema_migrations")
+    ] == [1, 2, 3]
+    assert "parent_version_id" not in {
+        row["name"] for row in connection.execute("PRAGMA table_info(monitor_versions)")
+    }
     connection.close()
 
 

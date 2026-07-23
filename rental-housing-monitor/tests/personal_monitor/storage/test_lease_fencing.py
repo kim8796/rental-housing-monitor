@@ -6,6 +6,7 @@ import pytest
 
 from personal_monitor.domain.observation import ObservationBatch, ObservedItem
 from personal_monitor.domain.spec import MonitorSpec, MonitorStatus
+from personal_monitor.engine.scheduler import next_run_at
 from personal_monitor.storage import (
     DeliveryCandidate,
     MonitorLease,
@@ -183,4 +184,71 @@ def test_atomic_enqueue_rejects_cross_owner_target_and_rolls_back_snapshot() -> 
 
     assert runtime.load_items(monitor_id) == list(old.items)
     assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
+    connection.close()
+
+
+def test_owner_pause_fences_old_worker_and_resume_recomputes_next_run() -> None:
+    connection = open_database(":memory:")
+    registry = RegistryRepository(connection)
+    runtime = RuntimeRepository(connection)
+    registry.create_user("owner-1", 1)
+    registry.create_delivery_target("target-1", "owner-1", "chat-1")
+    monitor_id = registry.create_monitor(make_spec(), created_by="owner-1")
+    active = registry.get_active_monitor(monitor_id)
+    connection.execute(
+        "UPDATE monitors SET next_run_at = ? WHERE id = ?", (NOW.isoformat(), monitor_id)
+    )
+    lease = runtime.claim_due(worker_id="worker-a", now=NOW)[0]
+
+    changed_at = NOW + timedelta(minutes=1)
+    registry.transition_status_exact(
+        monitor_id,
+        owner_id="owner-1",
+        expected_status=MonitorStatus.ACTIVE,
+        expected_active_version_id=active.version_id,
+        target_status=MonitorStatus.PAUSED_USER,
+        changed_at=changed_at,
+    )
+
+    stale = ObservationBatch(
+        monitor_id=monitor_id,
+        items=(ObservedItem("stale", {"price": 10}),),
+        observed_at=changed_at,
+        source_hash="stale",
+    )
+    with pytest.raises(ValueError, match="lease generation"):
+        runtime.apply_snapshot_and_deliveries(
+            stale,
+            (DeliveryCandidate("stale:new", "target-1", {"text": "stale"}),),
+            lease=lease,
+            worker_id="worker-a",
+        )
+    paused = connection.execute(
+        "SELECT lease_owner, lease_expires_at, lease_generation, next_run_at "
+        "FROM monitors WHERE id = ?",
+        (monitor_id,),
+    ).fetchone()
+    assert tuple(paused) == (None, None, lease.generation + 1, None)
+    assert connection.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
+
+    resumed_at = NOW + timedelta(minutes=2)
+    registry.transition_status_exact(
+        monitor_id,
+        owner_id="owner-1",
+        expected_status=MonitorStatus.PAUSED_USER,
+        expected_active_version_id=active.version_id,
+        target_status=MonitorStatus.ACTIVE,
+        changed_at=resumed_at,
+    )
+    resumed = connection.execute(
+        "SELECT lease_owner, lease_expires_at, lease_generation, next_run_at "
+        "FROM monitors WHERE id = ?",
+        (monitor_id,),
+    ).fetchone()
+    assert tuple(resumed) == (
+        None,
+        None,
+        lease.generation + 2,
+        next_run_at(active.spec, monitor_id, resumed_at).isoformat(),
+    )
     connection.close()

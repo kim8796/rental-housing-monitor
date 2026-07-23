@@ -91,7 +91,18 @@ CREATE INDEX adaptive_features_namespace_idx ON adaptive_features(namespace_hash
 CREATE INDEX adaptive_features_expiry_idx ON adaptive_features(expires_at);
 """
 
-_MIGRATIONS = ((1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3))
+_MIGRATION_4 = """
+ALTER TABLE monitor_versions
+ADD COLUMN parent_version_id TEXT REFERENCES monitor_versions(id);
+CREATE INDEX monitor_versions_parent_idx ON monitor_versions(parent_version_id);
+"""
+
+_MIGRATIONS = (
+    (1, _MIGRATION_1),
+    (2, _MIGRATION_2),
+    (3, _MIGRATION_3),
+    (4, _MIGRATION_4),
+)
 
 
 def open_database(path: str | Path) -> sqlite3.Connection:

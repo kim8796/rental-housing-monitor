@@ -297,6 +297,8 @@ class MonitorPlanner:
     ) -> PlannedMonitor:
         safe_request: ControlRequest | None = None
         create_intent: IntentResult | None = None
+        current: MonitorSpec | None = None
+        update: IntentResult | None = None
         with suppress(Exception):
             if (
                 type(request) is not ControlRequest
@@ -335,6 +337,8 @@ class MonitorPlanner:
         spec_value, items, trusted_probe = await self._build_candidate(
             safe_request,
             create_intent,
+            update_current=current,
+            update_intent=update,
         )
         snapshot = _capture_proposal_snapshot(spec_value, items, trusted_probe)
         rebuilt = (
@@ -365,6 +369,9 @@ class MonitorPlanner:
         self,
         safe_request: ControlRequest,
         safe_intent: IntentResult,
+        *,
+        update_current: MonitorSpec | None = None,
+        update_intent: IntentResult | None = None,
     ) -> tuple[MonitorSpec, tuple[ObservedItem, ...], ProbeResult]:
         target = await self._validate_target(safe_intent.target_url)
         result = await self._probe_once(safe_request.owner_id, target)
@@ -422,6 +429,15 @@ class MonitorPlanner:
                 feedback.append(category)
                 continue
             spec_value, items, trusted_probe = candidate
+            if update_current is not None:
+                spec_value = _restore_trusted_update_bindings(spec_value, update_current)
+                if (
+                    spec_value is None
+                    or update_intent is None
+                    or not update_scope_is_valid(update_current, spec_value, update_intent)
+                ):
+                    feedback.append(_FEEDBACK_BINDING)
+                    continue
             return spec_value, items, trusted_probe
         raise PlanningFailed
 
@@ -809,6 +825,50 @@ def reconstruct_confirmed_spec(
     if result is None:
         raise PlanningFailed
     return result
+
+
+def update_scope_is_valid(
+    current: MonitorSpec,
+    candidate: MonitorSpec,
+    intent: IntentResult,
+) -> bool:
+    """Allow update workers to change only the surfaces named by the user."""
+    try:
+        if (
+            type(current) is not MonitorSpec
+            or type(candidate) is not MonitorSpec
+            or type(intent) is not IntentResult
+            or intent.kind is not IntentKind.UPDATE
+        ):
+            return False
+        allowed: set[str] = set()
+        if intent.schedule_text is not None:
+            allowed.add("schedule")
+        if intent.condition_text is not None:
+            allowed.add("rules")
+        if not allowed:
+            return False
+        before = current.model_dump(mode="json")
+        after = candidate.model_dump(mode="json")
+        changed = {key for key in before if before[key] != after[key]}
+        return bool(changed) and changed <= allowed
+    except Exception:
+        return False
+
+
+def _restore_trusted_update_bindings(
+    candidate: MonitorSpec,
+    current: MonitorSpec,
+) -> MonitorSpec | None:
+    """Restore fields deliberately rewritten by the trusted probe/binding layer."""
+    try:
+        value = candidate.model_dump(mode="json")
+        value["target_url"] = current.target_url
+        value["auth_profile_ref"] = current.auth_profile_ref
+        value["fetch_strategy"] = current.fetch_strategy.value
+        return MonitorSpec.model_validate(value)
+    except Exception:
+        return None
 
 
 def _capture_dependency(value: object, method_name: str | None) -> _Dependency:
