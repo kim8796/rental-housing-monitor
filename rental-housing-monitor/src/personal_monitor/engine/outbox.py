@@ -8,6 +8,7 @@ from personal_monitor.storage import RegistryRepository, RuntimeRepository
 from personal_monitor.storage.runtime import OutboxRow
 
 _RETRY_DELAYS_SECONDS = (60, 300, 1800, 7200, 21600)
+_EXACT_DRAIN_CHUNK_SIZE = 50
 
 
 class OutboxWorker:
@@ -68,6 +69,29 @@ class OutboxWorker:
                 delivered_at=now,
             )
             delivered_count += 1
+        return delivered_count
+
+    async def drain_ids_once(
+        self,
+        *,
+        now: datetime,
+        monitor_id: str,
+        outbox_ids: Sequence[str],
+    ) -> int:
+        exact_ids = tuple(outbox_ids)
+        if len(set(exact_ids)) != len(exact_ids) or any(
+            type(value) is not str or not 1 <= len(value) <= 128 for value in exact_ids
+        ):
+            raise ValueError("outbox_ids are invalid")
+        delivered_count = 0
+        for start in range(0, len(exact_ids), _EXACT_DRAIN_CHUNK_SIZE):
+            chunk = exact_ids[start : start + _EXACT_DRAIN_CHUNK_SIZE]
+            delivered_count += await self.drain_once(
+                now=now,
+                limit=len(chunk),
+                monitor_id=monitor_id,
+                outbox_ids=chunk,
+            )
         return delivered_count
 
     async def _reschedule(self, row: OutboxRow, now: datetime) -> None:

@@ -9,6 +9,7 @@ import pytest
 from personal_monitor.service import (
     NullDeliverySender,
     PersonalMonitorService,
+    ServiceFailure,
     TelegramDeliverySender,
     next_maintenance_run,
 )
@@ -354,3 +355,157 @@ def test_transient_scheduler_failure_recovers_and_resets_failure_budget() -> Non
     asyncio.run(service.run())
 
     assert scheduler.calls == 2
+
+
+def test_invalid_telegram_batches_escalate_without_resetting_failure_budget() -> None:
+    class InvalidBatches(FakeTelegram):
+        def __init__(self) -> None:
+            super().__init__()
+            self.service: PersonalMonitorService | None = None
+
+        async def get_updates(self, **_kwargs):
+            self.offsets.append(0)
+            if len(self.offsets) == 6:
+                assert self.service is not None
+                self.service.request_stop()
+            return [TelegramUpdate(-1, None, None)]
+
+    telegram = InvalidBatches()
+    service = PersonalMonitorService(
+        telegram_api=telegram,
+        telegram_gateway=FakeGateway(),
+        scheduler=FakeScheduler(),
+        runner=FakeRunner(),
+        outbox=FakePeriodic(),
+        maintenance=FakePeriodic(),
+        heartbeat=FakePeriodicHeartbeat(),
+        clock=lambda: datetime(2026, 7, 23, tzinfo=UTC),
+        sleeper=immediate_sleep,
+    )
+    telegram.service = service
+
+    with pytest.raises(ServiceFailure):
+        asyncio.run(service._telegram_loop())
+
+    assert len(telegram.offsets) == 5
+
+
+def test_complete_valid_telegram_batch_resets_failure_budget() -> None:
+    class BatchSequence(FakeTelegram):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def get_updates(self, **_kwargs):
+            self.calls += 1
+            if self.calls in {5, 10}:
+                return [TelegramUpdate(0 if self.calls == 5 else 1, None, None)]
+            return [TelegramUpdate(-1, None, None)]
+
+    class StopAfterSecondValid(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.service: PersonalMonitorService | None = None
+
+        async def handle_update(self, update: TelegramUpdate, *, now=None) -> None:
+            await super().handle_update(update, now=now)
+            if update.update_id == 1:
+                assert self.service is not None
+                self.service.request_stop()
+
+    telegram = BatchSequence()
+    gateway = StopAfterSecondValid()
+    service = PersonalMonitorService(
+        telegram_api=telegram,
+        telegram_gateway=gateway,
+        scheduler=FakeScheduler(),
+        runner=FakeRunner(),
+        outbox=FakePeriodic(),
+        maintenance=FakePeriodic(),
+        heartbeat=FakePeriodicHeartbeat(),
+        clock=lambda: datetime(2026, 7, 23, tzinfo=UTC),
+        sleeper=immediate_sleep,
+    )
+    gateway.service = service
+
+    asyncio.run(service._telegram_loop())
+
+    assert telegram.calls == 10
+    assert gateway.ids == [0, 1]
+
+
+def test_maintenance_retries_with_bounded_backoff_and_resets_after_success() -> None:
+    delays: list[float] = []
+
+    class MaintenanceSequence:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.service: PersonalMonitorService | None = None
+
+        def run(self, **_kwargs) -> None:
+            self.calls += 1
+            if self.calls in {1, 2, 3, 4, 6, 7, 8, 9}:
+                raise RuntimeError("private")
+            if self.calls == 10:
+                assert self.service is not None
+                self.service.request_stop()
+
+    async def recording_sleep(delay: float) -> None:
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    maintenance = MaintenanceSequence()
+    service = PersonalMonitorService(
+        telegram_api=FakeTelegram(),
+        telegram_gateway=FakeGateway(),
+        scheduler=FakeScheduler(),
+        runner=FakeRunner(),
+        outbox=FakePeriodic(),
+        maintenance=maintenance,
+        heartbeat=FakePeriodicHeartbeat(),
+        clock=lambda: datetime(2026, 7, 22, 18, 29, tzinfo=UTC),
+        monotonic=lambda: 0.0,
+        sleeper=recording_sleep,
+    )
+    maintenance.service = service
+
+    asyncio.run(service._maintenance_loop())
+
+    assert maintenance.calls == 10
+    assert delays == [60.0, 1.0, 2.0, 4.0, 8.0, 60.0, 1.0, 2.0, 4.0, 8.0]
+
+
+def test_maintenance_escalates_on_fifth_consecutive_scheduled_failure() -> None:
+    delays: list[float] = []
+
+    class AlwaysFails:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, **_kwargs) -> None:
+            self.calls += 1
+            raise RuntimeError("private")
+
+    async def recording_sleep(delay: float) -> None:
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    maintenance = AlwaysFails()
+    service = PersonalMonitorService(
+        telegram_api=FakeTelegram(),
+        telegram_gateway=FakeGateway(),
+        scheduler=FakeScheduler(),
+        runner=FakeRunner(),
+        outbox=FakePeriodic(),
+        maintenance=maintenance,
+        heartbeat=FakePeriodicHeartbeat(),
+        clock=lambda: datetime(2026, 7, 22, 18, 29, tzinfo=UTC),
+        monotonic=lambda: 0.0,
+        sleeper=recording_sleep,
+    )
+
+    with pytest.raises(ServiceFailure):
+        asyncio.run(service._maintenance_loop())
+
+    assert maintenance.calls == 5
+    assert delays == [60.0, 1.0, 2.0, 4.0, 8.0]

@@ -635,6 +635,34 @@ def test_claim_due_outbox_exact_ids_excludes_older_same_monitor_rows(
     )
 
 
+def test_claim_due_outbox_accepts_more_than_one_hundred_exact_ids(
+    repositories: tuple[RegistryRepository, RuntimeRepository],
+    connection: sqlite3.Connection,
+) -> None:
+    registry, runtime = repositories
+    monitor_id = registry.create_monitor(make_spec(), created_by="telegram-user:1")
+    exact_ids = tuple(
+        seed_outbox(
+            connection,
+            dedupe_key=f"exact-{index}",
+            monitor_id=monitor_id,
+            target_id="target-1",
+            payload={"text": str(index)},
+            available_at=OUTBOX_AT,
+        )
+        for index in range(101)
+    )
+
+    rows = runtime.claim_due_outbox(
+        worker_id="operator",
+        now=OUTBOX_AT,
+        limit=101,
+        outbox_ids=exact_ids,
+    )
+
+    assert {row.id for row in rows} == set(exact_ids)
+
+
 def test_two_workers_cannot_claim_the_same_unexpired_outbox_lease(
     repositories: tuple[RegistryRepository, RuntimeRepository], connection: sqlite3.Connection
 ) -> None:

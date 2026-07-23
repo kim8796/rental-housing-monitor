@@ -21,6 +21,10 @@ from personal_monitor.storage.schema import (
     utc_timestamp,
 )
 
+_SQLITE_PORTABLE_MAX_VARIABLES = 999
+_OUTBOX_QUERY_FIXED_PARAMETERS = 4
+_MAX_OUTBOX_ID_QUERY = _SQLITE_PORTABLE_MAX_VARIABLES - _OUTBOX_QUERY_FIXED_PARAMETERS
+
 SAFE_DIAGNOSTIC_CODES = frozenset(
     {
         "authentication_failed",
@@ -386,7 +390,7 @@ class RuntimeRepository:
             if not exact_ids:
                 return []
             if (
-                len(exact_ids) > 100
+                len(exact_ids) > _MAX_OUTBOX_ID_QUERY
                 or len(set(exact_ids)) != len(exact_ids)
                 or any(type(value) is not str or not 1 <= len(value) <= 128 for value in exact_ids)
             ):

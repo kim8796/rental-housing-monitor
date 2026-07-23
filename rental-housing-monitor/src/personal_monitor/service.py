@@ -252,7 +252,6 @@ class PersonalMonitorService:
                     timeout=30,
                 )
                 self._telegram_last_poll = self._now()
-                failures = 0
                 for update in updates:
                     if self.stopping:
                         return
@@ -267,6 +266,7 @@ class PersonalMonitorService:
                         _safe_log("telegram_update_failed", error)
                     self._telegram_offset = update_id + 1
                     self._telegram_last_update = self._now()
+                failures = 0
                 # A real long poll suspends. This explicit checkpoint also prevents a
                 # misbehaving/test transport returning immediately from monopolizing the loop.
                 await self.sleeper(0)
@@ -321,15 +321,18 @@ class PersonalMonitorService:
             await self.sleeper(max(0.0, deadline - self.monotonic()))
             if self.stopping:
                 return
-            try:
-                result = self.maintenance.run(now=self._now())
-                if inspect.isawaitable(result):
-                    await result
-                failures = 0
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                failures = _component_failure("maintenance_iteration_failed", error, failures)
+            while not self.stopping:
+                try:
+                    result = self.maintenance.run(now=self._now())
+                    if inspect.isawaitable(result):
+                        await result
+                    failures = 0
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    failures = _component_failure("maintenance_iteration_failed", error, failures)
+                    await self.sleeper(min(30.0, float(2 ** (failures - 1))))
 
     async def _heartbeat_loop(self) -> None:
         deadline = self.monotonic()
@@ -845,7 +848,7 @@ async def run_monitor_once(
             now=datetime.now(UTC),
         )
         result = await runner.run(lease)
-        await outbox.drain_once(
+        await outbox.drain_ids_once(
             now=datetime.now(UTC),
             monitor_id=monitor_id,
             outbox_ids=result.outbox_ids,

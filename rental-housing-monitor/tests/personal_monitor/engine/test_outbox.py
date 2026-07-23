@@ -128,6 +128,93 @@ def test_success_resolves_target_address_then_marks_delivery(
     assert health.events == []
 
 
+def test_exact_drain_delivers_every_produced_id_across_bounded_chunks(
+    connection: sqlite3.Connection,
+) -> None:
+    sender = RecordingSender("external-message")
+    worker, preexisting_id, _, _, _ = configured_worker(connection, sender)
+    monitor_id = connection.execute("SELECT id FROM monitors").fetchone()[0]
+    produced_ids = tuple(
+        seed_outbox(
+            connection,
+            dedupe_key=f"produced-{index}",
+            monitor_id=monitor_id,
+            target_id="opaque-target-id",
+            payload={"text": f"produced-{index}"},
+            available_at=NOW,
+        )
+        for index in range(52)
+    )
+
+    delivered = asyncio.run(
+        worker.drain_ids_once(
+            now=NOW,
+            monitor_id=monitor_id,
+            outbox_ids=produced_ids,
+        )
+    )
+
+    assert delivered == 52
+    assert len(sender.calls) == 52
+    assert {payload["text"] for _, payload in sender.calls} == {
+        f"produced-{index}" for index in range(52)
+    }
+    assert (
+        connection.execute("SELECT COUNT(*) FROM outbox WHERE status = 'pending'").fetchone()[0]
+        == 1
+    )
+    assert (
+        connection.execute(
+            "SELECT status FROM outbox WHERE id = ?",
+            (preexisting_id,),
+        ).fetchone()[0]
+        == "pending"
+    )
+
+
+def test_exact_drain_attempts_each_failed_produced_id_only_once(
+    connection: sqlite3.Connection,
+) -> None:
+    sender = RecordingSender(RuntimeError("offline"))
+    worker, preexisting_id, _, _, _ = configured_worker(connection, sender)
+    monitor_id = connection.execute("SELECT id FROM monitors").fetchone()[0]
+    produced_ids = tuple(
+        seed_outbox(
+            connection,
+            dedupe_key=f"failed-{index}",
+            monitor_id=monitor_id,
+            target_id="opaque-target-id",
+            payload={"text": f"failed-{index}"},
+            available_at=NOW,
+        )
+        for index in range(52)
+    )
+
+    delivered = asyncio.run(
+        worker.drain_ids_once(
+            now=NOW,
+            monitor_id=monitor_id,
+            outbox_ids=produced_ids,
+        )
+    )
+
+    assert delivered == 0
+    assert len(sender.calls) == 52
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM outbox WHERE dedupe_key LIKE 'failed-%' AND attempt_count = 1"
+        ).fetchone()[0]
+        == 52
+    )
+    assert (
+        connection.execute(
+            "SELECT attempt_count FROM outbox WHERE id = ?",
+            (preexisting_id,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
 @pytest.mark.parametrize(
     ("existing_attempts", "delay_seconds"),
     [(0, 60), (1, 300), (2, 1800), (3, 7200), (4, 21600), (5, 21600)],
