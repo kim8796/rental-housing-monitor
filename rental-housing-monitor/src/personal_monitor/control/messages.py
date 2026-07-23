@@ -88,6 +88,7 @@ def safe_approval_value(
         rendered = json.dumps(value, ensure_ascii=False, allow_nan=False)
     else:
         raise ValueError("invalid approval value")
+    rendered = _escape_approval_unicode_categories(rendered)
     rendered = rendered.replace("<", r"\u003c").replace(">", r"\u003e")
     try:
         if (
@@ -100,6 +101,20 @@ def safe_approval_value(
     except (UnicodeError, ValueError):
         raise ValueError("invalid approval value") from None
     return rendered
+
+
+def _escape_approval_unicode_categories(value: str) -> str:
+    parts: list[str] = []
+    for character in value:
+        if not unicodedata.category(character).startswith("C"):
+            parts.append(character)
+            continue
+        codepoint = ord(character)
+        if codepoint <= 0xFFFF:
+            parts.append(f"\\u{codepoint:04X}")
+        else:
+            parts.append(f"\\U{codepoint:08X}")
+    return "".join(parts)
 
 
 def _normalize_plain(value: str, *, limit: int) -> str:

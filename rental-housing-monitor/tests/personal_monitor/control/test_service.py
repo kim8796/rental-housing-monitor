@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import FrozenInstanceError
@@ -15,7 +16,7 @@ import pytest
 
 from personal_monitor.ai.contracts import IntentKind, IntentResult
 from personal_monitor.control.actions import ConsumedAction, PendingAction, PendingActionService
-from personal_monitor.control.messages import ControlReply, safe_plain
+from personal_monitor.control.messages import ControlReply, safe_approval_value, safe_plain
 from personal_monitor.control.planner import (
     PlannedMonitor,
     PreviewItem,
@@ -1367,6 +1368,63 @@ def test_approval_preview_json_escapes_without_losing_keyword_semantics(
     assert (versions, actions) == (2, 1)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected", "category"),
+    (
+        ("DEL-\x7f-끝", '"DEL-\\u007F-끝"', "Cc"),
+        ("C1-\x85-끝", '"C1-\\u0085-끝"', "Cc"),
+        ("BIDI-\u202e-끝", '"BIDI-\\u202E-끝"', "Cf"),
+        ("ZWJ-\u200d-끝", '"ZWJ-\\u200D-끝"', "Cf"),
+        ("SURROGATE-\ud800-끝", '"SURROGATE-\\uD800-끝"', "Cs"),
+        ("PRIVATE-\ue000-끝", '"PRIVATE-\\uE000-끝"', "Co"),
+        ("UNASSIGNED-\u0378-끝", '"UNASSIGNED-\\u0378-끝"', "Cn"),
+        ("TAG-\U000e0020-끝", '"TAG-\\U000E0020-끝"', "Cf"),
+    ),
+)
+def test_approval_value_visibly_and_losslessly_escapes_every_unicode_c_category(
+    value: str,
+    expected: str,
+    category: str,
+) -> None:
+    unsafe_character = value.split("-")[1]
+    assert unicodedata.category(unsafe_character) == category
+
+    rendered = safe_approval_value(value)
+
+    assert rendered == expected
+    assert unsafe_character not in rendered
+    assert not any(unicodedata.category(character).startswith("C") for character in rendered)
+
+
+def test_approval_preview_preserves_korean_emoji_and_visibly_represents_zwj() -> None:
+    keyword = "개발자 👩\u200d💻 채용"
+
+    reply, versions, actions = _text_rule_update_reply(
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": [keyword],
+        }
+    )
+
+    assert '키워드="개발자 👩\\u200D💻 채용"' in reply.text
+    assert "\u200d" not in reply.text
+    assert (versions, actions) == (2, 1)
+
+
+def test_distinct_unicode_c_values_produce_distinct_lossless_approval_values() -> None:
+    values = ("\x7f", "\x85", "\u202e", "\u200d", "\ud800", "\ue000", "\u0378", "\U000e0020")
+
+    rendered = tuple(safe_approval_value(f"값-{value}-끝") for value in values)
+
+    assert len(set(rendered)) == len(values)
+
+
+def test_unicode_c_escape_expansion_obeys_the_exact_rendered_limit() -> None:
+    with pytest.raises(ValueError, match="invalid approval value"):
+        safe_approval_value("\ue000" * 600, limit=3_500)
+
+
 def test_distinct_whitespace_keywords_produce_distinct_complete_previews() -> None:
     compact = "서울 경기"
     repeated = "서울  경기"
@@ -1409,6 +1467,21 @@ def test_approval_preview_preserves_long_status_string_with_visible_escapes() ->
 
 def test_approval_escape_expansion_overflow_rolls_back_without_writes() -> None:
     keywords = [f"키워드-{index}" + "\t " * 80 + "끝" for index in range(50)]
+
+    reply, versions, actions = _text_rule_update_reply(
+        {
+            "kind": "keyword_match",
+            "field": "title",
+            "keywords": keywords,
+        }
+    )
+
+    assert "처리하지 못했습니다" in reply.text
+    assert (versions, actions) == (1, 0)
+
+
+def test_unicode_c_escape_expansion_overflow_rolls_back_without_writes() -> None:
+    keywords = [f"키워드-{index}-" + "\ue000" * 80 + "-끝" for index in range(50)]
 
     reply, versions, actions = _text_rule_update_reply(
         {
