@@ -36,10 +36,12 @@ from personal_monitor.storage import (
     RuntimeRepository,
     open_database,
 )
+from rental_monitor.telegram import TelegramClient
 
 NOW = datetime(2026, 7, 23, 3, 0, tzinfo=UTC)
 _LOOPBACK = "127.0.0.1"
 _MAX_FIXTURE_BODY = 1024 * 1024
+_PROXY_CAPABILITY_HEADER = "X-Integration-Proxy-Capability"
 
 
 @dataclass(frozen=True)
@@ -53,15 +55,26 @@ class _FixedClock:
 @dataclass
 class _FixtureState:
     requests: list[str] = field(default_factory=list)
+    forwarded_paths: list[str] = field(default_factory=list)
     rejected_proxy_targets: list[str] = field(default_factory=list)
     forwarded_proxy_origins: list[tuple[str, str, int]] = field(default_factory=list)
+    proxy_capability: str = field(
+        default_factory=lambda: secrets.token_urlsafe(32),
+        repr=False,
+    )
+    direct_origin_rejections: int = 0
+    trap_port: int = 0
+    trap_hits: int = 0
     active_requests: int = 0
     active_browser_requests: int = 0
     max_active_browser_requests: int = 0
     first_browser_entered: threading.Event = field(default_factory=threading.Event)
     release_first_browser: threading.Event = field(default_factory=threading.Event)
-    session_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
-    session_tokens: list[str] = field(default_factory=list)
+    session_token: str = field(
+        default_factory=lambda: secrets.token_urlsafe(32),
+        repr=False,
+    )
+    session_tokens: list[str] = field(default_factory=list, repr=False)
     authenticated_requests: int = 0
     unauthenticated_requests: int = 0
     forwarded_protected_cookie_requests: int = 0
@@ -80,11 +93,17 @@ class _OriginHandler(BaseHTTPRequestHandler):
     state: _FixtureState
 
     def do_GET(self) -> None:
+        capability = self.headers.get(_PROXY_CAPABILITY_HEADER, "")
+        if not hmac.compare_digest(capability, self.state.proxy_capability):
+            with self.state.lock:
+                self.state.direct_origin_rejections += 1
+            self._send(403, b"fixture proxy capability required", "text/plain")
+            return
         with self.state.lock:
             self.state.active_requests += 1
         try:
             path = urlsplit(self.path).path
-            self.state.record(path)
+            self.state.record(_request_path(self.path))
             if path == "/robots.txt":
                 self._send(200, b"User-agent: *\nAllow: /\n", "text/plain")
             elif path == "/static":
@@ -100,15 +119,7 @@ class _OriginHandler(BaseHTTPRequestHandler):
             elif path == "/dynamic":
                 self._send(
                     200,
-                    (
-                        b"<!doctype html><main class='listing'>"
-                        b"<h1>Browser keyboard</h1><span id='price-slot'></span></main>"
-                        b"<script>window.addEventListener('load',()=>setTimeout(()=>{"
-                        b"const price=document.createElement('span');"
-                        b"price.className='price';price.textContent='87,000';"
-                        b"document.querySelector('#price-slot').replaceWith(price);"
-                        b"},50));</script>"
-                    ),
+                    _dynamic_body(self.state.trap_port),
                     "text/html",
                 )
             elif path in {"/concurrent-a", "/concurrent-b"}:
@@ -208,6 +219,45 @@ class _OriginHandler(BaseHTTPRequestHandler):
         return None
 
 
+class _TrapHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    state: _FixtureState
+
+    def do_GET(self) -> None:
+        with self.state.lock:
+            self.state.trap_hits += 1
+        body = b"trap origin must not be reached"
+        self.send_response(418)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return None
+
+
+def _request_path(value: str) -> str:
+    target = urlsplit(value)
+    return urlunsplit(("", "", target.path or "/", target.query, ""))
+
+
+def _dynamic_body(trap_port: int) -> bytes:
+    if trap_port <= 0:
+        raise AssertionError("dynamic fixture trap is unavailable")
+    return (
+        "<!doctype html><main class='listing'>"
+        "<h1>Browser keyboard</h1><span id='price-slot'></span></main>"
+        "<script>window.addEventListener('load',()=>{"
+        f"fetch('http://{_LOOPBACK}:{trap_port}/__proxy_trap__').catch(()=>{{}});"
+        "setTimeout(()=>{const price=document.createElement('span');"
+        "price.className='price';price.textContent='87,000';"
+        "document.querySelector('#price-slot').replaceWith(price);},50);"
+        "});</script>"
+    ).encode()
+
+
 def _session_cookie(value: str) -> str:
     return f"pm_local_session={value}; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax"
 
@@ -240,6 +290,13 @@ def _bootstrap_noop(_page: object) -> None:
     return None
 
 
+def _forbid_telegram_send(*_args: object, **_kwargs: object) -> int:
+    raise AssertionError("integration monitor runner attempted Telegram delivery")
+
+
+_forbid_telegram_send._integration_fail_fast = True  # type: ignore[attr-defined]
+
+
 class _ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     origin_port: int
@@ -262,7 +319,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             or target.username is not None
             or target.password is not None
         ):
-            self._reject(f"{target.hostname or 'invalid'}{target.path}")
+            safe_port = f":{port}" if port is not None else ""
+            self._reject(f"{target.hostname or 'invalid'}{safe_port}{target.path}")
             return
 
         path = urlunsplit(("", "", target.path or "/", target.query, ""))
@@ -270,7 +328,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             self.state.forwarded_proxy_origins.append(
                 (target.scheme, target.hostname, self.origin_port)
             )
+            self.state.forwarded_paths.append(path)
         headers = {"Host": f"{_LOOPBACK}:{self.origin_port}", "Connection": "close"}
+        headers[_PROXY_CAPABILITY_HEADER] = self.state.proxy_capability
         cookie = self.headers.get("Cookie")
         if cookie is not None:
             headers["Cookie"] = cookie
@@ -402,7 +462,7 @@ class _StaticScenario:
     state: _FixtureState
     origin_server: _LocalServer
     proxy_server: _LocalServer
-    telegram_calls: list[object]
+    trap_server: _LocalServer | None = None
     strategy_trace: list[str] = field(default_factory=list)
 
     async def run(self) -> RunResult:
@@ -425,10 +485,47 @@ class _StaticScenario:
     def outbox_count(self) -> int:
         return int(self.connection.execute("SELECT count(*) FROM outbox").fetchone()[0])
 
+    @property
+    def pending_outbox_count(self) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT count(*) FROM outbox WHERE status = 'pending'"
+            ).fetchone()[0]
+        )
+
+    @property
+    def delivery_count(self) -> int:
+        return int(self.connection.execute("SELECT count(*) FROM deliveries").fetchone()[0])
+
     def route_count(self, path: str) -> int:
         return self.origin_requests.count(path)
 
+    def assert_proxy_ledger_consistent(self) -> None:
+        with self.state.lock:
+            forwarded_paths = tuple(self.state.forwarded_paths)
+            accepted_paths = tuple(self.state.requests)
+        assert forwarded_paths == accepted_paths
+
+    def assert_browser_proxy_trap(self) -> None:
+        with self.state.lock:
+            rejected_targets = tuple(self.state.rejected_proxy_targets)
+            trap_targets = tuple(
+                target for target in rejected_targets if "/__proxy_trap__" in target
+            )
+            trap_hits = self.state.trap_hits
+        assert len(trap_targets) == 1
+        assert trap_hits == 0
+        assert all(
+            any(target.startswith(host) for target in rejected_targets)
+            for host in (
+                "clients2.google.com",
+                "accounts.google.com",
+                "www.google.com",
+            )
+        )
+
     def assert_local_only_and_clean(self) -> None:
+        self.assert_proxy_ledger_consistent()
         with self.state.lock:
             session_tokens = tuple(self.state.session_tokens)
             assert self.state.forwarded_proxy_origins
@@ -442,8 +539,11 @@ class _StaticScenario:
             assert self.state.active_requests == 0
         self.proxy_server.close()
         self.origin_server.close()
+        if self.trap_server is not None:
+            self.trap_server.close()
         assert not self.proxy_server.is_alive
         assert not self.origin_server.is_alive
+        assert self.trap_server is None or not self.trap_server.is_alive
 
 
 @dataclass
@@ -660,7 +760,6 @@ class _IntegrationHarness:
             state=state,
             origin_server=origin_server,
             proxy_server=proxy_server,
-            telegram_calls=[],
         )
         self._scenarios.append(scenario)
         return scenario
@@ -668,6 +767,9 @@ class _IntegrationHarness:
     def dynamic_monitor(self) -> _StaticScenario:
         _require_browser_assets()
         state = _FixtureState()
+        trap_handler = type("TrapHandler", (_TrapHandler,), {"state": state})
+        trap_server = _LocalServer(trap_handler)
+        state.trap_port = trap_server.port
         origin_handler = type("DynamicOriginHandler", (_OriginHandler,), {"state": state})
         origin_server = _LocalServer(origin_handler)
         proxy_handler = type(
@@ -737,7 +839,7 @@ class _IntegrationHarness:
             state=state,
             origin_server=origin_server,
             proxy_server=proxy_server,
-            telegram_calls=[],
+            trap_server=trap_server,
             strategy_trace=extractor.trace,
         )
         self._scenarios.append(scenario)
@@ -819,7 +921,6 @@ class _IntegrationHarness:
             state=state,
             origin_server=origin_server,
             proxy_server=proxy_server,
-            telegram_calls=[],
             monitor_ids=(monitor_ids[0], monitor_ids[1]),
             leases=(leases[0], leases[1]),
         )
@@ -932,7 +1033,6 @@ class _IntegrationHarness:
             state=state,
             origin_server=origin_server,
             proxy_server=proxy_server,
-            telegram_calls=[],
             unauthenticated_lease=leases_by_id[unauthenticated_id],
             profiled_monitor_id=profiled_id,
             profiled_lease=leases_by_id[profiled_id],
@@ -975,6 +1075,8 @@ class _IntegrationHarness:
         for scenario in reversed(self._scenarios):
             scenario.proxy_server.close()
             scenario.origin_server.close()
+            if scenario.trap_server is not None:
+                scenario.trap_server.close()
             scenario.connection.close()
             close_extra = getattr(scenario, "close_extra", None)
             if callable(close_extra):
@@ -1007,3 +1109,8 @@ def integration_harness(
         yield harness
     finally:
         harness.close()
+
+
+@pytest.fixture(autouse=True)
+def fail_fast_telegram_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(TelegramClient, "send", _forbid_telegram_send)
