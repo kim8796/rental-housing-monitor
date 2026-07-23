@@ -1,0 +1,144 @@
+x-application-image: &application-image
+  image: personal-monitor:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+services:
+  monitor:
+    <<: *application-image
+    user: "10001:10001"
+    command: [personal-monitor, serve]
+    restart: unless-stopped
+    depends_on:
+      codex-worker:
+        condition: service_started
+      egress-proxy:
+        condition: service_started
+    environment:
+      - PERSONAL_MONITOR_DATABASE_PATH=/srv/personal-monitor/db/monitor.db
+      - PERSONAL_MONITOR_ADAPTIVE_ROOT=/srv/personal-monitor/adaptive
+      - PERSONAL_MONITOR_DIAGNOSTICS_ROOT=/srv/personal-monitor/diagnostics
+      - PERSONAL_MONITOR_LOG_ROOT=/srv/personal-monitor/logs
+      - PERSONAL_MONITOR_LOG_PATH=/srv/personal-monitor/logs/monitor.jsonl
+      - PERSONAL_MONITOR_BACKUP_STATUS_PATH=/srv/personal-monitor/logs/backup-status.json
+      - PERSONAL_MONITOR_MASTER_KEY_PATH=/etc/personal-monitor/master.key
+      - PERSONAL_MONITOR_PROFILES_ROOT=/run/personal-monitor-profiles
+      - PERSONAL_MONITOR_CODEX_SOCKET=/run/personal-monitor-ai/worker.sock
+      - PERSONAL_MONITOR_EGRESS_PROXY=http://egress-proxy:3128
+      - PERSONAL_MONITOR_TIMEZONE=Asia/Seoul
+      - PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY=${PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY}
+      - PERSONAL_MONITOR_TELEGRAM_BOT_TOKEN=${PERSONAL_MONITOR_TELEGRAM_BOT_TOKEN}
+      - PERSONAL_MONITOR_TELEGRAM_USER_ID=${PERSONAL_MONITOR_TELEGRAM_USER_ID}
+      - PERSONAL_MONITOR_TELEGRAM_COMMAND_CHAT_ID=${PERSONAL_MONITOR_TELEGRAM_COMMAND_CHAT_ID}
+      - PERSONAL_MONITOR_TELEGRAM_DELIVERY_CHAT_ID=${PERSONAL_MONITOR_TELEGRAM_DELIVERY_CHAT_ID}
+    volumes:
+      - /srv/personal-monitor/db:/srv/personal-monitor/db
+      - /srv/personal-monitor/adaptive:/srv/personal-monitor/adaptive
+      - /srv/personal-monitor/vault:/run/personal-monitor-profiles/vault
+      - /srv/personal-monitor/diagnostics:/srv/personal-monitor/diagnostics
+      - /srv/personal-monitor/logs:/srv/personal-monitor/logs
+      - /etc/personal-monitor/master.key:/etc/personal-monitor/master.key:ro
+      - ai-socket:/run/personal-monitor-ai
+    tmpfs:
+      - /run/personal-monitor-profiles:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10001
+      - /tmp:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10001
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - monitor-egress
+
+  codex-worker:
+    <<: *application-image
+    user: "10001:10001"
+    command: [personal-monitor, ai-worker, --socket, /run/personal-monitor-ai/worker.sock]
+    restart: unless-stopped
+    environment:
+      - PERSONAL_MONITOR_CODEX_BINARY=codex
+      - PERSONAL_MONITOR_CODEX_HOME=/srv/personal-monitor/codex-home
+      - PERSONAL_MONITOR_CODEX_TASK_ROOT=/work
+      - PERSONAL_MONITOR_NODE_BINARY=${PERSONAL_MONITOR_NODE_BINARY:-node}
+    volumes:
+      - codex-home:/srv/personal-monitor/codex-home
+      - ai-socket:/run/personal-monitor-ai
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10001
+      - /work:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10001
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - worker-egress
+
+  egress-proxy:
+    build:
+      context: .
+      dockerfile: deploy/squid.Dockerfile
+    image: personal-monitor-egress-proxy:local
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /run/squid:rw,noexec,nosuid,nodev,mode=0700,uid=13,gid=13
+      - /var/log/squid:rw,noexec,nosuid,nodev,mode=0700,uid=13,gid=13
+      - /var/spool/squid:rw,noexec,nosuid,nodev,mode=0700,uid=13,gid=13
+      - /tmp:rw,noexec,nosuid,nodev,mode=0700,uid=13,gid=13
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - monitor-egress
+
+  profile-bootstrap:
+    <<: *application-image
+    profiles: ["admin"]
+    user: "10001:10001"
+    entrypoint: [/usr/local/bin/personal-monitor-entrypoint, profile-bootstrap]
+    command:
+      - --id
+      - ${PERSONAL_MONITOR_PROFILE_ID:-profile-bootstrap-placeholder}
+      - --url
+      - ${PERSONAL_MONITOR_PROFILE_URL:-https://example.invalid/profile-bootstrap}
+    restart: "no"
+    environment:
+      - PERSONAL_MONITOR_PROFILE_VAULT_ROOT=/srv/personal-monitor/profile-bootstrap
+      - PERSONAL_MONITOR_PROFILE_TMPFS_ROOT=/run/personal-monitor-profiles
+      - PERSONAL_MONITOR_MASTER_KEY_PATH=/srv/personal-monitor/profile-bootstrap/master.key
+      - PERSONAL_MONITOR_EGRESS_PROXY=http://egress-proxy:3128
+      - PERSONAL_MONITOR_EGRESS_PROXY_URL=http://egress-proxy:3128
+    volumes:
+      - /srv/personal-monitor/vault:/srv/personal-monitor/profile-bootstrap/vault
+      - /etc/personal-monitor/master.key:/srv/personal-monitor/profile-bootstrap/master.key:ro
+    tmpfs:
+      - /run/personal-monitor-profiles:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10001
+      - /tmp:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10001
+    ports:
+      - 127.0.0.1:6080:6080
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - monitor-egress
+
+volumes:
+  ai-socket:
+  codex-home:
+
+networks:
+  monitor-egress:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+  worker-egress:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.78.0.0/24
