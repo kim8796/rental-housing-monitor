@@ -400,6 +400,40 @@ def test_broad_jwt_is_hidden_from_every_rendered_preview_value(
 
 
 @pytest.mark.parametrize(
+    "secret",
+    (
+        'authorization: "supersecretvalue"',
+        "password='supersecretvalue'",
+        '"authorization": "supersecretvalue"',
+        "'api_key': 'supersecretvalue'",
+    ),
+)
+def test_quoted_assignment_hides_entire_preview_values(
+    connection: sqlite3.Connection,
+    secret: str,
+) -> None:
+    body = f"<main><h1>{secret}</h1><span class='price'>99,000원</span></main>".encode()
+    candidate = MonitorSpec.model_validate(
+        {
+            **spec().model_dump(mode="json"),
+            "name": secret,
+        }
+    )
+    value = _custom_proposal(
+        connection,
+        candidate,
+        document(body=body),
+        sanitizer=lambda _html, *, secret_values: "<main>safe projection</main>",
+    )
+
+    preview = render_preview(value)
+
+    assert "모니터: [숨김]" in preview.text
+    assert "현재 이름: [숨김]" in preview.text
+    assert "supersecretvalue" not in preview.text
+
+
+@pytest.mark.parametrize(
     ("schedule", "expected"),
     [
         ("*/15 * * * *", "15분마다"),

@@ -467,6 +467,7 @@ class CodexCli:
             or self._launcher is not self._launcher_anchor
         ):
             raise CodexProtocolError
+        _scan_secrets(request.model_dump(mode="python"))
         await self._auth_guard_anchor.check()
         expected_type = result_type_for(request)
         expected_schema = expected_type.model_json_schema()

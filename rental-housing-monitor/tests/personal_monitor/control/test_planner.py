@@ -817,6 +817,37 @@ def test_broad_jwt_is_redacted_from_worker_sanitized_document(
     assert jwt not in worker.calls[0][0].sanitized_document
 
 
+@pytest.mark.parametrize(
+    "secret",
+    (
+        'authorization: "supersecretvalue"',
+        "password='supersecretvalue'",
+        '"authorization": "supersecretvalue"',
+        "'api_key': 'supersecretvalue'",
+    ),
+)
+def test_quoted_assignment_is_fully_hidden_from_worker_message_and_document(
+    connection: sqlite3.Connection,
+    secret: str,
+) -> None:
+    worker = FakeWorker([plan()])
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        worker,
+        PendingActionService(connection),
+        sanitizer=lambda _html, *, secret_values: secret,
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+    )
+
+    run(value.propose(request(f"prefix {secret} suffix"), intent()))
+
+    sent = worker.calls[0][0]
+    assert sent.message == "[숨김]"
+    assert sent.sanitized_document == "[숨김]"
+
+
 def test_sanitizer_that_retains_established_query_secret_fails_before_worker(
     connection: sqlite3.Connection,
 ) -> None:
@@ -842,6 +873,132 @@ def test_sanitizer_that_retains_established_query_secret_fails_before_worker(
 
     assert worker.calls == []
     assert pending_count(connection) == 0
+
+
+def test_extractor_valid_strategy_mutation_cannot_change_trusted_probe_baseline(
+    connection: sqlite3.Connection,
+) -> None:
+    class MutatingExtractor:
+        def extract(self, source: SourceDocument, extract_spec: object):
+            values = DeclarativeExtractor().extract(source, extract_spec)  # type: ignore[arg-type]
+            object.__setattr__(source, "strategy", FetchStrategy.DYNAMIC)
+            return values
+
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        FakeWorker([plan()]),
+        PendingActionService(connection),
+        extractor=MutatingExtractor(),
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+    )
+
+    proposal = run(value.propose(request(), intent()))
+
+    assert proposal.resolved_strategy is FetchStrategy.HTTP
+    assert proposal.spec.fetch_strategy is FetchStrategy.HTTP
+    consumed = PendingActionService(connection).consume(
+        proposal.pending_action.token,
+        OWNER,
+        now=NOW,
+    )
+    assert consumed.payload["spec"]["fetch_strategy"] == "http"  # type: ignore[index]
+
+
+def test_extractor_valid_selector_mutation_cannot_change_verified_spec_baseline(
+    connection: sqlite3.Connection,
+) -> None:
+    class MutatingExtractor:
+        def extract(self, source: SourceDocument, extract_spec: object):
+            values = DeclarativeExtractor().extract(source, extract_spec)  # type: ignore[arg-type]
+            object.__setattr__(
+                extract_spec.fields["price"],  # type: ignore[attr-defined]
+                "selector",
+                ".future-missing",
+            )
+            return values
+
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        FakeWorker([plan()]),
+        PendingActionService(connection),
+        extractor=MutatingExtractor(),
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+    )
+
+    proposal = run(value.propose(request(), intent()))
+
+    assert proposal.spec.extract.fields["price"].selector == ".price"
+    consumed = PendingActionService(connection).consume(
+        proposal.pending_action.token,
+        OWNER,
+        now=NOW,
+    )
+    assert consumed.payload["spec"]["extract"]["fields"]["price"]["selector"] == ".price"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("mutation", ("strategy", "extract", "rules"))
+def test_validator_valid_mutation_cannot_change_any_trusted_baseline(
+    connection: sqlite3.Connection,
+    mutation: str,
+) -> None:
+    class MutatingValidator:
+        def validate(self, items: object, extract_spec: object, validators: object):
+            values = ObservationValidator().validate(  # type: ignore[arg-type]
+                items,
+                extract_spec,
+                validators,
+            )
+            if mutation == "strategy":
+                mutate_planner_local(
+                    "probe",
+                    lambda value: object.__setattr__(
+                        value.document,
+                        "strategy",
+                        FetchStrategy.DYNAMIC,
+                    ),
+                )
+            elif mutation == "extract":
+                object.__setattr__(
+                    extract_spec.fields["price"],  # type: ignore[attr-defined]
+                    "selector",
+                    ".future-missing",
+                )
+            else:
+                mutate_planner_local(
+                    "spec",
+                    lambda value: object.__setattr__(value.rules[0], "value", 1),
+                )
+            return values
+
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        FakeWorker([plan()]),
+        PendingActionService(connection),
+        validator=MutatingValidator(),
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+    )
+
+    proposal = run(value.propose(request(), intent()))
+
+    assert proposal.resolved_strategy is FetchStrategy.HTTP
+    assert proposal.spec.fetch_strategy is FetchStrategy.HTTP
+    assert proposal.spec.extract.fields["price"].selector == ".price"
+    assert proposal.spec.rules[0].value == 100000
+    consumed = PendingActionService(connection).consume(
+        proposal.pending_action.token,
+        OWNER,
+        now=NOW,
+    )
+    stored = consumed.payload["spec"]
+    assert stored["fetch_strategy"] == "http"  # type: ignore[index]
+    assert stored["extract"]["fields"]["price"]["selector"] == ".price"  # type: ignore[index]
+    assert stored["rules"][0]["value"] == 100000  # type: ignore[index]
 
 
 def test_id_callback_mutating_source_strategy_never_leaves_orphan_action(
@@ -943,8 +1100,8 @@ def test_post_insert_proposal_validation_failure_is_atomically_rolled_back(
     assert pending_count(connection) == 0
 
 
-@pytest.mark.parametrize("dependency", ["extractor", "validator", "observation"])
-def test_hostile_dependency_post_validation_mutation_never_writes_pending_action(
+@pytest.mark.parametrize("dependency", ["extractor", "validator"])
+def test_hostile_dependency_input_mutation_is_disposable(
     connection: sqlite3.Connection,
     dependency: str,
 ) -> None:
@@ -964,6 +1121,32 @@ def test_hostile_dependency_post_validation_mutation_never_writes_pending_action
             object.__setattr__(extract_spec, "item_scope", "bad;selector")
             return values
 
+    kwargs: dict[str, object] = {}
+    if dependency == "extractor":
+        kwargs["extractor"] = MutatingExtractor()
+    else:
+        kwargs["validator"] = MutatingValidator()
+    worker = FakeWorker([plan()])
+    value = MonitorPlanner(
+        FakePolicy(),
+        FakeProbe(),
+        worker,
+        PendingActionService(connection),
+        id_source=IdSource(),
+        now_source=lambda: NOW,
+        **kwargs,
+    )
+
+    proposal = run(value.propose(request("private-message"), intent()))
+
+    assert proposal.spec.extract.item_scope == "main"
+    assert len(worker.calls) == 1
+    assert pending_count(connection) == 1
+
+
+def test_hostile_validator_return_mutation_never_writes_pending_action(
+    connection: sqlite3.Connection,
+) -> None:
     class MutatingObservationValidator:
         def validate(self, items: object, extract_spec: object, validators: object):
             values = ObservationValidator().validate(  # type: ignore[arg-type]
@@ -978,22 +1161,15 @@ def test_hostile_dependency_post_validation_mutation_never_writes_pending_action
             )
             return values
 
-    kwargs: dict[str, object] = {}
-    if dependency == "extractor":
-        kwargs["extractor"] = MutatingExtractor()
-    elif dependency == "validator":
-        kwargs["validator"] = MutatingValidator()
-    else:
-        kwargs["validator"] = MutatingObservationValidator()
     worker = FakeWorker([plan(), plan(), plan()])
     value = MonitorPlanner(
         FakePolicy(),
         FakeProbe(),
         worker,
         PendingActionService(connection),
+        validator=MutatingObservationValidator(),
         id_source=IdSource(),
         now_source=lambda: NOW,
-        **kwargs,
     )
 
     with pytest.raises(PlanningFailed) as caught:

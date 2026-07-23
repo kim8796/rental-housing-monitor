@@ -42,6 +42,14 @@ def request() -> IntentRequest:
     )
 
 
+QUOTED_ASSIGNMENTS = (
+    'authorization: "supersecretvalue"',
+    "password='supersecretvalue'",
+    '"authorization": "supersecretvalue"',
+    "'api_key': 'supersecretvalue'",
+)
+
+
 def cli_paths(tmp_path: Path) -> tuple[Path, Path]:
     home = tmp_path / "codex-home"
     home.mkdir(mode=0o700)
@@ -339,6 +347,39 @@ async def test_result_secret_scanner_is_recursive(tmp_path: Path, secret: str) -
     with pytest.raises(CodexProtocolError) as caught:
         await cli.run(request(), IntentResult.model_json_schema(), "gpt-5.6-terra", "medium")
     assert secret not in str(caught.value)
+
+
+@async_test
+@pytest.mark.parametrize("secret", QUOTED_ASSIGNMENTS)
+async def test_request_secret_is_rejected_before_codex_process_spawn(
+    tmp_path: Path,
+    secret: str,
+) -> None:
+    home, root = cli_paths(tmp_path)
+    spawn_calls = 0
+
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        nonlocal spawn_calls
+        spawn_calls += 1
+        return FakeProcess(valid_events())
+
+    unsafe = IntentRequest(
+        request_id="req-1",
+        owner_id="telegram-user:7",
+        message=secret,
+        monitor_summaries=[],
+    )
+    cli = make_cli(home, root, process_factory=spawn)
+
+    with pytest.raises(CodexProtocolError):
+        await cli.run(
+            unsafe,
+            IntentResult.model_json_schema(),
+            "gpt-5.6-terra",
+            "medium",
+        )
+
+    assert spawn_calls == 0
 
 
 def test_contracts_forbid_extra_and_redact_user_content() -> None:

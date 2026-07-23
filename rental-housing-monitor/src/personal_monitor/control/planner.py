@@ -161,6 +161,17 @@ class _ProposalSnapshot(NamedTuple):
         return "<_ProposalSnapshot redacted>"
 
 
+class _CandidateBaseline(NamedTuple):
+    owner_id: str
+    target_url: str
+    spec_json: str
+    probe_json: str
+    document_body: bytes
+
+    def __repr__(self) -> str:
+        return "<_CandidateBaseline redacted>"
+
+
 class MonitorPlanner:
     __slots__ = (
         "_actions",
@@ -319,8 +330,8 @@ class MonitorPlanner:
             if candidate is None:
                 feedback.append(category)
                 continue
-            spec_value, items = candidate
-            return self._persist_proposal(spec_value, items, result)
+            spec_value, items, trusted_probe = candidate
+            return self._persist_proposal(spec_value, items, trusted_probe)
         raise PlanningFailed
 
     async def _validate_target(self, url: str | None) -> ResolvedTarget:
@@ -446,7 +457,10 @@ class MonitorPlanner:
         projected_intent: IntentResult,
         probe: ProbeResult,
         forbidden: tuple[str, ...],
-    ) -> tuple[tuple[MonitorSpec, tuple[ObservedItem, ...]] | None, str]:
+    ) -> tuple[
+        tuple[MonitorSpec, tuple[ObservedItem, ...], ProbeResult] | None,
+        str,
+    ]:
         fresh = _fresh_plan_result(raw)
         if fresh is None:
             return None, _FEEDBACK_SCHEMA
@@ -462,6 +476,14 @@ class MonitorPlanner:
             or _contains_forbidden_value(spec.model_dump(mode="python"), forbidden)
         ):
             return None, _FEEDBACK_BINDING
+        baseline = _capture_candidate_baseline(
+            spec,
+            probe,
+            owner_id=request.owner_id,
+            target_url=intent.target_url,
+        )
+        if baseline is None:
+            return None, _FEEDBACK_BINDING
         if not _dependency_intact(
             self._extractor, self._extractor_anchor
         ) or not _dependency_intact(
@@ -469,11 +491,18 @@ class MonitorPlanner:
             self._validator_anchor,
         ):
             raise PlanningFailed
+        extraction_inputs = _candidate_inputs_from_baseline(baseline)
+        if extraction_inputs is None:
+            raise PlanningFailed
+        extraction_spec, extraction_probe = extraction_inputs
         extracted: object | None = None
         invalid = False
         local_failed = False
         try:
-            extracted = self._extractor_anchor.call(probe.document, spec.extract)
+            extracted = self._extractor_anchor.call(
+                extraction_probe.document,
+                extraction_spec.extract,
+            )
         except MonitorError as error:
             if type(error) is MonitorError:
                 invalid = True
@@ -486,9 +515,17 @@ class MonitorPlanner:
         if invalid:
             return None, _FEEDBACK_EXTRACT
 
+        validation_inputs = _candidate_inputs_from_baseline(baseline)
+        if validation_inputs is None:
+            raise PlanningFailed
+        validation_spec, _ = validation_inputs
         validated: object | None = None
         try:
-            validated = self._validator_anchor.call(extracted, spec.extract, spec.validators)
+            validated = self._validator_anchor.call(
+                extracted,
+                validation_spec.extract,
+                validation_spec.validators,
+            )
         except MonitorError as error:
             if type(error) is MonitorError:
                 invalid = True
@@ -504,19 +541,23 @@ class MonitorPlanner:
             or any(type(item) is not ObservedItem for item in validated)
         ):
             return None, _FEEDBACK_EXTRACT
+        trusted_inputs = _candidate_inputs_from_baseline(baseline)
+        if trusted_inputs is None:
+            raise PlanningFailed
+        trusted_spec, trusted_probe = trusted_inputs
         bound = _bind_application_spec(
-            spec,
-            owner_id=request.owner_id,
-            target_url=intent.target_url,
-            strategy=probe.document.strategy,
-            auth_profile_ref=probe.auth_profile_ref,
+            trusted_spec,
+            owner_id=baseline.owner_id,
+            target_url=baseline.target_url,
+            strategy=trusted_probe.document.strategy,
+            auth_profile_ref=trusted_probe.auth_profile_ref,
         )
         if bound is None:
             return None, _FEEDBACK_BINDING
         fresh_items = _fresh_observations(validated, bound)
         if fresh_items is None:
             return None, _FEEDBACK_EXTRACT
-        return (bound, fresh_items), ""
+        return (bound, fresh_items, trusted_probe), ""
 
     def _persist_proposal(
         self,
@@ -973,6 +1014,70 @@ def _fresh_observations(
             spec.extract,
             spec.validators,
         )
+    return result
+
+
+def _capture_candidate_baseline(
+    spec: MonitorSpec,
+    probe: ProbeResult,
+    *,
+    owner_id: str,
+    target_url: str | None,
+) -> _CandidateBaseline | None:
+    result: _CandidateBaseline | None = None
+    with suppress(Exception):
+        if (
+            type(spec) is not MonitorSpec
+            or type(probe) is not ProbeResult
+            or type(owner_id) is not str
+            or _OWNER_RE.fullmatch(owner_id) is None
+            or type(target_url) is not str
+            or not _safe_web_url(target_url, reject_sensitive_query=True)
+            or type(probe.document.body) is not bytes
+        ):
+            raise TypeError
+        candidate = _CandidateBaseline(
+            owner_id=owner_id,
+            target_url=target_url,
+            spec_json=canonical_json(spec.model_dump(mode="json")),
+            probe_json=canonical_json(_probe_primitives(probe)),
+            document_body=bytes(probe.document.body),
+        )
+        if _candidate_inputs_from_baseline(candidate) is None:
+            raise ValueError
+        result = candidate
+    return result
+
+
+def _candidate_inputs_from_baseline(
+    baseline: _CandidateBaseline,
+) -> tuple[MonitorSpec, ProbeResult] | None:
+    result: tuple[MonitorSpec, ProbeResult] | None = None
+    with suppress(Exception):
+        if (
+            type(baseline) is not _CandidateBaseline
+            or _OWNER_RE.fullmatch(baseline.owner_id) is None
+            or not _safe_web_url(baseline.target_url, reject_sensitive_query=True)
+            or type(baseline.document_body) is not bytes
+        ):
+            raise TypeError
+        spec_payload = json.loads(baseline.spec_json)
+        fresh_spec = MonitorSpec.model_validate(spec_payload)
+        if canonical_json(fresh_spec.model_dump(mode="json")) != baseline.spec_json:
+            raise ValueError
+        probe_payload = json.loads(baseline.probe_json)
+        fresh_probe = _probe_from_primitives(
+            probe_payload,
+            baseline.document_body,
+            owner_id=baseline.owner_id,
+        )
+        if (
+            fresh_probe is None
+            or fresh_probe.target.normalized_url != baseline.target_url
+            or canonical_json(_probe_primitives(fresh_probe)) != baseline.probe_json
+        ):
+            raise ValueError
+        result = fresh_spec, fresh_probe
     return result
 
 
