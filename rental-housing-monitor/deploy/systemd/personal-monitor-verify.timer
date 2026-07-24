@@ -1,0 +1,11 @@
+[Unit]
+Description=Verify the personal monitor backup path Sundays at 04:10 KST
+
+[Timer]
+OnCalendar=Sun *-*-* 04:10:00 Asia/Seoul
+Persistent=true
+RandomizedDelaySec=0
+Unit=personal-monitor-verify.service
+
+[Install]
+WantedBy=timers.target

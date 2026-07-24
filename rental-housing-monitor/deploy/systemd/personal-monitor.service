@@ -1,0 +1,24 @@
+[Unit]
+Description=Personal monitor Docker Compose stack
+Wants=network-online.target
+Requires=docker.service
+After=network-online.target docker.service
+ConditionPathExists=/srv/personal-monitor/app/compose.yaml
+ConditionPathExists=/srv/personal-monitor/.env
+ConditionPathExists=/etc/personal-monitor/master.key
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/srv/personal-monitor/app
+ExecStart=/usr/bin/docker compose --env-file /srv/personal-monitor/.env up --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file /srv/personal-monitor/.env stop --timeout 90
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=120
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
