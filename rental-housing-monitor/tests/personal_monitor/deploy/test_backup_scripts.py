@@ -172,6 +172,10 @@ def test_scripts_use_strict_private_shell_baseline(
         assert "$*" not in script
 
 
+def test_backup_can_find_gcloud_snap_on_ubuntu_gce(backup_text: str) -> None:
+    assert ":/snap/bin" in backup_text
+
+
 def test_backup_has_fixed_allowlist_and_forbidden_exclusions(backup_text: str) -> None:
     for required in (
         'SOURCE_ROOT="/srv/personal-monitor"',
