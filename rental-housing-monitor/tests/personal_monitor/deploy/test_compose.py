@@ -330,6 +330,7 @@ def test_squid_limits_ports_bodies_and_sensitive_logging() -> None:
 def test_squid_denies_metadata_private_reserved_and_ipv6_ranges() -> None:
     squid = _text(SQUID)
     allow_index = squid.index("http_access allow monitor_network safe_ports")
+    assert "::ffff:0:0/96" not in squid
     for value in (
         "metadata.google.internal",
         "169.254.169.254/32",
@@ -347,7 +348,6 @@ def test_squid_denies_metadata_private_reserved_and_ipv6_ranges() -> None:
         "224.0.0.0/4",
         "240.0.0.0/4",
         "::1/128",
-        "::ffff:0:0/96",
         "64:ff9b::/96",
         "64:ff9b:1::/48",
         "100::/64",
