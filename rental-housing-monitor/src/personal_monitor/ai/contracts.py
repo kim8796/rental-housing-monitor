@@ -15,6 +15,12 @@ BoundMonitorId = Annotated[str, Field(min_length=1, max_length=128)]
 BoundUrl = Annotated[str | None, Field(max_length=2_048)]
 
 
+def _require_all_properties(schema: dict[str, object]) -> None:
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        schema["required"] = list(properties)
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -46,6 +52,8 @@ class IntentRequest(RedactedModel):
 
 
 class IntentResult(RedactedModel):
+    model_config = ConfigDict(json_schema_extra=_require_all_properties)
+
     kind: IntentKind
     target_monitor_ids: list[BoundMonitorId] = Field(max_length=10)
     target_url: BoundUrl = None
