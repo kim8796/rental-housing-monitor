@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the personal monitor backup every day at 03:10 KST
+
+[Timer]
+OnCalendar=*-*-* 03:10:00 Asia/Seoul
+Persistent=true
+RandomizedDelaySec=0
+Unit=personal-monitor-backup.service
+
+[Install]
+WantedBy=timers.target

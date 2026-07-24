@@ -1,0 +1,8 @@
+[
+  {"text": "지금 모니터링 중인 거 보여줘", "kind": "list"},
+  {"text": "아까 등록한 상품 감시 잠깐 꺼줘", "kind": "pause"},
+  {"text": "확인 주기를 하루에 한 번으로 바꿔줘", "kind": "update"},
+  {"text": "임대주택 알림은 두고 가격 알림만 삭제해줘", "kind": "delete"},
+  {"text": "https://example.com/p/7 이게 10만 원 아래면 알려줘", "kind": "create"},
+  {"text": "요즘 어때?", "kind": "unknown"}
+]

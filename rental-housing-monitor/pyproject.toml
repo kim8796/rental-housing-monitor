@@ -9,10 +9,19 @@ description = "서울·경기 LH, SH, GH 임대주택 모집공고 모니터"
 requires-python = ">=3.12"
 dependencies = [
   "beautifulsoup4>=4.12,<5",
+  "cryptography>=45,<47",
+  "croniter>=6.0,<7",
   "httpx>=0.27,<1",
+  "idna>=3.10,<4",
+  "pydantic>=2.11,<3",
   "python-dotenv>=1.0,<2",
+  "regex>=2024.11,<2027",
+  "scrapling[fetchers]>=0.4.11,<0.5",
   "tenacity>=8.2,<10",
 ]
+
+[project.scripts]
+personal-monitor = "personal_monitor.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -23,9 +32,12 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "browser: launches the locally installed Scrapling browser against loopback fixtures only",
+]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/rental_monitor"]
+packages = ["src/rental_monitor", "src/personal_monitor"]
 
 [tool.ruff]
 line-length = 100

@@ -8,6 +8,18 @@
 
 공고 고유번호 또는 공식 URL 기반 키를 SQLite에 저장하며, Telegram 전송 성공 기록이 없는 공고만 신규로 보냅니다. 정상 수집 결과가 0건이면 `오늘은 신규 공고가 없습니다.`를 보냅니다. 한 기관의 수집이나 파싱이 실패하면 나머지 기관은 계속 처리하고 실패 기관·단계·원인을 별도 메시지로 알립니다.
 
+## 개인 모니터 플랫폼 운영 문서
+
+현재 QStash/GitHub Actions 임대주택 모니터를 유지하면서, 별도 GCP VM의 자연어
+Telegram 개인 모니터 플랫폼으로 단계적으로 이전하는 절차입니다.
+
+- [GCP 배포와 호스트 운영](docs/operations/gcp-deploy.md)
+- [암호화 백업과 복구 검증](docs/operations/backup-restore.md)
+- [임대주택 7일 shadow, 전환, 롤백](docs/operations/rental-cutover.md)
+
+VM 생성은 `infra/gcp/README.md`의 실행 체크포인트 뒤에만 수행합니다. 7일 shadow와
+중복 probe가 모두 통과하기 전에는 QStash schedule을 중지하지 않습니다.
+
 ## 공식 데이터 소스
 
 - LH: [한국토지주택공사 분양임대공고문 조회 서비스](https://www.data.go.kr/data/15058530/openapi.do)

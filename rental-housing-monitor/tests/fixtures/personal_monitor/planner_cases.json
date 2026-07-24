@@ -1,0 +1,117 @@
+[
+  {
+    "id": "numeric_price",
+    "message": "https://example.com/products 키보드가 10만원 아래면 알려줘",
+    "url": "https://example.com/products",
+    "html": "<main class=\"listing\"><h1>기계식 키보드</h1><span class=\"price\">99,000원</span></main>",
+    "condition": "가격이 10만원 아래",
+    "profile": null,
+    "warnings": [],
+    "spec": {
+      "name": "키보드 가격",
+      "item_scope": "main.listing",
+      "fields": {
+        "title": {"selector": "h1", "type": "text"},
+        "price": {"selector": ".price", "type": "krw"}
+      },
+      "min_items": 1,
+      "max_items": 3,
+      "rule": {"kind": "numeric_threshold", "field": "price", "operator": "lt", "value": 100000}
+    },
+    "expected": {"rule_kind": "numeric_threshold", "rule_field": "price", "field_type": "krw"}
+  },
+  {
+    "id": "stock_status",
+    "message": "https://example.com/stock 재고가 입고로 바뀌면 알려줘",
+    "url": "https://example.com/stock",
+    "html": "<main class=\"listing\"><h1>무선 마우스</h1><span class=\"status\">입고</span></main>",
+    "condition": "재고 상태가 입고",
+    "profile": null,
+    "warnings": [],
+    "spec": {
+      "name": "재고 상태",
+      "item_scope": "main.listing",
+      "fields": {
+        "title": {"selector": "h1", "type": "text"},
+        "status": {"selector": ".status", "type": "text"}
+      },
+      "min_items": 1,
+      "max_items": 3,
+      "rule": {"kind": "status_equals", "field": "status", "value": "입고"}
+    },
+    "expected": {"rule_kind": "status_equals", "rule_field": "status", "field_type": "text"}
+  },
+  {
+    "id": "keyword_notice",
+    "message": "https://example.com/notices 공고에 청년 키워드가 나오면 알려줘",
+    "url": "https://example.com/notices",
+    "html": "<main class=\"notice\"><h1>서울 청년 임대 공고</h1></main>",
+    "condition": "청년 키워드 포함",
+    "profile": null,
+    "warnings": [],
+    "spec": {
+      "name": "청년 공고",
+      "item_scope": "main.notice",
+      "fields": {
+        "title": {"selector": "h1", "type": "text"}
+      },
+      "min_items": 1,
+      "max_items": 10,
+      "rule": {"kind": "keyword_match", "field": "title", "keywords": ["청년"]}
+    },
+    "expected": {"rule_kind": "keyword_match", "rule_field": "title", "field_type": "text"}
+  },
+  {
+    "id": "repeated_change",
+    "message": "https://example.com/listing 이 매물의 상태가 바뀌면 알려줘",
+    "url": "https://example.com/listing",
+    "html": "<main class=\"listing\"><h1>101동 1001호</h1><span class=\"status\">접수중</span></main>",
+    "condition": "같은 매물 상태 변경",
+    "profile": null,
+    "warnings": [],
+    "spec": {
+      "name": "매물 변경",
+      "item_scope": "main.listing",
+      "fields": {
+        "title": {"selector": "h1", "type": "text"},
+        "status": {"selector": ".status", "type": "text"}
+      },
+      "min_items": 1,
+      "max_items": 3,
+      "rule": {"kind": "field_changed", "field": "status"}
+    },
+    "expected": {"rule_kind": "field_changed", "rule_field": "status", "field_type": "text"}
+  },
+  {
+    "id": "ambiguous_invalid",
+    "message": "이거 좀 봐줘",
+    "url": null,
+    "html": "<main><h1>무엇을 볼까요</h1></main>",
+    "condition": null,
+    "profile": null,
+    "warnings": [],
+    "spec": null,
+    "expected": {"fails_closed": true}
+  },
+  {
+    "id": "login_profile",
+    "message": "https://example.com/account 신청 상태가 선정으로 바뀌면 알려줘",
+    "url": "https://example.com/account",
+    "html": "<main class=\"application\"><h1>내 신청</h1><span class=\"status\">선정</span></main>",
+    "condition": "신청 상태가 선정",
+    "profile": "owner-session",
+    "warnings": ["login_required"],
+    "spec": {
+      "name": "신청 결과",
+      "item_scope": "main.application",
+      "fields": {
+        "title": {"selector": "h1", "type": "text"},
+        "status": {"selector": ".status", "type": "text"}
+      },
+      "min_items": 1,
+      "max_items": 1,
+      "rule": {"kind": "status_equals", "field": "status", "value": "선정"}
+    },
+    "expected": {"rule_kind": "status_equals", "rule_field": "status", "field_type": "text"}
+  }
+]

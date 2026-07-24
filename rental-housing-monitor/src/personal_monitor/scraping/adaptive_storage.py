@@ -1,0 +1,595 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+import threading
+import weakref
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from lxml.html import HtmlElement
+from scrapling.core.storage import StorageSystemMixin
+
+from personal_monitor.security.encryption import AesGcmCipher, EncryptedBlob
+from personal_monitor.storage.schema import canonical_json, transaction, utc_timestamp
+
+_IDENTIFIER = re.compile(r"(?:item_scope:[0-9]{1,6}|field:[a-z][a-z0-9_]{0,63}:[0-9]{1,6})\Z")
+_NAMESPACE_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}\Z")
+_FORMAT = "personal-monitor-adaptive-feature-v1"
+_AAD_PREFIX = b"personal-monitor/adaptive-feature/v1\0"
+_MAX_FEATURE_BYTES = 32_768
+_MAX_ATTRIBUTES = 64
+_MAX_ATTRIBUTE_NAME = 256
+_MAX_ATTRIBUTE_VALUE = 4_096
+_MAX_TEXT = 8_192
+_MAX_TAG = 128
+_MAX_PATH = 64
+_MAX_RELATED = 128
+_RETENTION = timedelta(days=90)
+
+
+def _private_weak_pins():
+    pins: weakref.WeakKeyDictionary[object, tuple[object, ...]] = weakref.WeakKeyDictionary()
+    lock = threading.RLock()
+
+    def pin(owner: object, values: tuple[object, ...]) -> None:
+        with lock:
+            if owner in pins:
+                raise RuntimeError("adaptive feature storage integrity check failed")
+            pins[owner] = values
+
+    def acquire(owner: object) -> tuple[object, ...]:
+        with lock:
+            values = pins.get(owner)
+        if values is None:
+            raise RuntimeError("adaptive feature storage integrity check failed")
+        return values
+
+    return pin, acquire
+
+
+_pin_storage, _acquire_storage = _private_weak_pins()
+_pin_namespace, _acquire_namespace = _private_weak_pins()
+
+
+class EncryptedAdaptiveStorage:
+    """Factory for monitor/version-scoped authenticated Scrapling feature stores."""
+
+    __slots__ = (
+        "_connection",
+        "_cipher",
+        "_clock",
+        "_composition",
+        "_sealed",
+        "__weakref__",
+    )
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        cipher: AesGcmCipher,
+        clock: Callable[[], datetime],
+    ) -> None:
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError("connection must be a SQLite connection")
+        if type(cipher) is not AesGcmCipher:
+            raise TypeError("cipher must be an AesGcmCipher")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        _clock_value(clock)
+        try:
+            if connection.row_factory is not sqlite3.Row or connection.isolation_level is not None:
+                raise RuntimeError
+            if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                raise RuntimeError
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(adaptive_features)")
+            }
+            if columns != {
+                "key_hash",
+                "namespace_hash",
+                "nonce",
+                "ciphertext",
+                "created_at",
+                "updated_at",
+                "expires_at",
+            }:
+                raise RuntimeError
+            connection.execute("SELECT 1 FROM adaptive_features LIMIT 1")
+        except (RuntimeError, sqlite3.Error):
+            raise RuntimeError("adaptive feature storage is unavailable") from None
+        self._connection = connection
+        self._cipher = cipher
+        self._clock = clock
+        self._composition = (connection, cipher, clock)
+        self._sealed = True
+        _pin_storage(self, (connection, cipher, clock))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("adaptive feature storage is sealed")
+        object.__setattr__(self, name, value)
+
+    def __repr__(self) -> str:
+        return "EncryptedAdaptiveStorage()"
+
+    def for_namespace(
+        self, *, owner_id: str, monitor_id: str, version_id: str
+    ) -> EncryptedAdaptiveNamespace:
+        connection, cipher, clock = self._trusted_snapshot()
+        parts = tuple(_namespace_part(value) for value in (owner_id, monitor_id, version_id))
+        namespace = b"\0".join(part.encode("utf-8") for part in parts)
+        return EncryptedAdaptiveNamespace(
+            connection,
+            cipher=cipher,
+            clock=clock,
+            namespace=namespace,
+        )
+
+    def purge_expired(self, *, now: datetime) -> int:
+        connection, _cipher, _clock = self._trusted_snapshot()
+        timestamp = utc_timestamp(now, parameter="now")
+        try:
+            with transaction(connection, immediate=True):
+                cursor = connection.execute(
+                    "DELETE FROM adaptive_features WHERE expires_at <= ?", (timestamp,)
+                )
+            return cursor.rowcount
+        except sqlite3.Error:
+            raise RuntimeError("adaptive feature storage failed") from None
+
+    def _trusted_snapshot(
+        self,
+        _acquire: Callable[[object], tuple[object, ...]] = _acquire_storage,
+    ) -> tuple[sqlite3.Connection, AesGcmCipher, Callable[[], datetime]]:
+        try:
+            connection, cipher, clock = _acquire(self)
+            valid = (
+                self._connection is connection
+                and self._cipher is cipher
+                and self._clock is clock
+                and self._composition == (connection, cipher, clock)
+                and type(cipher) is AesGcmCipher
+                and isinstance(connection, sqlite3.Connection)
+            )
+        except (AttributeError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise RuntimeError("adaptive feature storage integrity check failed")
+        return connection, cipher, clock
+
+    def _assert_integrity(self) -> None:
+        self._trusted_snapshot()
+
+    def _trusted_connection(self) -> sqlite3.Connection:
+        connection, _cipher, _clock = self._trusted_snapshot()
+        return connection
+
+
+class EncryptedAdaptiveNamespace(StorageSystemMixin):
+    """A sealed namespace implementing Scrapling's adaptive storage contract."""
+
+    __slots__ = (
+        "_connection",
+        "_cipher",
+        "_clock",
+        "_namespace",
+        "_namespace_hash",
+        "_composition",
+        "_sealed",
+    )
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        cipher: AesGcmCipher,
+        clock: Callable[[], datetime],
+        namespace: bytes,
+    ) -> None:
+        super().__init__(None)
+        self._connection = connection
+        self._cipher = cipher
+        self._clock = clock
+        self._namespace = bytes(namespace)
+        self._namespace_hash = hashlib.sha256(self._namespace).hexdigest()
+        self._composition = (
+            connection,
+            cipher,
+            clock,
+            self._namespace,
+            self._namespace_hash,
+        )
+        self._sealed = True
+        _pin_namespace(
+            self,
+            (connection, cipher, clock, self._namespace, self._namespace_hash),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("adaptive feature namespace is sealed")
+        object.__setattr__(self, name, value)
+
+    def __repr__(self) -> str:
+        return "EncryptedAdaptiveNamespace()"
+
+    def save(self, element: HtmlElement, identifier: str) -> None:
+        self.save_many(((element, identifier),))
+
+    def save_many(
+        self,
+        entries: Sequence[tuple[HtmlElement, str]],
+        *,
+        precondition: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> None:
+        connection, cipher, clock, namespace, namespace_hash = self._trusted_snapshot()
+        now = _clock_value(clock)
+        timestamp = now.isoformat()
+        expires_at = (now + _RETENTION).isoformat()
+        prepared: list[tuple[object, ...]] = []
+        for element, identifier in entries:
+            checked_identifier = _identifier(identifier)
+            payload = _encode_feature(_element_feature(element))
+            base_aad = _feature_aad(namespace, checked_identifier)
+            blob = cipher.encrypt(payload, _expiry_aad(base_aad, expires_at))
+            prepared.append(
+                (
+                    hashlib.sha256(base_aad).hexdigest(),
+                    namespace_hash,
+                    blob.nonce,
+                    blob.ciphertext,
+                    timestamp,
+                    timestamp,
+                    expires_at,
+                )
+            )
+        try:
+            with transaction(connection, immediate=True):
+                if precondition is not None:
+                    precondition(connection)
+                connection.executemany(
+                    "INSERT INTO adaptive_features("
+                    "key_hash, namespace_hash, nonce, ciphertext, created_at, updated_at, "
+                    "expires_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(key_hash) DO UPDATE SET "
+                    "namespace_hash = excluded.namespace_hash, nonce = excluded.nonce, "
+                    "ciphertext = excluded.ciphertext, updated_at = excluded.updated_at, "
+                    "expires_at = excluded.expires_at",
+                    prepared,
+                )
+        except sqlite3.Error:
+            raise RuntimeError("adaptive feature storage failed") from None
+
+    def retrieve(self, identifier: str) -> dict[str, object] | None:
+        connection, cipher, clock, namespace, namespace_hash = self._trusted_snapshot()
+        checked_identifier = _identifier(identifier)
+        base_aad = _feature_aad(namespace, checked_identifier)
+        key_hash = hashlib.sha256(base_aad).hexdigest()
+        try:
+            row = connection.execute(
+                "SELECT nonce, ciphertext, expires_at FROM adaptive_features "
+                "WHERE key_hash = ? AND namespace_hash = ?",
+                (key_hash, namespace_hash),
+            ).fetchone()
+        except sqlite3.Error:
+            raise RuntimeError("adaptive feature storage failed") from None
+        if row is None:
+            return None
+        try:
+            expires_at_value = row["expires_at"]
+            if not isinstance(expires_at_value, str):
+                raise ValueError
+            plaintext = cipher.decrypt(
+                EncryptedBlob(nonce=row["nonce"], ciphertext=row["ciphertext"]),
+                _expiry_aad(base_aad, expires_at_value),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("adaptive feature authentication failed") from None
+        try:
+            feature = _decode_feature(plaintext)
+            if _encode_feature(feature) != plaintext:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, UnicodeError, RecursionError):
+            raise ValueError("adaptive feature payload is invalid") from None
+        try:
+            expires_at = datetime.fromisoformat(expires_at_value)
+            if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("adaptive feature authentication failed") from None
+        if expires_at.astimezone(UTC) <= _clock_value(clock):
+            try:
+                with transaction(connection, immediate=True):
+                    connection.execute(
+                        "DELETE FROM adaptive_features WHERE key_hash = ? "
+                        "AND namespace_hash = ? AND nonce = ? AND ciphertext = ? "
+                        "AND expires_at = ?",
+                        (
+                            key_hash,
+                            namespace_hash,
+                            row["nonce"],
+                            row["ciphertext"],
+                            expires_at_value,
+                        ),
+                    )
+            except sqlite3.Error:
+                raise RuntimeError("adaptive feature storage failed") from None
+            return None
+        return feature
+
+    def delete(self, identifier: str) -> bool:
+        connection, _cipher, _clock, namespace, namespace_hash = self._trusted_snapshot()
+        checked_identifier = _identifier(identifier)
+        aad = _feature_aad(namespace, checked_identifier)
+        key_hash = hashlib.sha256(aad).hexdigest()
+        try:
+            with transaction(connection, immediate=True):
+                cursor = connection.execute(
+                    "DELETE FROM adaptive_features WHERE key_hash = ? AND namespace_hash = ?",
+                    (key_hash, namespace_hash),
+                )
+            return cursor.rowcount == 1
+        except sqlite3.Error:
+            raise RuntimeError("adaptive feature storage failed") from None
+
+    def delete_all(self) -> int:
+        connection, _cipher, _clock, _namespace, namespace_hash = self._trusted_snapshot()
+        try:
+            with transaction(connection, immediate=True):
+                cursor = connection.execute(
+                    "DELETE FROM adaptive_features WHERE namespace_hash = ?",
+                    (namespace_hash,),
+                )
+            return cursor.rowcount
+        except sqlite3.Error:
+            raise RuntimeError("adaptive feature storage failed") from None
+
+    def _trusted_snapshot(
+        self,
+        _acquire: Callable[[object], tuple[object, ...]] = _acquire_namespace,
+    ) -> tuple[
+        sqlite3.Connection,
+        AesGcmCipher,
+        Callable[[], datetime],
+        bytes,
+        str,
+    ]:
+        try:
+            connection, cipher, clock, namespace, namespace_hash = _acquire(self)
+            valid = (
+                self._connection is connection
+                and self._cipher is cipher
+                and self._clock is clock
+                and self._namespace == namespace
+                and self._namespace_hash == namespace_hash
+                and self._composition == (connection, cipher, clock, namespace, namespace_hash)
+                and hashlib.sha256(namespace).hexdigest() == namespace_hash
+                and self.url is None
+                and type(cipher) is AesGcmCipher
+                and isinstance(connection, sqlite3.Connection)
+            )
+        except (AttributeError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise RuntimeError("adaptive feature storage integrity check failed")
+        return connection, cipher, clock, namespace, namespace_hash
+
+    def _assert_integrity(self) -> None:
+        self._trusted_snapshot()
+
+
+def _feature_aad(namespace: bytes, identifier: str) -> bytes:
+    return _AAD_PREFIX + namespace + b"\0" + identifier.encode("ascii")
+
+
+def _expiry_aad(base_aad: bytes, expires_at: str) -> bytes:
+    try:
+        encoded = expires_at.encode("ascii")
+    except (AttributeError, UnicodeError):
+        raise ValueError("adaptive feature authentication failed") from None
+    return base_aad + b"\0expires_at\0" + encoded
+
+
+def _namespace_part(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("adaptive namespace values must be strings")
+    if not _NAMESPACE_PART.fullmatch(value):
+        raise ValueError("adaptive namespace value is invalid")
+    return value
+
+
+def _identifier(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("adaptive identifier must be a string")
+    if not _IDENTIFIER.fullmatch(value):
+        raise ValueError("adaptive identifier is invalid")
+    return value
+
+
+def _clock_value(clock: Callable[[], datetime]) -> datetime:
+    value = clock()
+    if not isinstance(value, datetime):
+        raise TypeError("clock must return a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("clock must return a timezone-aware datetime")
+    return value.astimezone(UTC)
+
+
+def _element_feature(element: object) -> dict[str, object]:
+    if not isinstance(element, HtmlElement):
+        raise TypeError("adaptive element must be an HTML element")
+    tag = _tag(element.tag)
+    attributes = _attributes(element.attrib)
+    feature: dict[str, object] = {
+        "tag": tag,
+        "attributes": attributes,
+        "text": _text(element.text),
+        "path": _path(element),
+    }
+    parent = element.getparent()
+    if parent is not None:
+        feature.update(
+            {
+                "parent_name": _tag(parent.tag),
+                "parent_attribs": _attributes(parent.attrib),
+                "parent_text": _text(parent.text),
+            }
+        )
+        siblings = [_tag(child.tag) for child in parent.iterchildren() if child is not element]
+        if siblings:
+            feature["siblings"] = _related(siblings)
+    children = [_tag(child.tag) for child in element.iterchildren()]
+    if children:
+        feature["children"] = _related(children)
+    _validate_feature(feature)
+    return feature
+
+
+def _tag(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > _MAX_TAG:
+        raise ValueError("adaptive feature must be bounded")
+    return value
+
+
+def _attributes(value: Mapping[object, object]) -> dict[str, str]:
+    if len(value) > _MAX_ATTRIBUTES:
+        raise ValueError("adaptive feature must be bounded")
+    result: dict[str, str] = {}
+    for raw_name, raw_value in value.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            raise ValueError("adaptive feature must be bounded")
+        if len(raw_name) > _MAX_ATTRIBUTE_NAME or len(raw_value) > _MAX_ATTRIBUTE_VALUE:
+            raise ValueError("adaptive feature must be bounded")
+        cleaned = raw_value.strip()
+        if not cleaned:
+            continue
+        result[raw_name] = cleaned
+    return result
+
+
+def _text(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("adaptive feature must be bounded")
+    if len(value) > _MAX_TEXT:
+        raise ValueError("adaptive feature must be bounded")
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _path(element: HtmlElement) -> list[str]:
+    reversed_path: list[str] = []
+    current: Any = element
+    while current is not None:
+        if len(reversed_path) >= _MAX_PATH:
+            raise ValueError("adaptive feature must be bounded")
+        reversed_path.append(_tag(current.tag))
+        current = current.getparent()
+    return list(reversed(reversed_path))
+
+
+def _related(values: Sequence[str]) -> list[str]:
+    if len(values) > _MAX_RELATED:
+        raise ValueError("adaptive feature must be bounded")
+    return [_tag(value) for value in values]
+
+
+def _encode_feature(feature: Mapping[str, object]) -> bytes:
+    encoded = canonical_json({"format": _FORMAT, "feature": feature}).encode("utf-8")
+    if len(encoded) > _MAX_FEATURE_BYTES:
+        raise ValueError("adaptive feature must be bounded")
+    return encoded
+
+
+def _decode_feature(value: bytes) -> dict[str, object]:
+    if len(value) > _MAX_FEATURE_BYTES:
+        raise ValueError("adaptive feature must be bounded")
+    _validate_json_nesting(value)
+    decoded = json.loads(value.decode("utf-8"), object_pairs_hook=_unique_object)
+    if not isinstance(decoded, dict) or set(decoded) != {"format", "feature"}:
+        raise ValueError("adaptive feature must be bounded")
+    if decoded["format"] != _FORMAT or not isinstance(decoded["feature"], dict):
+        raise ValueError("adaptive feature must be bounded")
+    feature = decoded["feature"]
+    _validate_feature(feature)
+    return feature
+
+
+def _validate_json_nesting(value: bytes) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == 0x5C:
+                escaped = True
+            elif character == 0x22:
+                in_string = False
+            continue
+        if character == 0x22:
+            in_string = True
+        elif character in (0x5B, 0x7B):
+            depth += 1
+            if depth > 8:
+                raise ValueError("adaptive feature must be bounded")
+        elif character in (0x5D, 0x7D):
+            depth -= 1
+            if depth < 0:
+                raise ValueError("adaptive feature must be bounded")
+    if depth != 0 or in_string:
+        raise ValueError("adaptive feature must be bounded")
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("adaptive feature must be bounded")
+        result[key] = value
+    return result
+
+
+def _validate_feature(feature: Mapping[str, object]) -> None:
+    required = {"tag", "attributes", "text", "path"}
+    optional = {"parent_name", "parent_attribs", "parent_text", "siblings", "children"}
+    if not required <= set(feature) or not set(feature) <= required | optional:
+        raise ValueError("adaptive feature must be bounded")
+    _tag(feature["tag"])
+    if not isinstance(feature["attributes"], dict):
+        raise ValueError("adaptive feature must be bounded")
+    if _attributes(feature["attributes"]) != feature["attributes"]:
+        raise ValueError("adaptive feature must be bounded")
+    if _text(feature["text"]) != feature["text"]:
+        raise ValueError("adaptive feature must be bounded")
+    path = feature["path"]
+    if not isinstance(path, list) or not path or len(path) > _MAX_PATH:
+        raise ValueError("adaptive feature must be bounded")
+    for item in path:
+        _tag(item)
+    if path[-1] != feature["tag"]:
+        raise ValueError("adaptive feature must be bounded")
+    parent_keys = {"parent_name", "parent_attribs", "parent_text"}
+    if set(feature) & parent_keys and not parent_keys <= set(feature):
+        raise ValueError("adaptive feature must be bounded")
+    if "parent_name" in feature:
+        _tag(feature["parent_name"])
+        if not isinstance(feature["parent_attribs"], dict):
+            raise ValueError("adaptive feature must be bounded")
+        if _attributes(feature["parent_attribs"]) != feature["parent_attribs"]:
+            raise ValueError("adaptive feature must be bounded")
+        if _text(feature["parent_text"]) != feature["parent_text"]:
+            raise ValueError("adaptive feature must be bounded")
+    for key in ("siblings", "children"):
+        if key in feature:
+            values = feature[key]
+            if not isinstance(values, list):
+                raise ValueError("adaptive feature must be bounded")
+            _related(values)

@@ -1,0 +1,1819 @@
+from __future__ import annotations
+
+import asyncio
+import gzip
+import json
+import logging
+import zlib
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+from dataclasses import FrozenInstanceError
+from threading import Barrier
+from typing import Any
+
+import httpx
+import pytest
+
+import personal_monitor.telegram.api as api_module
+from personal_monitor.telegram import (
+    CallbackQuery,
+    InlineButton,
+    TelegramApi,
+    TelegramApiError,
+    TelegramMessage,
+    TelegramUpdate,
+)
+
+TOKEN = "unit-test-bot-token"
+MAX_RESPONSE_BYTES = 1024 * 1024
+
+
+def message_json(text: str = "감시해줘") -> dict[str, object]:
+    return {
+        "message_id": 31,
+        "chat": {"id": 42, "ignored": "chat-secret"},
+        "from": {"id": 7, "ignored": "user-secret"},
+        "text": text,
+        "ignored": "response-secret",
+    }
+
+
+def callback_json(data: str = "confirm:opaque") -> dict[str, object]:
+    return {
+        "id": "callback-query-id",
+        "from": {"id": 7},
+        "message": {"message_id": 31, "chat": {"id": 42}},
+        "data": data,
+        "ignored": "response-secret",
+    }
+
+
+class TelegramHarness:
+    def __init__(
+        self,
+        responses: list[httpx.Response | BaseException | Callable[[httpx.Request], httpx.Response]],
+        *,
+        token: str = TOKEN,
+    ) -> None:
+        self.responses = list(responses)
+        self.requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            if not self.responses:
+                raise AssertionError("unexpected HTTP request")
+            queued = self.responses.pop(0)
+            if isinstance(queued, BaseException):
+                if isinstance(queued, httpx.RequestError):
+                    queued._request = request
+                raise queued
+            if callable(queued):
+                return queued(request)
+            queued.request = request
+            return queued
+
+        self.transport = httpx.MockTransport(handler)
+        self.api = TelegramApi(token, transport=self.transport)
+
+    async def close(self) -> None:
+        await self.api.aclose()
+
+
+def json_response(payload: object, *, status: int = 200) -> httpx.Response:
+    return httpx.Response(status, json=payload)
+
+
+def request_json(request: httpx.Request) -> dict[str, Any]:
+    parsed = json.loads(request.content)
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def run(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+def test_get_updates_sends_bounded_poll_query_and_parses_supported_updates() -> None:
+    harness = TelegramHarness(
+        [
+            json_response(
+                {
+                    "ok": True,
+                    "result": [
+                        {"update_id": 17, "message": message_json()},
+                        {"update_id": 18, "callback_query": callback_json()},
+                        {"update_id": 19, "edited_message": {"ignored": True}},
+                    ],
+                }
+            )
+        ]
+    )
+
+    updates = run(harness.api.get_updates(offset=10, timeout=30))
+    run(harness.close())
+
+    assert updates == [
+        TelegramUpdate(17, TelegramMessage(31, 42, 7, "감시해줘"), None),
+        TelegramUpdate(
+            18,
+            None,
+            CallbackQuery("callback-query-id", 7, 42, 31, "confirm:opaque"),
+        ),
+        TelegramUpdate(19, None, None),
+    ]
+    request = harness.requests[0]
+    assert request.method == "GET"
+    assert request.url.path.endswith("/getUpdates")
+    assert dict(request.url.params) == {
+        "offset": "10",
+        "timeout": "30",
+        "allowed_updates": '["message","callback_query"]',
+    }
+    assert request.extensions["timeout"] == {
+        "connect": 35.0,
+        "read": 35.0,
+        "write": 35.0,
+        "pool": 35.0,
+    }
+
+
+def test_parsed_updates_are_frozen_copies_with_redacted_representations() -> None:
+    raw = {"update_id": 17, "message": message_json("private-message")}
+    harness = TelegramHarness([json_response({"ok": True, "result": [raw]})])
+
+    update = run(harness.api.get_updates(offset=0, timeout=0))[0]
+    raw["update_id"] = 999
+    message = raw["message"]
+    assert isinstance(message, dict)
+    message["text"] = "mutated"
+    run(harness.close())
+
+    assert update.update_id == 17
+    assert update.message is not None
+    assert update.message.text == "private-message"
+    with pytest.raises(FrozenInstanceError):
+        update.message.text = "changed"  # type: ignore[misc]
+    assert "private-message" not in repr(update)
+    assert "42" not in repr(update)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"update_id": True},
+        {"update_id": -1},
+        {"update_id": 1, "message": None},
+        {"update_id": 1, "message": {}},
+        {"update_id": 1, "message": {**message_json(), "message_id": True}},
+        {"update_id": 1, "message": {**message_json(), "message_id": 0}},
+        {"update_id": 1, "message": {**message_json(), "chat": {"id": False}}},
+        {"update_id": 1, "message": {**message_json(), "from": {"id": -1}}},
+        {"update_id": 1, "message": {**message_json(), "text": 4}},
+        {"update_id": 1, "message": {**message_json(), "text": "bad\x00text"}},
+        {"update_id": 1, "message": {**message_json(), "text": "x" * 4097}},
+        {"update_id": 1, "callback_query": None},
+        {"update_id": 1, "callback_query": {}},
+        {"update_id": 1, "callback_query": {**callback_json(), "id": ""}},
+        {"update_id": 1, "callback_query": {**callback_json(), "data": ""}},
+        {"update_id": 1, "callback_query": {**callback_json(), "data": "가" * 22}},
+        {"update_id": 1, "callback_query": {**callback_json(), "data": "bad\x01"}},
+        {
+            "update_id": 1,
+            "message": message_json(),
+            "callback_query": callback_json(),
+        },
+    ],
+)
+def test_malformed_supported_update_shapes_fail_with_one_fixed_error(payload: object) -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": [payload]})])
+
+    with pytest.raises(TelegramApiError) as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert str(caught.value) == "invalid Telegram response shape"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("offset", "timeout"),
+    [(-1, 30), (True, 30), (2**63, 30), (0, -1), (0, 31), (0, False), (0, 1.5)],
+)
+def test_poll_bounds_fail_before_network_access(offset: object, timeout: object) -> None:
+    harness = TelegramHarness([])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram request"):
+        run(harness.api.get_updates(offset=offset, timeout=timeout))  # type: ignore[arg-type]
+    run(harness.close())
+
+    assert harness.requests == []
+
+
+def test_too_many_updates_fail_closed() -> None:
+    result = [{"update_id": index} for index in range(101)]
+    harness = TelegramHarness([json_response({"ok": True, "result": result})])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+
+def test_send_message_splits_unbroken_and_korean_text_in_order_and_returns_final_id() -> None:
+    harness = TelegramHarness(
+        [
+            json_response({"ok": True, "result": {"message_id": 88}}),
+            json_response({"ok": True, "result": {"message_id": 89}}),
+            json_response({"ok": True, "result": {"message_id": 90}}),
+        ]
+    )
+    text = "가" * 4096 + "\n" + "x" * 4097
+
+    result = run(harness.api.send_message("42", text))
+    run(harness.close())
+
+    assert result == "90"
+    payloads = [request_json(request) for request in harness.requests]
+    assert [payload["text"] for payload in payloads] == ["가" * 4096, "x" * 4096, "x"]
+    assert all(payload["chat_id"] == "42" for payload in payloads)
+    assert all(payload["disable_web_page_preview"] is True for payload in payloads)
+    assert all(request.method == "POST" for request in harness.requests)
+    assert all(
+        request.headers["content-type"] == "application/json" for request in harness.requests
+    )
+    assert all(
+        request.extensions["timeout"]
+        == {"connect": 20.0, "read": 20.0, "write": 20.0, "pool": 20.0}
+        for request in harness.requests
+    )
+
+
+def test_send_message_accepts_a_signed_group_chat_id() -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": {"message_id": 91}})])
+
+    result = run(harness.api.send_message(-100123, "hello"))
+    run(harness.close())
+
+    assert result == "91"
+    assert request_json(harness.requests[0])["chat_id"] == "-100123"
+
+
+def test_inline_keyboard_has_canonical_structure_and_copies_mutable_rows() -> None:
+    rows = [[InlineButton("등록", "confirm:opaque")]]
+    harness = TelegramHarness([json_response({"ok": True, "result": {"message_id": 88}})])
+
+    result = run(harness.api.send_message(42, "미리보기", buttons=rows))
+    rows[0].append(InlineButton("취소", "cancel:opaque"))
+    run(harness.close())
+
+    assert result == "88"
+    assert request_json(harness.requests[0]) == {
+        "chat_id": "42",
+        "text": "미리보기",
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [[{"text": "등록", "callback_data": "confirm:opaque"}]]
+        },
+    }
+    with pytest.raises(FrozenInstanceError):
+        rows[0][0].text = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "button",
+    [
+        InlineButton("", "valid"),
+        InlineButton("bad\x00", "valid"),
+        InlineButton("x" * 65, "valid"),
+        InlineButton("valid", ""),
+        InlineButton("valid", "bad\x01"),
+        InlineButton("valid", "가" * 22),
+        InlineButton("valid", "bad\ud800"),
+    ],
+)
+def test_invalid_inline_buttons_fail_before_network_access(button: InlineButton) -> None:
+    harness = TelegramHarness([])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram request"):
+        run(harness.api.send_message(42, "preview", buttons=[[button]]))
+    run(harness.close())
+
+    assert harness.requests == []
+
+
+def test_button_collection_bounds_fail_before_network_access() -> None:
+    harness = TelegramHarness([])
+    rows = [[InlineButton(str(index), f"callback:{index}")] for index in range(9)]
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram request"):
+        run(harness.api.send_message(42, "preview", buttons=rows))
+    run(harness.close())
+
+    assert harness.requests == []
+
+
+@pytest.mark.parametrize("text", ["", "   \n\t", "bad\x00text", "bad\ud800", "x" * 40961])
+def test_invalid_outgoing_message_fails_before_network_access(text: str) -> None:
+    harness = TelegramHarness([])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram request"):
+        run(harness.api.send_message(42, text))
+    run(harness.close())
+
+    assert harness.requests == []
+
+
+def test_edit_message_accepts_one_chunk_and_returns_edited_id() -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": {"message_id": 31}})])
+
+    result = run(
+        harness.api.edit_message(
+            42,
+            31,
+            "수정된 미리보기",
+            buttons=((InlineButton("확인", "confirm:opaque"),),),
+        )
+    )
+    run(harness.close())
+
+    assert result == "31"
+    assert request_json(harness.requests[0]) == {
+        "chat_id": "42",
+        "message_id": "31",
+        "text": "수정된 미리보기",
+        "reply_markup": {
+            "inline_keyboard": [[{"text": "확인", "callback_data": "confirm:opaque"}]]
+        },
+    }
+
+
+@pytest.mark.parametrize("text", ["", " \n", "x" * 4097])
+def test_edit_rejects_empty_or_multi_chunk_text_before_network(text: str) -> None:
+    harness = TelegramHarness([])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram request"):
+        run(harness.api.edit_message(42, 31, text))
+    run(harness.close())
+
+    assert harness.requests == []
+
+
+def test_answer_callback_requires_boolean_success() -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": True})])
+
+    assert run(harness.api.answer_callback("callback-id", text="완료", show_alert=True)) is None
+    run(harness.close())
+
+    assert request_json(harness.requests[0]) == {
+        "callback_query_id": "callback-id",
+        "text": "완료",
+        "show_alert": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("callback_id", "text", "show_alert"),
+    [
+        ("", None, False),
+        ("bad\x00", None, False),
+        ("x" * 257, None, False),
+        ("valid", "x" * 201, False),
+        ("valid", "bad\x01", False),
+        ("valid", None, 1),
+    ],
+)
+def test_invalid_callback_answer_fails_before_network(
+    callback_id: str, text: str | None, show_alert: object
+) -> None:
+    harness = TelegramHarness([])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram request"):
+        run(
+            harness.api.answer_callback(
+                callback_id,
+                text=text,
+                show_alert=show_alert,  # type: ignore[arg-type]
+            )
+        )
+    run(harness.close())
+
+    assert harness.requests == []
+
+
+def test_answer_callback_rejects_non_boolean_result() -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": 1})])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.answer_callback("callback-id"))
+    run(harness.close())
+
+
+def test_webhook_preflight_accepts_only_an_empty_url() -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": {"url": ""}})])
+
+    assert run(harness.api.ensure_webhook_disabled()) is None
+    run(harness.close())
+
+    assert harness.requests[0].method == "GET"
+    assert harness.requests[0].url.path.endswith("/getWebhookInfo")
+
+
+@pytest.mark.parametrize("result", [{"url": "https://hook.invalid/private"}, {}, {"url": None}])
+def test_webhook_preflight_rejects_nonempty_or_malformed_state_without_leaking_it(
+    result: object,
+) -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": result})])
+
+    with pytest.raises(TelegramApiError, match="Telegram webhook preflight failed") as caught:
+        run(harness.api.ensure_webhook_disabled())
+    run(harness.close())
+
+    assert "hook.invalid" not in str(caught.value)
+    assert "hook.invalid" not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, content=b"server-body-secret"),
+        httpx.Response(200, content=b"not-json-response-secret"),
+        httpx.Response(200, content=b'\xff{"ok":true,"result":[]}'),
+        json_response([]),
+        json_response({"ok": True}),
+        json_response({"ok": 1, "result": []}),
+        json_response({"ok": True, "result": {}}),
+    ],
+)
+def test_invalid_http_or_response_envelope_fails_without_retaining_response(
+    response: httpx.Response,
+) -> None:
+    harness = TelegramHarness([response])
+
+    with pytest.raises(TelegramApiError) as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    combined = f"{caught.value!s} {caught.value!r}"
+    assert "server-body-secret" not in combined
+    assert "not-json-response-secret" not in combined
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_oversized_response_body_is_rejected_at_one_mib_boundary() -> None:
+    harness = TelegramHarness([httpx.Response(200, content=b"x" * (MAX_RESPONSE_BYTES + 1))])
+
+    with pytest.raises(TelegramApiError, match="Telegram response too large"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [httpx.ConnectError("offline"), httpx.ReadTimeout("timed out")],
+)
+def test_network_errors_are_replaced_without_token_bearing_cause_or_context(
+    error: httpx.RequestError,
+) -> None:
+    harness = TelegramHarness([error])
+
+    with pytest.raises(TelegramApiError, match="Telegram request failed") as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert TOKEN not in str(caught.value)
+    assert TOKEN not in repr(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_api_descriptions_are_always_replaced_with_fixed_error() -> None:
+    safe = TelegramHarness([json_response({"ok": False, "description": "chat not found"})])
+    with pytest.raises(TelegramApiError) as safe_error:
+        run(safe.api.get_updates(offset=0, timeout=30))
+    run(safe.close())
+    assert str(safe_error.value) == "Telegram API request failed"
+
+    secret = "Authorization: Bearer abc https://bad.invalid/?token=response-secret chat 42"
+    malicious = TelegramHarness([json_response({"ok": False, "description": secret})])
+    with pytest.raises(TelegramApiError) as caught:
+        run(malicious.api.get_updates(offset=0, timeout=30))
+    run(malicious.close())
+
+    assert str(caught.value) == "Telegram API request failed"
+    assert secret not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ok": True, "result": {}},
+        {"ok": True, "result": {"message_id": True}},
+        {"ok": True, "result": {"message_id": 0}},
+        {"ok": True, "result": {"message_id": "88"}},
+    ],
+)
+def test_send_rejects_missing_or_invalid_message_id(payload: object) -> None:
+    harness = TelegramHarness([json_response(payload)])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.send_message(42, "hello"))
+    run(harness.close())
+
+
+def test_api_and_errors_have_fixed_secret_safe_representations(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    response_secret = "private-response-body"
+    harness = TelegramHarness(
+        [json_response({"ok": False, "description": f"token={response_secret}"})]
+    )
+    caplog.set_level(logging.DEBUG)
+
+    with pytest.raises(TelegramApiError) as caught:
+        run(harness.api.send_message(42, "private-message"))
+    run(harness.close())
+
+    assert repr(harness.api) == "<TelegramApi redacted>"
+    assert repr(caught.value) == "TelegramApiError(<redacted>)"
+    exposed = " ".join((str(caught.value), repr(caught.value), caplog.text))
+    for secret in (TOKEN, response_secret, "private-message", "42"):
+        assert secret not in exposed
+
+
+@pytest.mark.parametrize("token", ["", "   ", "bad\x00token", "bad\ud800"])
+def test_constructor_rejects_invalid_token_without_exposing_value(token: str) -> None:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(500))
+
+    with pytest.raises(ValueError) as caught:
+        TelegramApi(token, transport=transport)
+
+    if token:
+        assert token not in str(caught.value)
+        assert token not in repr(caught.value)
+
+
+class _ObservingLogFilter(logging.Filter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        self.messages.append(record.getMessage())
+        return True
+
+
+class _TrackingResponseStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes = b"", *, cancel: bool = False) -> None:
+        self._body = body
+        self._cancel = cancel
+        self.close_calls = 0
+
+    async def __aiter__(self):
+        if self._cancel:
+            raise asyncio.CancelledError
+        yield self._body
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+class _UnavailableResponseHeaders:
+    def get(self, _key: str, _default: str = "") -> str:
+        raise RuntimeError("response headers unavailable")
+
+
+def test_review_preexisting_httpx_filter_never_observes_tokenized_url() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+    logger.filters.insert(0, observer)
+    logger.setLevel(logging.INFO)
+    harness = TelegramHarness([json_response({"ok": True, "result": []})])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+        assert observer.messages
+        assert all(TOKEN not in message for message in observer.messages)
+        assert any("/bot-redacted/getUpdates" in message for message in observer.messages)
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+def test_review_request_hook_exception_is_replaced_without_secret_context() -> None:
+    hook_calls = 0
+
+    async def leaking_hook(request: httpx.Request) -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+        raise RuntimeError(f"hook saw {request.url}")
+
+    harness = TelegramHarness([])
+    object.__setattr__(
+        harness.api._client,
+        "_event_hooks",
+        {"request": [leaking_hook], "response": []},
+    )
+
+    with pytest.raises(TelegramApiError, match="Telegram client integrity failure") as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert TOKEN not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert hook_calls == 0
+    assert harness.requests == []
+
+
+def test_review_runtime_transport_exception_is_replaced_without_secret_context() -> None:
+    harness = TelegramHarness([RuntimeError(f"transport leaked {TOKEN}")])
+
+    with pytest.raises(TelegramApiError, match="Telegram request failed") as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert TOKEN not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_review_caller_owned_async_client_is_not_an_accepted_constructor_boundary() -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(500)))
+    try:
+        with pytest.raises(TypeError):
+            TelegramApi(client, TOKEN)
+    finally:
+        run(client.aclose())
+
+
+def test_review_post_construction_client_swap_fails_before_swapped_transport() -> None:
+    harness = TelegramHarness([])
+    swapped_requests: list[httpx.Request] = []
+
+    def swapped_handler(request: httpx.Request) -> httpx.Response:
+        swapped_requests.append(request)
+        return json_response({"ok": True, "result": []})
+
+    swapped = httpx.AsyncClient(transport=httpx.MockTransport(swapped_handler))
+    object.__setattr__(harness.api, "_client", swapped)
+    with pytest.raises(TelegramApiError, match="Telegram client integrity failure"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(swapped.aclose())
+    run(harness.close())
+
+    assert swapped_requests == []
+
+
+def test_review_ok_false_never_returns_even_ordinary_description() -> None:
+    harness = TelegramHarness(
+        [json_response({"ok": False, "description": "ordinary alphabetic failure"})]
+    )
+
+    with pytest.raises(TelegramApiError) as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert str(caught.value) == "Telegram API request failed"
+    assert repr(caught.value) == "TelegramApiError(<redacted>)"
+
+
+def test_review_huge_json_integer_is_replaced_with_fixed_response_error() -> None:
+    body = b'{"ok":true,"result":[{"update_id":' + b"9" * 5000 + b"}]}"
+    harness = TelegramHarness([httpx.Response(200, content=body)])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape") as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_review_deep_json_is_rejected_before_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = b"[" * 400_000 + b"0" + b"]" * 400_000
+    harness = TelegramHarness([httpx.Response(200, content=body)])
+    decoder_called = False
+
+    def forbidden_decoder(*_args: object, **_kwargs: object) -> object:
+        nonlocal decoder_called
+        decoder_called = True
+        raise AssertionError("deep JSON reached decoder")
+
+    monkeypatch.setattr(api_module.json, "loads", forbidden_decoder)
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert decoder_called is False
+
+
+def test_review_photo_message_and_inline_callback_advance_offset_as_unsupported() -> None:
+    photo_message = {
+        "message_id": 31,
+        "chat": {"id": 42},
+        "from": {"id": 7},
+        "photo": [
+            {
+                "file_id": "opaque",
+                "file_unique_id": "opaque-unique",
+                "width": 1,
+                "height": 1,
+            }
+        ],
+    }
+    inline_callback = {
+        "id": "callback-query-id",
+        "from": {"id": 7},
+        "data": "confirm:opaque",
+        "inline_message_id": "inline-message-id",
+    }
+    harness = TelegramHarness(
+        [
+            json_response(
+                {
+                    "ok": True,
+                    "result": [
+                        {"update_id": 70, "message": photo_message},
+                        {"update_id": 71, "callback_query": inline_callback},
+                        {"update_id": 72, "message": message_json("supported")},
+                    ],
+                }
+            )
+        ]
+    )
+
+    updates = run(harness.api.get_updates(offset=70, timeout=30))
+    run(harness.close())
+
+    assert updates == [
+        TelegramUpdate(70, None, None),
+        TelegramUpdate(71, None, None),
+        TelegramUpdate(72, TelegramMessage(31, 42, 7, "supported"), None),
+    ]
+
+
+def test_review_api_owns_exact_client_and_exposes_only_mock_transport_seam() -> None:
+    transport = httpx.MockTransport(lambda _request: json_response({"ok": True, "result": []}))
+    api = TelegramApi(TOKEN, transport=transport)
+
+    assert type(api._client) is httpx.AsyncClient
+    assert api._client.event_hooks == {"request": (), "response": ()}
+    with pytest.raises(TypeError):
+        TelegramApi(TOKEN, event_hooks={"request": []})  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="invalid Telegram test transport"):
+        TelegramApi(TOKEN, transport=object())  # type: ignore[arg-type]
+    run(api.aclose())
+
+
+def test_review_api_composition_rejects_normal_attribute_swap() -> None:
+    harness = TelegramHarness([])
+    with pytest.raises(AttributeError, match="sealed"):
+        harness.api._client = object()  # type: ignore[assignment]
+    run(harness.close())
+
+
+def test_review_logger_filter_container_is_not_a_request_dependency() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = logger.filters
+    harness = TelegramHarness([json_response({"ok": True, "result": []})])
+    logger.filters = tuple(reversed(original_filters))  # type: ignore[assignment]
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        assert len(harness.requests) == 1
+    finally:
+        logger.filters = original_filters
+        run(harness.close())
+
+
+def test_review_concurrent_clients_redact_each_token_before_other_filters() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+    logger.filters.insert(0, observer)
+    logger.setLevel(logging.INFO)
+    first_token = "first-concurrent-token"
+    second_token = "second-concurrent-token"
+    first = TelegramHarness([json_response({"ok": True, "result": []})], token=first_token)
+    second = TelegramHarness([json_response({"ok": True, "result": []})], token=second_token)
+
+    async def exercise() -> None:
+        await asyncio.gather(
+            first.api.get_updates(offset=0, timeout=30),
+            second.api.get_updates(offset=0, timeout=30),
+        )
+        await first.close()
+        await second.close()
+
+    try:
+        run(exercise())
+        assert observer.messages
+        assert all(first_token not in message for message in observer.messages)
+        assert all(second_token not in message for message in observer.messages)
+        assert sum("/bot-redacted/getUpdates" in item for item in observer.messages) == 2
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        f"token echo {TOKEN}",
+        "message echo private payload",
+        "callback echo confirm opaque",
+        "chat echo private address",
+    ],
+)
+def test_review_api_failure_descriptions_are_never_public(description: str) -> None:
+    harness = TelegramHarness([json_response({"ok": False, "description": description})])
+
+    with pytest.raises(TelegramApiError) as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert str(caught.value) == "Telegram API request failed"
+    assert description not in repr(caught.value)
+
+
+def test_review_json_nesting_scanner_ignores_escaped_string_brackets() -> None:
+    ignored = '\\"' + "[" * 1000 + "}" * 1000
+    body = json.dumps(
+        {"ok": True, "result": [{"update_id": 90, "ignored": ignored}]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    harness = TelegramHarness([httpx.Response(200, content=body)])
+
+    assert run(harness.api.get_updates(offset=90, timeout=30)) == [TelegramUpdate(90, None, None)]
+    run(harness.close())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "update_id": 80,
+            "message": {"message_id": 31, "chat": {"id": 42}, "photo": []},
+        },
+        {
+            "update_id": 81,
+            "callback_query": {
+                "id": "callback-query-id",
+                "from": {"id": 7},
+                "data": "confirm:opaque",
+                "inline_message_id": "",
+            },
+        },
+        {
+            "update_id": 82,
+            "callback_query": {
+                "id": "callback-query-id",
+                "from": {"id": True},
+                "data": "confirm:opaque",
+                "inline_message_id": "inline-id",
+            },
+        },
+    ],
+)
+def test_review_malformed_unsupported_subtypes_remain_strictly_rejected(
+    payload: object,
+) -> None:
+    harness = TelegramHarness([json_response({"ok": True, "result": [payload]})])
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+
+def test_final_review_filter_installed_in_flight_observes_only_sanitized_url() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+
+    def install_filter(_request: httpx.Request) -> httpx.Response:
+        logger.filters.insert(0, observer)
+        return json_response({"ok": True, "result": []})
+
+    logger.setLevel(logging.INFO)
+    harness = TelegramHarness([install_filter])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+        assert observer.messages
+        assert all(TOKEN not in message for message in observer.messages)
+        assert any("/bot-redacted/getUpdates" in message for message in observer.messages)
+        assert all("allowed_updates" not in message for message in observer.messages)
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+def test_final_review_concurrent_in_flight_filter_changes_never_observe_tokens() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+
+    def install_filter(_request: httpx.Request) -> httpx.Response:
+        if observer in logger.filters:
+            logger.filters.remove(observer)
+        logger.filters.insert(0, observer)
+        return json_response({"ok": True, "result": []})
+
+    logger.setLevel(logging.INFO)
+    first_token = "first-race-token"
+    second_token = "second-race-token"
+    first = TelegramHarness([install_filter], token=first_token)
+    second = TelegramHarness([install_filter], token=second_token)
+
+    async def exercise() -> None:
+        await asyncio.gather(
+            first.api.get_updates(offset=0, timeout=30),
+            second.api.get_updates(offset=0, timeout=30),
+        )
+        await first.close()
+        await second.close()
+
+    try:
+        run(exercise())
+        assert observer.messages
+        assert all(first_token not in message for message in observer.messages)
+        assert all(second_token not in message for message in observer.messages)
+        assert all("allowed_updates" not in message for message in observer.messages)
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "raw/slash",
+        "raw?query",
+        "raw#fragment",
+        "raw\\backslash",
+        "percent%2Fslash",
+        "percent%3Fquery",
+        "percent%23fragment",
+        "dot.segment",
+        "space token",
+        "nonascii-토큰",
+    ],
+)
+def test_final_review_token_rejects_path_query_and_encoding_delimiters(token: str) -> None:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(500))
+    api: TelegramApi | None = None
+    try:
+        with pytest.raises(ValueError, match="invalid Telegram bot token") as caught:
+            api = TelegramApi(token, transport=transport)
+        assert token not in str(caught.value)
+        assert token not in repr(caught.value)
+    finally:
+        if api is not None:
+            run(api.aclose())
+
+
+def test_final_review_transport_wrapper_and_inner_identity_are_sealed() -> None:
+    harness = TelegramHarness([])
+    wrapper = harness.api._transport_anchor
+    replacement_calls = 0
+
+    def replacement_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal replacement_calls
+        replacement_calls += 1
+        return json_response({"ok": True, "result": []})
+
+    replacement = httpx.MockTransport(replacement_handler)
+    with pytest.raises(AttributeError, match="sealed"):
+        wrapper._inner = replacement  # type: ignore[attr-defined]
+    object.__setattr__(wrapper, "_inner", replacement)
+
+    with pytest.raises(TelegramApiError, match="Telegram client integrity failure"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert replacement_calls == 0
+    assert harness.requests == []
+
+
+def unsupported_message(**content: object) -> dict[str, object]:
+    return {
+        "message_id": 31,
+        "chat": {"id": 42},
+        "from": {"id": 7},
+        **content,
+    }
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        unsupported_message(),
+        unsupported_message(made_up={"value": "unknown"}),
+        unsupported_message(photo=[]),
+        unsupported_message(photo={"file_id": "not-a-list"}),
+        unsupported_message(photo=[{}]),
+        unsupported_message(
+            photo=[{"file_id": f"photo-{index}", "width": 1, "height": 1} for index in range(21)]
+        ),
+        unsupported_message(photo=[{"file_id": "x" * 513, "width": 1, "height": 1}]),
+        unsupported_message(video={}),
+        unsupported_message(video="not-an-object"),
+        unsupported_message(
+            photo=[{"file_id": "photo-id", "width": 1, "height": 1}],
+            caption="x" * 1025,
+        ),
+    ],
+)
+def test_final_review_malformed_or_unknown_no_text_message_is_rejected(
+    message: object,
+) -> None:
+    harness = TelegramHarness(
+        [json_response({"ok": True, "result": [{"update_id": 100, "message": message}]})]
+    )
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.get_updates(offset=100, timeout=30))
+    run(harness.close())
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        unsupported_message(
+            photo=[
+                {
+                    "file_id": "photo-small",
+                    "file_unique_id": "photo-small-unique",
+                    "width": 320,
+                    "height": 240,
+                    "file_size": 2048,
+                },
+                {
+                    "file_id": "photo-large",
+                    "file_unique_id": "photo-large-unique",
+                    "width": 1280,
+                    "height": 960,
+                    "file_size": 8192,
+                },
+            ],
+            caption="사진 설명",
+        ),
+        unsupported_message(
+            video={
+                "file_id": "video-id",
+                "file_unique_id": "video-unique-id",
+                "width": 1280,
+                "height": 720,
+                "duration": 5,
+                "file_name": "clip.mp4",
+                "mime_type": "video/mp4",
+                "file_size": 8192,
+                "supports_streaming": True,
+            }
+        ),
+        unsupported_message(
+            document={
+                "file_id": "document-id",
+                "file_unique_id": "document-unique-id",
+                "file_name": "notice.pdf",
+                "mime_type": "application/pdf",
+                "file_size": 4096,
+                "thumbnail": {
+                    "file_id": "thumb-id",
+                    "file_unique_id": "thumb-unique-id",
+                    "width": 80,
+                    "height": 80,
+                },
+            }
+        ),
+    ],
+)
+def test_final_review_valid_bounded_media_message_advances_offset(message: object) -> None:
+    harness = TelegramHarness(
+        [json_response({"ok": True, "result": [{"update_id": 101, "message": message}]})]
+    )
+
+    assert run(harness.api.get_updates(offset=101, timeout=30)) == [TelegramUpdate(101, None, None)]
+    run(harness.close())
+
+
+def test_final_review_cancellation_propagates_and_owned_transport_still_closes() -> None:
+    close_calls = 0
+
+    async def cancel_handler(_request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    transport = httpx.MockTransport(cancel_handler)
+    original_close = transport.aclose
+
+    async def recording_close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        await original_close()
+
+    object.__setattr__(transport, "aclose", recording_close)
+    api = TelegramApi(TOKEN, transport=transport)
+
+    with pytest.raises(asyncio.CancelledError):
+        run(api.get_updates(offset=0, timeout=30))
+    run(api.aclose())
+
+    assert close_calls == 1
+
+
+def test_second_final_review_response_metadata_is_sanitized_before_httpx_logging() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+    stream = _TrackingResponseStream(b'{"ok":false,"description":"body-secret"}')
+
+    def malicious_response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            stream=stream,
+            extensions={
+                "http_version": b"123:VERSION_SECRET",
+                "reason_phrase": b"123:REASON_SECRET",
+            },
+        )
+
+    logger.filters.insert(0, observer)
+    logger.setLevel(logging.INFO)
+    harness = TelegramHarness([malicious_response])
+    try:
+        with pytest.raises(TelegramApiError, match="Telegram request failed") as caught:
+            run(harness.api.get_updates(offset=0, timeout=30))
+        run(harness.close())
+
+        observed = " ".join(observer.messages)
+        assert "VERSION_SECRET" not in observed
+        assert "REASON_SECRET" not in observed
+        assert "body-secret" not in observed
+        assert "HTTP/1.1" in observed
+        assert "Telegram" in observed
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert stream.close_calls == 1
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+def test_second_final_review_cancelled_stream_closes_once_without_metadata_leak() -> None:
+    logger = logging.getLogger("httpx")
+    original_filters = list(logger.filters)
+    original_level = logger.level
+    observer = _ObservingLogFilter()
+    stream = _TrackingResponseStream(cancel=True)
+
+    def malicious_response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=stream,
+            extensions={
+                "http_version": b"123:CANCEL_VERSION_SECRET",
+                "reason_phrase": b"123:CANCEL_REASON_SECRET",
+            },
+        )
+
+    logger.filters.insert(0, observer)
+    logger.setLevel(logging.INFO)
+    harness = TelegramHarness([malicious_response])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            run(harness.api.get_updates(offset=0, timeout=30))
+        run(harness.close())
+
+        observed = " ".join(observer.messages)
+        assert "CANCEL_VERSION_SECRET" not in observed
+        assert "CANCEL_REASON_SECRET" not in observed
+        assert stream.close_calls == 1
+    finally:
+        logger.filters[:] = original_filters
+        logger.setLevel(original_level)
+
+
+def test_second_final_review_httpcore_diagnostics_are_suppressed_without_muting_other_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    parent_logger = logging.getLogger("httpcore")
+    probe_logger = logging.getLogger("httpcore.http11")
+    unrelated_logger = logging.getLogger("personal_monitor.telegram_unrelated_probe")
+    original_parent = (parent_logger.disabled, parent_logger.level)
+    original_probe = (probe_logger.disabled, probe_logger.level, probe_logger.propagate)
+    original_unrelated = (
+        unrelated_logger.disabled,
+        unrelated_logger.level,
+        unrelated_logger.propagate,
+    )
+
+    def response_with_transport_diagnostic(_request: httpx.Request) -> httpx.Response:
+        probe_logger.debug(
+            "receive_response_headers %r",
+            [
+                (b"authorization", b"123:HEADER_SECRET"),
+                (b"x-message", b"callback-secret"),
+            ],
+        )
+        unrelated_logger.warning("unrelated-log-marker")
+        return json_response({"ok": True, "result": []})
+
+    parent_logger.disabled = False
+    parent_logger.setLevel(logging.DEBUG)
+    probe_logger.disabled = False
+    probe_logger.setLevel(logging.DEBUG)
+    probe_logger.propagate = True
+    unrelated_logger.disabled = False
+    unrelated_logger.setLevel(logging.DEBUG)
+    unrelated_logger.propagate = True
+    caplog.set_level(logging.DEBUG)
+    harness = TelegramHarness([response_with_transport_diagnostic])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert all("HEADER_SECRET" not in message for message in messages)
+        assert all("callback-secret" not in message for message in messages)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert any(message == "unrelated-log-marker" for message in messages)
+    finally:
+        parent_logger.disabled, parent_logger.level = original_parent
+        probe_logger.disabled, probe_logger.level, probe_logger.propagate = original_probe
+        (
+            unrelated_logger.disabled,
+            unrelated_logger.level,
+            unrelated_logger.propagate,
+        ) = original_unrelated
+
+
+def test_third_final_review_in_flight_httpcore_reconfiguration_cannot_emit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    parent_logger = logging.getLogger("httpcore")
+    probe_logger = logging.getLogger("httpcore.http11")
+    unrelated_logger = logging.getLogger("personal_monitor.telegram_third_review_probe")
+    original_parent = (
+        parent_logger.disabled,
+        parent_logger.level,
+        list(parent_logger.filters),
+        list(parent_logger.handlers),
+        parent_logger.propagate,
+    )
+    original_probe = (
+        probe_logger.disabled,
+        probe_logger.level,
+        list(probe_logger.filters),
+        list(probe_logger.handlers),
+        probe_logger.propagate,
+    )
+    original_unrelated = (
+        unrelated_logger.disabled,
+        unrelated_logger.level,
+        unrelated_logger.propagate,
+    )
+
+    def reconfigure_after_preflight(_request: httpx.Request) -> httpx.Response:
+        for logger in (parent_logger, probe_logger):
+            logger.disabled = False
+            logger.setLevel(logging.DEBUG)
+            logger.filters = []
+            logger.handlers = []
+            logger.addHandler(caplog.handler)
+            logger.propagate = True
+
+        future_logger = logging.getLogger("httpcore.future_notset_third_review_probe")
+        future_logger.disabled = False
+        future_logger.setLevel(logging.NOTSET)
+        future_logger.propagate = True
+        probe_logger.debug("httpcore-in-flight-secret")
+        probe_logger._log(logging.DEBUG, "httpcore-direct-log-secret", ())
+        direct_record = logging.LogRecord(
+            probe_logger.name,
+            logging.DEBUG,
+            __file__,
+            0,
+            "httpcore-direct-handle-secret",
+            (),
+            None,
+        )
+        probe_logger.handle(direct_record)
+        probe_logger.callHandlers(direct_record)
+        future_logger.debug("httpcore-future-child-secret")
+        unrelated_logger.warning("third-review-unrelated-marker")
+        return json_response({"ok": True, "result": []})
+
+    unrelated_logger.disabled = False
+    unrelated_logger.setLevel(logging.DEBUG)
+    unrelated_logger.propagate = True
+    caplog.set_level(logging.DEBUG)
+    harness = TelegramHarness([reconfigure_after_preflight])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert all("httpcore-" not in message for message in messages)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert any(record.name == "httpx" for record in caplog.records)
+        assert any(message == "third-review-unrelated-marker" for message in messages)
+    finally:
+        (
+            parent_logger.disabled,
+            parent_logger.level,
+            parent_logger.filters,
+            parent_logger.handlers,
+            parent_logger.propagate,
+        ) = original_parent
+        (
+            probe_logger.disabled,
+            probe_logger.level,
+            probe_logger.filters,
+            probe_logger.handlers,
+            probe_logger.propagate,
+        ) = original_probe
+        (
+            unrelated_logger.disabled,
+            unrelated_logger.level,
+            unrelated_logger.propagate,
+        ) = original_unrelated
+
+
+def test_third_final_review_installed_transport_loggers_are_immediately_sealed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unrelated_logger = logging.getLogger("personal_monitor.telegram_constructor_probe")
+    original_unrelated = (
+        unrelated_logger.disabled,
+        unrelated_logger.level,
+        unrelated_logger.propagate,
+    )
+    late_logger = logging.getLogger("httpcore.lazy_installed_transport_probe")
+    late_logger.disabled = False
+    late_logger.setLevel(logging.DEBUG)
+    api = TelegramApi(TOKEN)
+    installed_loggers = [
+        candidate
+        for name, candidate in logging.Logger.manager.loggerDict.items()
+        if name.startswith("httpcore.") and isinstance(candidate, logging.Logger)
+    ]
+    original_states = [
+        (
+            logger,
+            logger.disabled,
+            logger.level,
+            list(logger.filters),
+            list(logger.handlers),
+            logger.propagate,
+        )
+        for logger in installed_loggers
+    ]
+    unrelated_logger.disabled = False
+    unrelated_logger.setLevel(logging.DEBUG)
+    unrelated_logger.propagate = True
+    caplog.set_level(logging.DEBUG)
+    try:
+        assert installed_loggers
+        for logger in installed_loggers:
+            logger.disabled = False
+            logger.setLevel(logging.DEBUG)
+            logger.filters = []
+            logger.handlers = []
+            logger.addHandler(caplog.handler)
+            logger.propagate = True
+            logger.debug("installed-transport-httpcore-secret")
+        unrelated_logger.warning("constructor-unrelated-marker")
+        run(api.aclose())
+
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert any(
+            record.getMessage() == "constructor-unrelated-marker" for record in caplog.records
+        )
+    finally:
+        if not api._client.is_closed:
+            run(api.aclose())
+        for logger, disabled, level, filters, handlers, propagate in original_states:
+            logger.disabled = disabled
+            logger.level = level
+            logger.filters = filters
+            logger.handlers = handlers
+            logger.propagate = propagate
+        (
+            unrelated_logger.disabled,
+            unrelated_logger.level,
+            unrelated_logger.propagate,
+        ) = original_unrelated
+
+
+def test_fourth_final_review_sealed_logger_rejects_normal_class_restoration(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("httpcore.http11")
+    caplog.set_level(logging.DEBUG)
+
+    try:
+        with suppress(AttributeError, TypeError):
+            logger.__class__ = logging.Logger
+        logger.disabled = False
+        logger.setLevel(logging.DEBUG)
+        logger.handlers = []
+        logger.addHandler(caplog.handler)
+        logger.propagate = True
+        logger.debug("restored-httpcore-class-secret")
+        direct_record = logging.LogRecord(
+            logger.name,
+            logging.DEBUG,
+            __file__,
+            0,
+            "restored-httpcore-direct-secret",
+            (),
+            None,
+        )
+        logger.handle(direct_record)
+        logger.callHandlers(direct_record)
+
+        assert all("restored-httpcore" not in record.getMessage() for record in caplog.records)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+    finally:
+        api_module._suppress_httpcore_diagnostics()
+
+
+def test_fourth_final_review_in_flight_future_httpcore_child_is_sealed_on_creation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unrelated_logger = logging.getLogger("personal_monitor.telegram_fourth_review_probe")
+    original_unrelated = (
+        unrelated_logger.disabled,
+        unrelated_logger.level,
+        unrelated_logger.propagate,
+    )
+
+    def create_and_reconfigure_after_preflight(_request: httpx.Request) -> httpx.Response:
+        logger = logging.getLogger("httpcore.explicit_future_fourth_review_probe")
+        logger.disabled = False
+        logger.setLevel(logging.DEBUG)
+        logger.filters = []
+        logger.handlers = []
+        logger.addHandler(caplog.handler)
+        logger.propagate = True
+        logger.debug("future-httpcore-debug-secret")
+        logger._log(logging.DEBUG, "future-httpcore-direct-log-secret", ())
+        direct_record = logging.LogRecord(
+            logger.name,
+            logging.DEBUG,
+            __file__,
+            0,
+            "future-httpcore-direct-handle-secret",
+            (),
+            None,
+        )
+        logger.handle(direct_record)
+        logger.callHandlers(direct_record)
+        unrelated_logger.warning("fourth-review-unrelated-marker")
+        return json_response({"ok": True, "result": []})
+
+    unrelated_logger.disabled = False
+    unrelated_logger.setLevel(logging.DEBUG)
+    unrelated_logger.propagate = True
+    caplog.set_level(logging.DEBUG)
+    manager = logging.Logger.manager
+    harness = TelegramHarness([create_and_reconfigure_after_preflight])
+    try:
+        assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+        run(harness.close())
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert all("future-httpcore" not in message for message in messages)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert any(record.name == "httpx" for record in caplog.records)
+        assert any(message == "fourth-review-unrelated-marker" for message in messages)
+        assert logging.Logger.manager is manager
+        assert logging.root.manager is manager
+    finally:
+        api_module._suppress_httpcore_diagnostics()
+        (
+            unrelated_logger.disabled,
+            unrelated_logger.level,
+            unrelated_logger.propagate,
+        ) = original_unrelated
+
+
+def test_fourth_final_review_concurrent_logger_creation_seals_only_httpcore_namespace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    original_logger_class = logging.getLoggerClass()
+    manager = logging.Logger.manager
+
+    class ConfiguredLogger(logging.Logger):
+        def __init__(self, name: str) -> None:
+            super().__init__(name, logging.WARNING)
+            self.configuration_marker = "preserved"
+            self.configuration_handler = logging.NullHandler(logging.ERROR)
+            self.configuration_filter = logging.Filter(name)
+            self.addHandler(self.configuration_handler)
+            self.addFilter(self.configuration_filter)
+
+    barrier = Barrier(8)
+
+    def create_logger(index: int) -> tuple[logging.Logger, bool]:
+        is_httpcore = index % 2 == 0
+        namespace = "httpcore" if is_httpcore else "personal_monitor.concurrent_unrelated"
+        barrier.wait()
+        logger = logging.getLogger(f"{namespace}.fourth_review_{index}")
+        if is_httpcore:
+            logger.disabled = False
+            logger.setLevel(logging.DEBUG)
+            logger.handlers = []
+            logger.addHandler(caplog.handler)
+            logger.propagate = True
+            logger.debug(f"concurrent-httpcore-secret-{index}")
+            record = logging.LogRecord(
+                logger.name,
+                logging.DEBUG,
+                __file__,
+                0,
+                f"concurrent-httpcore-direct-secret-{index}",
+                (),
+                None,
+            )
+            logger.handle(record)
+            logger.callHandlers(record)
+        else:
+            assert isinstance(logger, ConfiguredLogger)
+            assert logger.configuration_marker == "preserved"
+            assert logger.level == logging.WARNING
+            assert logger.handlers == [logger.configuration_handler]
+            assert logger.filters == [logger.configuration_filter]
+            logger.setLevel(logging.DEBUG)
+            logger.addHandler(caplog.handler)
+            logger.propagate = False
+            logger.debug(f"concurrent-unrelated-marker-{index}")
+        return logger, is_httpcore
+
+    caplog.set_level(logging.DEBUG)
+    logging.setLoggerClass(ConfiguredLogger)
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            created = list(executor.map(create_logger, range(8)))
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert all("concurrent-httpcore" not in message for message in messages)
+        assert all(not record.name.startswith("httpcore") for record in caplog.records)
+        assert {
+            message for message in messages if message.startswith("concurrent-unrelated-marker-")
+        } == {f"concurrent-unrelated-marker-{index}" for index in (1, 3, 5, 7)}
+        assert all(
+            isinstance(logger, ConfiguredLogger)
+            for logger, is_httpcore in created
+            if not is_httpcore
+        )
+        assert logging.getLoggerClass() is ConfiguredLogger
+        assert logging.Logger.manager is manager
+        assert logging.root.manager is manager
+    finally:
+        logging.setLoggerClass(original_logger_class)
+        api_module._suppress_httpcore_diagnostics()
+
+
+@pytest.mark.parametrize(
+    "content_encodings",
+    [
+        (b"",),
+        (b"gzip", b"deflate"),
+        (b"gzip, deflate",),
+        (b"gzip,gzip",),
+        (b"br",),
+        (b"zstd",),
+        (b"unknown",),
+        (b"\xff",),
+    ],
+)
+def test_third_final_review_invalid_content_encoding_fails_closed_and_closes_once(
+    content_encodings: tuple[bytes, ...],
+) -> None:
+    stream = _TrackingResponseStream(b'{"ok":true,"result":[]}')
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers=[(b"content-encoding", item) for item in content_encodings],
+            stream=stream,
+        )
+
+    harness = TelegramHarness([response])
+    with pytest.raises(TelegramApiError, match="Telegram request failed") as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert stream.close_calls == 1
+
+
+def test_third_final_review_unavailable_content_encoding_fails_closed_and_closes_once() -> None:
+    stream = _TrackingResponseStream(b'{"ok":true,"result":[]}')
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        result = httpx.Response(200, stream=stream)
+        result.headers = _UnavailableResponseHeaders()  # type: ignore[assignment]
+        return result
+
+    harness = TelegramHarness([response])
+    with pytest.raises(TelegramApiError, match="Telegram request failed"):
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert stream.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "encoded_body"),
+    [
+        (None, b'{"ok":true,"result":[]}'),
+        (b"identity", b'{"ok":true,"result":[]}'),
+        (b"gzip", gzip.compress(b'{"ok":true,"result":[]}')),
+        (b"deflate", zlib.compress(b'{"ok":true,"result":[]}')),
+    ],
+)
+def test_third_final_review_installed_content_decoders_are_preserved(
+    content_encoding: bytes | None,
+    encoded_body: bytes,
+) -> None:
+    stream = _TrackingResponseStream(encoded_body)
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        headers = [] if content_encoding is None else [(b"content-encoding", content_encoding)]
+        return httpx.Response(200, headers=headers, stream=stream)
+
+    harness = TelegramHarness([response])
+    assert run(harness.api.get_updates(offset=0, timeout=30)) == []
+    run(harness.close())
+
+    assert stream.close_calls == 1
+
+
+def test_third_final_review_corrupt_gzip_fails_safely_and_closes_once() -> None:
+    stream = _TrackingResponseStream(b"not-a-gzip-stream")
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers=[(b"content-encoding", b"gzip")],
+            stream=stream,
+        )
+
+    harness = TelegramHarness([response])
+    with pytest.raises(TelegramApiError, match="Telegram request failed") as caught:
+        run(harness.api.get_updates(offset=0, timeout=30))
+    run(harness.close())
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert stream.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        unsupported_message(
+            video={
+                "file_id": "video-id",
+                "file_unique_id": "video-unique",
+                "width": True,
+                "height": 0,
+                "duration": "bad",
+            }
+        ),
+        unsupported_message(
+            audio={
+                "file_id": "audio-id",
+                "file_unique_id": "audio-unique",
+                "duration": False,
+            }
+        ),
+        unsupported_message(
+            document={
+                "file_id": "document-id",
+                "file_unique_id": "document-unique",
+                "thumbnail": [[] for _ in range(10_000)],
+            }
+        ),
+        unsupported_message(
+            photo=[
+                {
+                    "file_id": "photo-id",
+                    "file_unique_id": None,
+                    "width": 10,
+                    "height": 10,
+                }
+            ]
+        ),
+        unsupported_message(
+            animation={
+                "file_id": "animation-id",
+                "file_unique_id": "animation-unique",
+                "width": 10,
+                "height": 10,
+                "duration": 1,
+                "file_size": -1,
+            }
+        ),
+        unsupported_message(
+            sticker={
+                "file_id": "sticker-id",
+                "file_unique_id": "sticker-unique",
+                "type": "regular",
+                "width": 10,
+                "height": 10,
+                "is_animated": 1,
+                "is_video": False,
+            }
+        ),
+        unsupported_message(
+            sticker={
+                "file_id": "sticker-id",
+                "file_unique_id": "sticker-unique",
+                "type": ["regular"],
+                "width": 10,
+                "height": 10,
+                "is_animated": False,
+                "is_video": False,
+            }
+        ),
+        unsupported_message(
+            sticker={
+                "file_id": "sticker-id",
+                "file_unique_id": "sticker-unique",
+                "type": "mask",
+                "width": 10,
+                "height": 10,
+                "is_animated": False,
+                "is_video": False,
+                "mask_position": {
+                    "point": ["eyes"],
+                    "x_shift": 0,
+                    "y_shift": 0,
+                    "scale": 1,
+                },
+            }
+        ),
+        unsupported_message(
+            video_note={
+                "file_id": "note-id",
+                "file_unique_id": "note-unique",
+                "length": 0,
+                "duration": "bad",
+            }
+        ),
+        unsupported_message(
+            voice={
+                "file_id": "voice-id",
+                "file_unique_id": "voice-unique",
+                "duration": False,
+            }
+        ),
+        unsupported_message(
+            document={
+                "file_id": "document-id",
+                "file_unique_id": "document-unique",
+                **{f"extra_{index}": index for index in range(40)},
+            }
+        ),
+        unsupported_message(
+            video={
+                "file_id": "video-id",
+                "file_unique_id": "video-unique",
+                "width": 640,
+                "height": 480,
+                "duration": 1,
+                "cover": [
+                    {
+                        "file_id": f"cover-{index}",
+                        "file_unique_id": f"cover-unique-{index}",
+                        "width": 10,
+                        "height": 10,
+                    }
+                    for index in range(21)
+                ],
+            }
+        ),
+    ],
+)
+def test_second_final_review_media_fields_require_exact_bounded_per_type_shapes(
+    message: object,
+) -> None:
+    harness = TelegramHarness(
+        [json_response({"ok": True, "result": [{"update_id": 102, "message": message}]})]
+    )
+
+    with pytest.raises(TelegramApiError, match="invalid Telegram response shape"):
+        run(harness.api.get_updates(offset=102, timeout=30))
+    run(harness.close())

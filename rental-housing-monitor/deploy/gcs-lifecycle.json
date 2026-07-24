@@ -1,0 +1,6 @@
+{
+  "rule": [
+    {"action": {"type": "Delete"}, "condition": {"age": 8, "matchesPrefix": ["daily/"]}},
+    {"action": {"type": "Delete"}, "condition": {"age": 29, "matchesPrefix": ["weekly/"]}}
+  ]
+}
