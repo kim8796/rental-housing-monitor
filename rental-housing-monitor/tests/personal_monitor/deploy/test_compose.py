@@ -318,9 +318,10 @@ def test_squid_limits_ports_bodies_and_sensitive_logging() -> None:
     assert "http_access deny !safe_ports" in squid
     assert "request_header_access Accept-Encoding deny all" in squid
     assert "request_header_add Accept-Encoding identity" in squid
-    assert "reply_body_max_size 10485760 allow all" in squid
+    assert "reply_body_max_size 10 MB all" in squid
+    assert "reply_body_max_size 10485760 allow all" not in squid
     assert "cache deny all" in squid
-    assert "cache_dir null /tmp" in squid
+    assert "cache_dir " not in squid
     assert "access_log none" in squid
     assert "cache_log /dev/null" in squid
     assert "http_port 3128" in squid

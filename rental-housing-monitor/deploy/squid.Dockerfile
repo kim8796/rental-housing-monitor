@@ -8,5 +8,7 @@ RUN apt-get update \
 
 COPY deploy/squid.conf /etc/squid/squid.conf
 
+RUN squid -k parse -f /etc/squid/squid.conf
+
 USER proxy:proxy
 CMD ["squid", "-N", "-f", "/etc/squid/squid.conf"]
