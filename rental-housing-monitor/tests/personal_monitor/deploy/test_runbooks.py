@@ -130,7 +130,10 @@ def test_deploy_runbook_hands_private_source_archive_to_service_uid() -> None:
     text = _text(GCP_DEPLOY)
     chown = "sudo chown 10001:10001 /tmp/personal-monitor-src.tar.gz"
     chmod = "sudo chmod 0600 /tmp/personal-monitor-src.tar.gz"
-    extract = "sudo -u personal-monitor tar -xzf /tmp/personal-monitor-src.tar.gz"
+    extract = (
+        "sudo -u personal-monitor sh -c "
+        "'umask 022; exec tar -xzf /tmp/personal-monitor-src.tar.gz"
+    )
     assert chown in text
     assert chmod in text
     assert text.index(chown) < text.index(chmod) < text.index(extract)
