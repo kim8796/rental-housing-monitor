@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from personal_monitor.config import ConfigurationError, Settings
+from personal_monitor.config import BillingSettings, ConfigurationError, Settings
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
@@ -60,6 +60,45 @@ def test_blank_optional_data_go_kr_key_is_treated_as_unconfigured(tmp_path: Path
     environment["DATA_GO_KR_SERVICE_KEY"] = "legacy-runner-secret"
 
     assert Settings.from_env(environment).data_go_kr_service_key is None
+
+
+def test_billing_settings_are_optional_or_loaded_as_one_validated_unit(tmp_path: Path) -> None:
+    assert Settings.from_env(_environment(tmp_path)).billing is None
+    environment = _environment(tmp_path)
+    environment["PERSONAL_MONITOR_BILLING_PROJECT_ID"] = "local-social-native-wlk-0720"
+    environment["PERSONAL_MONITOR_BILLING_DATASET_ID"] = "billing_monitor"
+    environment["PERSONAL_MONITOR_BILLING_MAXIMUM_BYTES"] = "100000000"
+
+    settings = Settings.from_env(environment)
+
+    assert settings.billing == BillingSettings(
+        project_id="local-social-native-wlk-0720",
+        dataset_id="billing_monitor",
+        maximum_bytes_billed=100_000_000,
+    )
+    assert "local-social-native-wlk-0720" not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("PERSONAL_MONITOR_BILLING_PROJECT_ID", "INVALID_PROJECT"),
+        ("PERSONAL_MONITOR_BILLING_DATASET_ID", "bad-dataset"),
+        ("PERSONAL_MONITOR_BILLING_MAXIMUM_BYTES", "0"),
+        ("PERSONAL_MONITOR_BILLING_MAXIMUM_BYTES", "1000000001"),
+    ),
+)
+def test_invalid_billing_settings_fail_closed(tmp_path: Path, name: str, value: str) -> None:
+    environment = _environment(tmp_path)
+    environment["PERSONAL_MONITOR_BILLING_PROJECT_ID"] = "local-social-native-wlk-0720"
+    environment["PERSONAL_MONITOR_BILLING_DATASET_ID"] = "billing_monitor"
+    environment[name] = value
+
+    with pytest.raises(ConfigurationError) as caught:
+        Settings.from_env(environment)
+
+    assert name in str(caught.value)
+    assert value not in str(caught.value)
 
 
 @pytest.mark.parametrize(

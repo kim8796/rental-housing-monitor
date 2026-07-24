@@ -126,6 +126,37 @@ CREATE TABLE rental_duplicate_probe_results(
 );
 """
 
+_MIGRATION_7 = """
+CREATE TABLE billing_credit_grants(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL,
+  original_micros INTEGER NOT NULL, baseline_remaining_micros INTEGER NOT NULL,
+  starts_on TEXT NOT NULL, ends_on TEXT NOT NULL, baseline_as_of TEXT NOT NULL,
+  baseline_export_consumed_micros INTEGER,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE billing_snapshots(
+  id TEXT PRIMARY KEY, grant_id TEXT NOT NULL,
+  observed_at TEXT NOT NULL, source TEXT NOT NULL,
+  original_micros INTEGER NOT NULL, remaining_micros INTEGER NOT NULL,
+  daily_burn_micros INTEGER NOT NULL, projected_exhaustion_on TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(grant_id) REFERENCES billing_credit_grants(id)
+);
+CREATE TABLE billing_project_spend(
+  snapshot_id TEXT NOT NULL, project_id TEXT NOT NULL,
+  project_name TEXT NOT NULL, cost_micros INTEGER NOT NULL,
+  PRIMARY KEY(snapshot_id, project_id),
+  FOREIGN KEY(snapshot_id) REFERENCES billing_snapshots(id)
+);
+CREATE TABLE billing_alerts(
+  grant_id TEXT NOT NULL, alert_key TEXT NOT NULL, sent_at TEXT NOT NULL,
+  PRIMARY KEY(grant_id, alert_key),
+  FOREIGN KEY(grant_id) REFERENCES billing_credit_grants(id)
+);
+CREATE INDEX billing_snapshots_grant_observed_idx
+ON billing_snapshots(grant_id, observed_at);
+"""
+
 _MIGRATIONS = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -133,6 +164,7 @@ _MIGRATIONS = (
     (4, _MIGRATION_4),
     (5, _MIGRATION_5),
     (6, _MIGRATION_6),
+    (7, _MIGRATION_7),
 )
 
 

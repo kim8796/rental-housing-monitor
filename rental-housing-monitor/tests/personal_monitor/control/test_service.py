@@ -413,6 +413,32 @@ def test_control_service_rejects_planner_bound_to_different_action_store() -> No
     connection.close()
 
 
+def test_billing_status_intent_returns_bounded_provider_text_without_monitor_target() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    calls = 0
+
+    def billing_status() -> str:
+        nonlocal calls
+        calls += 1
+        return "☁️ GCP 크레딧\n잔액: ₩455,463.26 (98.92%)"
+
+    service = ControlService(
+        FakeIntentRouter(_intent(IntentKind.BILLING_STATUS)),
+        registry,
+        UnusedPlanner(actions),
+        actions,
+        now_source=lambda: NOW,
+        billing_status=billing_status,
+    )
+
+    reply = _run(service.handle(_request("구글 크레딧 얼마나 남았어?")))
+
+    assert reply.text == "☁️ GCP 크레딧\n잔액: ₩455,463.26 (98.92%)"
+    assert calls == 1
+    connection.close()
+
+
 def test_consumed_action_receipt_is_bound_to_service_and_claimed_once() -> None:
     registry, connection = _registry()
     issuing_actions = PendingActionService(connection)

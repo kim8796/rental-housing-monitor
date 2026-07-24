@@ -134,6 +134,35 @@ def test_exact_commands_bypass_worker(text: str, kind: IntentKind, target: str |
 
 @pytest.mark.parametrize(
     "text",
+    (
+        "구글 크레딧 얼마나 남았어?",
+        "GCP 무료 크레딧 잔액 알려줘",
+        "구글 클라우드 비용 사용량 보여줘",
+    ),
+)
+def test_common_billing_status_language_bypasses_worker(text: str) -> None:
+    router, provider, worker = _router([])
+
+    result = run(router.route(REQUEST(text)))
+
+    assert result == _result(IntentKind.BILLING_STATUS, confidence=1)
+    assert provider.calls == []
+    assert worker.calls == []
+
+
+def test_worker_billing_status_requires_no_monitor_target_or_other_fields() -> None:
+    output = _result(IntentKind.BILLING_STATUS)
+    router, provider, worker = _router([output])
+
+    result = run(router.route(REQUEST("이번 달 클라우드 쓴 돈은?")))
+
+    assert result is output
+    assert provider.calls == [OWNER]
+    assert len(worker.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
     [
         "/pause",
         "/pause  m1",

@@ -39,6 +39,7 @@ _SENSITIVE_KEY_PARTS: Final = (
 )
 _TRUSTED_EVENTS: Final = frozenset(
     {
+        "billing_iteration_failed",
         "heartbeat_iteration_failed",
         "maintenance_iteration_failed",
         "monitor_run_failed",

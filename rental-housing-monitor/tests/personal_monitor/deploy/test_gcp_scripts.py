@@ -150,9 +150,19 @@ def test_firewall_and_vm_policy_are_exact() -> None:
         "--image-project=ubuntu-os-cloud",
         "enable-oslogin=TRUE",
         "--metadata-from-file=startup-script=",
-        "--scopes=https://www.googleapis.com/auth/devstorage.read_write",
+        "--scopes=https://www.googleapis.com/auth/cloud-platform",
     ):
         assert value in text
+
+
+def test_provision_prepares_billing_export_dataset_and_least_privilege_roles() -> None:
+    text = _text(PROVISION)
+    assert "bigquery.googleapis.com" in text
+    assert 'BILLING_DATASET="billing_monitor"' in text
+    assert "--location=US" in text
+    assert "roles/bigquery.jobUser" in text
+    assert "roles/bigquery.dataViewer" in text
+    assert "gcloud projects add-iam-policy-binding" in text
 
 
 def test_existing_firewall_rules_are_described_as_json_and_validated() -> None:

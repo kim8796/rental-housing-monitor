@@ -13,6 +13,7 @@ SERVICE_ACCOUNT_NAME="personal-monitor-vm"
 SERVICE_ACCOUNT_EMAIL="personal-monitor-vm@local-social-native-wlk-0720.iam.gserviceaccount.com"
 BUCKET="gs://local-social-native-wlk-0720-personal-monitor-backups"
 BUDGET_NAME="personal-monitor-monthly-50000"
+BILLING_DATASET="billing_monitor"
 CONFIRM_EXPECTED="local-social-native-wlk-0720/personal-monitor-1"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPOSITORY_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
@@ -43,7 +44,7 @@ bind_bucket_object_user() {
 [[ $# -eq 1 ]] || fail
 [[ "${PERSONAL_MONITOR_PROVISION_CONFIRM-}" == "$CONFIRM_EXPECTED" ]] || fail
 
-for command_name in gcloud grep mktemp python3 rm sleep; do
+for command_name in bq gcloud grep mktemp python3 rm sleep; do
     command -v "$command_name" >/dev/null 2>&1 || fail
 done
 [[ -f "$LIFECYCLE_FILE" && ! -L "$LIFECYCLE_FILE" ]] || fail
@@ -166,6 +167,7 @@ fi
 
 gcloud services enable \
     compute.googleapis.com \
+    bigquery.googleapis.com \
     iap.googleapis.com \
     storage.googleapis.com \
     --project="$PROJECT" --quiet >/dev/null 2>&1 || fail
@@ -215,6 +217,38 @@ if ! gcloud iam service-accounts describe "$SERVICE_ACCOUNT_EMAIL" \
         --display-name="Personal monitor VM" \
         --quiet >/dev/null 2>&1 || fail
 fi
+
+gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+    --role=roles/bigquery.jobUser \
+    --condition=None \
+    --quiet >/dev/null 2>&1 || fail
+
+BILLING_DATASET_FILE="$WORKSPACE/billing-dataset.json"
+if bq --project_id="$PROJECT" show --format=prettyjson \
+    "$PROJECT:$BILLING_DATASET" >"$BILLING_DATASET_FILE" 2>/dev/null; then
+    python3 - "$BILLING_DATASET_FILE" "$PROJECT" "$BILLING_DATASET" <<'PY' || exit 1
+import json
+import sys
+from pathlib import Path
+
+dataset = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+reference = dataset.get("datasetReference", {})
+if (
+    reference.get("projectId") != sys.argv[2]
+    or reference.get("datasetId") != sys.argv[3]
+    or dataset.get("location") != "US"
+):
+    raise SystemExit(1)
+PY
+else
+    bq --project_id="$PROJECT" --location=US mk --dataset \
+        "$PROJECT:$BILLING_DATASET" >/dev/null 2>&1 || fail
+fi
+bq --project_id="$PROJECT" add-iam-policy-binding --dataset \
+    --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+    --role=roles/bigquery.dataViewer \
+    "$PROJECT:$BILLING_DATASET" >/dev/null 2>&1 || fail
 
 BUCKET_FILE="$WORKSPACE/bucket.json"
 if gcloud storage buckets describe "$BUCKET" \
@@ -360,7 +394,7 @@ if (
     or len(accounts) != 1
     or accounts[0].get("email") != sys.argv[2]
     or accounts[0].get("scopes")
-    != ["https://www.googleapis.com/auth/devstorage.read_write"]
+    != ["https://www.googleapis.com/auth/cloud-platform"]
     or metadata.get("enable-oslogin") != "TRUE"
     or metadata.get("block-project-ssh-keys") != "TRUE"
 ):
@@ -400,7 +434,7 @@ gcloud compute instances create "$INSTANCE_NAME" \
     --network=default \
     --tags=personal-monitor-iap \
     --service-account="$SERVICE_ACCOUNT_EMAIL" \
-    --scopes=https://www.googleapis.com/auth/devstorage.read_write \
+    --scopes=https://www.googleapis.com/auth/cloud-platform \
     --boot-disk-size=50GB \
     --boot-disk-type=pd-balanced \
     --image-family=ubuntu-2404-lts-amd64 \

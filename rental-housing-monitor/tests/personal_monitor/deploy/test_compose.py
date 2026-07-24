@@ -123,6 +123,9 @@ def test_monitor_has_explicit_mount_and_environment_allowlists() -> None:
         "PERSONAL_MONITOR_CODEX_SOCKET=/run/personal-monitor-ai/worker.sock",
         "PERSONAL_MONITOR_EGRESS_PROXY=http://egress-proxy:3128",
         "PERSONAL_MONITOR_TIMEZONE=Asia/Seoul",
+        "PERSONAL_MONITOR_BILLING_PROJECT_ID=local-social-native-wlk-0720",
+        "PERSONAL_MONITOR_BILLING_DATASET_ID=billing_monitor",
+        "PERSONAL_MONITOR_BILLING_MAXIMUM_BYTES=100000000",
         "${PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY}",
         "${PERSONAL_MONITOR_TELEGRAM_BOT_TOKEN}",
     ):

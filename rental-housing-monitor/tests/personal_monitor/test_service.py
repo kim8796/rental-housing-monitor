@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -29,6 +29,7 @@ from personal_monitor.service import (
     PersonalMonitorService,
     ServiceFailure,
     TelegramDeliverySender,
+    next_billing_run,
     next_maintenance_run,
 )
 from personal_monitor.storage.runtime import MonitorLease
@@ -114,6 +115,18 @@ class StopHeartbeat:
         self.service.request_stop()
 
 
+class FakeBilling:
+    def __init__(self) -> None:
+        self.sync_calls: list[datetime] = []
+        self.summary_calls: list[datetime] = []
+
+    async def sync(self, *, now: datetime) -> None:
+        self.sync_calls.append(now)
+
+    async def send_summary(self, *, now: datetime) -> None:
+        self.summary_calls.append(now)
+
+
 class CloseTracker:
     def __init__(self) -> None:
         self.closed = 0
@@ -172,6 +185,41 @@ def test_null_delivery_never_calls_remote_and_returns_stable_nonempty_id() -> No
 
     assert first == second
     assert first
+
+
+def test_billing_loop_runs_sync_then_summary_at_exact_kst_times() -> None:
+    current = datetime(2026, 7, 24, 3, 9, 59, tzinfo=UTC)
+    billing = FakeBilling()
+    service: PersonalMonitorService
+
+    async def advance(delay: float) -> None:
+        nonlocal current
+        current += timedelta(seconds=delay)
+        if len(billing.summary_calls) == 1:
+            service.request_stop()
+        await asyncio.sleep(0)
+
+    service = PersonalMonitorService(
+        telegram_api=FakeTelegram(),
+        telegram_gateway=FakeGateway(),
+        scheduler=FakeScheduler(),
+        runner=FakeRunner(),
+        outbox=FakePeriodic(),
+        maintenance=FakePeriodic(),
+        heartbeat=StopHeartbeat(),
+        billing=billing,
+        clock=lambda: current,
+        sleeper=advance,
+    )
+
+    asyncio.run(service._billing_loop())
+
+    assert billing.sync_calls == [datetime(2026, 7, 24, 3, 10, tzinfo=UTC)]
+    assert billing.summary_calls == [datetime(2026, 7, 24, 3, 20, tzinfo=UTC)]
+    assert next_billing_run(
+        datetime(2026, 7, 24, 3, 20, tzinfo=UTC),
+        ZoneInfo("Asia/Seoul"),
+    )[0] == datetime(2026, 7, 25, 3, 10, tzinfo=UTC)
 
 
 def _composed_runner(

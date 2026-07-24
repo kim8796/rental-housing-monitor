@@ -44,6 +44,8 @@ class ControlService:
         "_actions_anchor",
         "_actions_methods_anchor",
         "_claim_anchor",
+        "_billing_status",
+        "_billing_status_anchor",
         "_connection_anchor",
         "_now_source",
         "_now_source_anchor",
@@ -69,6 +71,7 @@ class ControlService:
         actions: PendingActionService,
         *,
         now_source: object = utc_now,
+        billing_status: object | None = None,
     ) -> None:
         if (
             type(registry) is not RegistryRepository
@@ -108,6 +111,9 @@ class ControlService:
                 )
             )
             now_call = _capture_callable(now_source)
+            billing_status_call = (
+                _capture_callable(billing_status) if billing_status is not None else None
+            )
             if (
                 not callable(route)
                 or not callable(propose)
@@ -143,6 +149,8 @@ class ControlService:
         object.__setattr__(self, "_now_source", now_source)
         object.__setattr__(self, "_now_source_anchor", now_source)
         object.__setattr__(self, "_now_call_anchor", now_call)
+        object.__setattr__(self, "_billing_status", billing_status)
+        object.__setattr__(self, "_billing_status_anchor", billing_status_call)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("ControlService composition is sealed")
@@ -201,6 +209,8 @@ class ControlService:
             return self._clarification(safe_request.owner_id)
         if fresh.kind is IntentKind.LIST:
             return self._list_reply(safe_request.owner_id)
+        if fresh.kind is IntentKind.BILLING_STATUS:
+            return self._billing_status_reply()
         if fresh.kind is IntentKind.CREATE:
             return await self._create_preview(safe_request, fresh)
         if len(fresh.target_monitor_ids) != 1:
@@ -238,6 +248,18 @@ class ControlService:
         if action.action == "repair_activation":
             return self._confirm_repair(action, owner_id)
         return ControlReply(_SAFE_FAILURE)
+
+    def _billing_status_reply(self) -> ControlReply:
+        anchor = self._billing_status_anchor
+        if anchor is None or not self._integrity_ok():
+            return ControlReply(_SAFE_FAILURE)
+        try:
+            text = anchor[3]()
+            if type(text) is not str or not 1 <= len(text) <= 3_500:
+                raise ValueError
+            return ControlReply(text)
+        except Exception:
+            return ControlReply(_SAFE_FAILURE)
 
     async def _create_preview(
         self,
@@ -628,6 +650,17 @@ class ControlService:
                 and self._planner is self._planner_anchor
                 and self._actions is self._actions_anchor
                 and self._now_source is self._now_source_anchor
+                and (
+                    (self._billing_status is None and self._billing_status_anchor is None)
+                    or (
+                        self._billing_status is not None
+                        and self._billing_status_anchor is not None
+                        and _captured_callable_intact(
+                            self._billing_status,
+                            self._billing_status_anchor,
+                        )
+                    )
+                )
                 and self._registry_anchor.connection is self._connection_anchor
                 and self._actions_anchor.connection is self._connection_anchor
                 and self._planner_anchor.action_service is self._actions_anchor

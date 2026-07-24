@@ -41,6 +41,7 @@ class IntentKind(StrEnum):
     RESUME = "resume"
     DELETE = "delete"
     STATUS = "status"
+    BILLING_STATUS = "billing_status"
     UNKNOWN = "unknown"
 
 

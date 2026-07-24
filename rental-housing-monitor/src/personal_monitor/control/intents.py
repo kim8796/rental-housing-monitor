@@ -42,6 +42,15 @@ _FAILED_CLARIFICATION: Final = "요청을 이해하지 못했습니다"
 _MAX_MONITORS: Final = 100
 _MAX_NAME: Final = 300
 _MAX_CLARIFICATION: Final = 500
+_BILLING_CLOUD_TERMS: Final = ("gcp", "구글 클라우드", "google cloud", "구글")
+_BILLING_STATUS_TERMS: Final = (
+    "크레딧",
+    "credit",
+    "잔액",
+    "비용",
+    "사용량",
+    "사용액",
+)
 
 
 class IntentRouterError(RuntimeError):
@@ -138,6 +147,8 @@ class IntentRouter:
             return _action(_COMMAND_KINDS[matched.group(1)], targets=[target])
         if _looks_like_command(normalized):
             return _clarification(_COMMAND_CLARIFICATION)
+        if _looks_like_billing_status(normalized):
+            return _action(IntentKind.BILLING_STATUS)
 
         summaries = self._summaries(request.owner_id)
         intent_request: IntentRequest | None = None
@@ -375,7 +386,7 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
     targets = value.target_monitor_ids
     if any(target not in owned_ids for target in targets):
         return _Validation.INVALID
-    if value.kind in {IntentKind.CREATE, IntentKind.LIST} and targets:
+    if value.kind in {IntentKind.CREATE, IntentKind.LIST, IntentKind.BILLING_STATUS} and targets:
         return _Validation.INVALID
     if (
         value.kind
@@ -397,7 +408,7 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
         semantically_valid = False
     elif value.kind is IntentKind.UPDATE:
         semantically_valid = value.condition_text is not None or value.schedule_text is not None
-    elif value.kind is IntentKind.LIST or value.kind in {
+    elif value.kind in {IntentKind.LIST, IntentKind.BILLING_STATUS} or value.kind in {
         IntentKind.PAUSE,
         IntentKind.RESUME,
         IntentKind.DELETE,
@@ -411,6 +422,13 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
     if value.clarification is not None:
         return _Validation.INVALID
     return _Validation.ACCEPT
+
+
+def _looks_like_billing_status(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return any(term in normalized for term in _BILLING_CLOUD_TERMS) and any(
+        term in normalized for term in _BILLING_STATUS_TERMS
+    )
 
 
 def _safe_http_url(value: object) -> bool:

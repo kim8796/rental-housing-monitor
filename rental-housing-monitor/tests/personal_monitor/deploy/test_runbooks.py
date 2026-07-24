@@ -186,6 +186,22 @@ def test_deploy_runbook_has_separate_health_checks() -> None:
         assert value in text
 
 
+def test_deploy_runbook_configures_and_seeds_gcp_billing_monitor() -> None:
+    text = _text(GCP_DEPLOY)
+    for value in (
+        "PERSONAL_MONITOR_BILLING_PROJECT_ID=local-social-native-wlk-0720",
+        "PERSONAL_MONITOR_BILLING_DATASET_ID=billing_monitor",
+        "PERSONAL_MONITOR_BILLING_MAXIMUM_BYTES=100000000",
+        "Cloud Billing Standard usage export",
+        "personal-monitor billing register-credit",
+        "--original-won 460418.00",
+        "--remaining-won 455145.36",
+        "--starts-on 2026-07-08",
+        "--ends-on 2026-10-08",
+    ):
+        assert value in text
+
+
 def test_restore_runbook_uses_off_server_identity_and_empty_target() -> None:
     text = _text(BACKUP_RESTORE)
     for value in (
@@ -262,6 +278,7 @@ def test_documented_personal_monitor_command_groups_parse_help() -> None:
     commands = (
         ("database", "init"),
         ("database", "integrity-check"),
+        ("billing", "register-credit"),
         ("migration", "import-rental"),
         ("migration", "shadow-run"),
         ("migration", "duplicate-probe"),

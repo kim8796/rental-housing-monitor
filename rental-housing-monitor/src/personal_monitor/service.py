@@ -15,6 +15,7 @@ from datetime import time as datetime_time
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from personal_monitor.billing.service import next_billing_run
 from personal_monitor.storage.runtime import MonitorLease
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ def _valid_local_time(day: date, timezone: ZoneInfo) -> datetime | None:
 
 
 class PersonalMonitorService:
-    """Own the five long-running personal-monitor loops and their shutdown boundary."""
+    """Own the long-running personal-monitor loops and their shutdown boundary."""
 
     def __init__(
         self,
@@ -108,6 +109,7 @@ class PersonalMonitorService:
         outbox: object,
         maintenance: object,
         heartbeat: object,
+        billing: object | None = None,
         resources: Iterable[object] = (),
         timezone: ZoneInfo | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -127,6 +129,11 @@ class PersonalMonitorService:
             (maintenance, "run"),
             (heartbeat, "beat"),
         )
+        if billing is not None:
+            dependencies += (
+                (billing, "sync"),
+                (billing, "send_summary"),
+            )
         if any(not callable(getattr(owner, name, None)) for owner, name in dependencies):
             raise TypeError("invalid service dependency")
         self.telegram_api = telegram_api
@@ -136,6 +143,7 @@ class PersonalMonitorService:
         self.outbox = outbox
         self.maintenance = maintenance
         self.heartbeat = heartbeat
+        self.billing = billing
         self.resources = tuple(resources)
         self.timezone = timezone or ZoneInfo("Asia/Seoul")
         self.clock = clock or (lambda: datetime.now(UTC))
@@ -203,13 +211,18 @@ class PersonalMonitorService:
                 await self.telegram_api.ensure_webhook_disabled()
                 async with asyncio.TaskGroup() as group:
                     self._task_group = group
-                    periodic = (
+                    periodic_tasks = [
                         group.create_task(self._telegram_loop(), name="telegram-poller"),
                         group.create_task(self._scheduler_loop(), name="scheduler"),
                         group.create_task(self._outbox_loop(), name="outbox"),
                         group.create_task(self._maintenance_loop(), name="maintenance"),
                         group.create_task(self._heartbeat_loop(), name="heartbeat"),
-                    )
+                    ]
+                    if self.billing is not None:
+                        periodic_tasks.append(
+                            group.create_task(self._billing_loop(), name="billing")
+                        )
+                    periodic = tuple(periodic_tasks)
                     await self._stop_event.wait()
                     for task in periodic:
                         task.cancel()
@@ -346,6 +359,28 @@ class PersonalMonitorService:
                 failures = _component_failure("heartbeat_iteration_failed", error, failures)
             deadline = _next_deadline(deadline, 60.0, self.monotonic())
             await self.sleeper(max(0.0, deadline - self.monotonic()))
+
+    async def _billing_loop(self) -> None:
+        if self.billing is None:
+            return
+        while not self.stopping:
+            now = self._now()
+            scheduled, kind = next_billing_run(now, self.timezone)
+            delay = max(0.0, (scheduled - now).total_seconds())
+            deadline = self.monotonic() + delay
+            await self.sleeper(max(0.0, deadline - self.monotonic()))
+            if self.stopping:
+                return
+            try:
+                run_now = self._now()
+                if kind == "sync":
+                    await self.billing.sync(now=run_now)
+                else:
+                    await self.billing.send_summary(now=run_now)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _safe_log("billing_iteration_failed", error)
 
     def _start_monitor(self, lease: object) -> None:
         if self.stopping or type(lease) is not MonitorLease or self._task_group is None:
@@ -732,6 +767,7 @@ def build_service(settings: object) -> PersonalMonitorService:
     connection = open_database(settings.database_path)
     telegram = None
     component_resources: tuple[object, ...] = ()
+    billing_resources: tuple[object, ...] = ()
     try:
         _prepare_personal_identity(
             connection,
@@ -759,7 +795,37 @@ def build_service(settings: object) -> PersonalMonitorService:
             worker,
             actions,
         )
-        control = ControlService(router, registry, planner, actions)
+        billing = None
+        billing_settings = getattr(settings, "billing", None)
+        if billing_settings is not None:
+            from personal_monitor.billing import BillingRepository
+            from personal_monitor.billing.bigquery import (
+                BigQueryBillingSource,
+                MetadataTokenProvider,
+            )
+            from personal_monitor.billing.service import BillingCoordinator
+
+            token_provider = MetadataTokenProvider()
+            billing_source = BigQueryBillingSource(
+                billing_settings.project_id,
+                billing_settings.dataset_id,
+                token_provider,
+                maximum_bytes_billed=billing_settings.maximum_bytes_billed,
+            )
+            billing_resources = (billing_source, token_provider)
+            billing = BillingCoordinator(
+                BillingRepository(connection),
+                billing_source,
+                delivery,
+                backup_status_path=settings.backup_status_path,
+            )
+        control = ControlService(
+            router,
+            registry,
+            planner,
+            actions,
+            billing_status=billing.render_status if billing is not None else None,
+        )
         gateway = TelegramGateway(
             settings.telegram_user_id,
             settings.command_chat_id,
@@ -787,13 +853,18 @@ def build_service(settings: object) -> PersonalMonitorService:
             outbox=outbox,
             maintenance=Maintenance(connection),
             heartbeat=heartbeat,
-            resources=(telegram, *component_resources, connection),
+            billing=billing,
+            resources=(telegram, *component_resources, *billing_resources, connection),
             timezone=settings.timezone,
         )
         state["service"] = service
         return service
     except BaseException:
-        for resource in ((telegram,) if telegram is not None else ()) + component_resources:
+        for resource in (
+            ((telegram,) if telegram is not None else ())
+            + component_resources
+            + billing_resources
+        ):
             with suppress(BaseException):
                 close = getattr(resource, "aclose", None)
                 if callable(close):
