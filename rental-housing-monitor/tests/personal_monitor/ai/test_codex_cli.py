@@ -409,6 +409,21 @@ def test_contracts_forbid_extra_and_redact_user_content() -> None:
         )
 
 
+def test_intent_output_schema_is_strict_structured_output_compatible() -> None:
+    schema = IntentResult.model_json_schema()
+    properties = schema["properties"]
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(properties)
+    for name in (
+        "target_url",
+        "condition_text",
+        "schedule_text",
+        "clarification",
+    ):
+        assert {"type": "null"} in properties[name]["anyOf"]
+
+
 @async_test
 @pytest.mark.parametrize("kind", ["intent", "plan", "repair"])
 async def test_all_three_request_result_pairs_use_fixed_prompts(tmp_path: Path, kind: str) -> None:
