@@ -101,9 +101,14 @@ def _encode(value: object) -> bytes:
     return len(payload).to_bytes(4, "big") + payload
 
 
-async def _read_frame(reader: asyncio.StreamReader) -> object:
+async def _read_frame(
+    reader: asyncio.StreamReader,
+    *,
+    header_timeout: float | None = None,
+) -> object:
     try:
-        header = await asyncio.wait_for(reader.readexactly(4), _READ_TIMEOUT)
+        timeout = _READ_TIMEOUT if header_timeout is None else header_timeout
+        header = await asyncio.wait_for(reader.readexactly(4), timeout)
         size = int.from_bytes(header, "big")
         if size < 1 or size > MAX_FRAME_BYTES:
             raise CodexWorkerError
@@ -455,7 +460,7 @@ class CodexWorkerClient:
             if not writer.can_write_eof():
                 raise CodexWorkerError
             writer.write_eof()
-            value = await _read_frame(reader)
+            value = await _read_frame(reader, header_timeout=_CLIENT_TIMEOUT)
         finally:
             await _shielded_close_writer(writer)
         _scan_secrets(value)
