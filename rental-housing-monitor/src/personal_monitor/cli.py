@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import asdict
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -44,6 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance = sub.add_parser("maintenance")
     maintenance.add_argument("action", choices=("run",))
     maintenance.add_argument("--database", type=Path, required=True)
+    billing = sub.add_parser("billing")
+    billing_subcommands = billing.add_subparsers(dest="billing_action", required=True)
+    register_credit = billing_subcommands.add_parser("register-credit")
+    register_credit.add_argument("--database", type=Path, required=True)
+    register_credit.add_argument("--id", required=True)
+    register_credit.add_argument("--name", required=True)
+    register_credit.add_argument("--original-won", required=True)
+    register_credit.add_argument("--remaining-won", required=True)
+    register_credit.add_argument("--starts-on", required=True)
+    register_credit.add_argument("--ends-on", required=True)
+    register_credit.add_argument("--as-of", required=True)
     profile = sub.add_parser("profile")
     profile.add_argument("action", choices=("bootstrap",))
     profile.add_argument("--id", dest="profile_id", required=True)
@@ -93,6 +105,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _database(arguments.action, arguments.path)
     if arguments.command == "maintenance":
         return _maintenance(arguments.database)
+    if arguments.command == "billing":
+        return _billing_register_credit(
+            arguments.database,
+            arguments.id,
+            arguments.name,
+            arguments.original_won,
+            arguments.remaining_won,
+            arguments.starts_on,
+            arguments.ends_on,
+            arguments.as_of,
+        )
     if arguments.command == "profile":
         try:
             _profile_bootstrap_command(
@@ -205,6 +228,65 @@ def _maintenance(path: Path) -> int:
     finally:
         if connection is not None:
             connection.close()
+
+
+def _billing_register_credit(
+    database: Path,
+    grant_id: str,
+    name: str,
+    original_won: str,
+    remaining_won: str,
+    starts_on: str,
+    ends_on: str,
+    as_of: str,
+) -> int:
+    from personal_monitor.billing import BillingRepository, CreditGrant
+
+    connection: sqlite3.Connection | None = None
+    try:
+        original_micros = _won_micros(original_won, positive=True)
+        remaining_micros = _won_micros(remaining_won, positive=False)
+        started = date.fromisoformat(starts_on)
+        ended = date.fromisoformat(ends_on)
+        observed = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+        if observed.tzinfo is None or observed.utcoffset() is None:
+            raise ValueError
+        connection = open_existing_database(database)
+        BillingRepository(connection).register_grant(
+            CreditGrant(
+                id=grant_id,
+                name=name,
+                original_micros=original_micros,
+                baseline_remaining_micros=remaining_micros,
+                starts_on=started,
+                ends_on=ended,
+                baseline_as_of=observed,
+            )
+        )
+        print("billing credit registered")
+        return 0
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
+        print("billing credit registration failed", file=sys.stderr)
+        return 1
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _won_micros(value: object, *, positive: bool) -> int:
+    if type(value) is not str or not 1 <= len(value) <= 64:
+        raise ValueError
+    try:
+        amount = Decimal(value)
+        micros = amount * 1_000_000
+    except InvalidOperation:
+        raise ValueError from None
+    if not amount.is_finite() or micros != micros.to_integral_value():
+        raise ValueError
+    result = int(micros)
+    if result < (1 if positive else 0) or result > 2**63 - 1:
+        raise ValueError
+    return result
 
 
 class _SystemResolver:

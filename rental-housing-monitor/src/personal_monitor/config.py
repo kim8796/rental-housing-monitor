@@ -11,6 +11,8 @@ from personal_monitor.security.egress import EgressProxyPolicy
 
 _POSITIVE_INTEGER = re.compile(r"[1-9][0-9]{0,18}\Z")
 _SIGNED_INTEGER = re.compile(r"-?[1-9][0-9]{0,18}\Z")
+_GCP_PROJECT_ID = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
+_BIGQUERY_DATASET_ID = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
 _MAX_TELEGRAM_ID = 2**63 - 1
 
 
@@ -21,6 +23,27 @@ class ConfigurationError(RuntimeError):
 
     def __repr__(self) -> str:
         return "ConfigurationError(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class BillingSettings:
+    project_id: str
+    dataset_id: str
+    maximum_bytes_billed: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.project_id) is not str
+            or _GCP_PROJECT_ID.fullmatch(self.project_id) is None
+            or type(self.dataset_id) is not str
+            or _BIGQUERY_DATASET_ID.fullmatch(self.dataset_id) is None
+            or type(self.maximum_bytes_billed) is not int
+            or not 1 <= self.maximum_bytes_billed <= 1_000_000_000
+        ):
+            raise ValueError("invalid billing settings")
+
+    def __repr__(self) -> str:
+        return "BillingSettings(<redacted>)"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -40,6 +63,7 @@ class Settings:
     timezone: ZoneInfo
     backup_status_path: Path
     data_go_kr_service_key: str | None = None
+    billing: BillingSettings | None = None
 
     def __repr__(self) -> str:
         return (
@@ -49,7 +73,8 @@ class Settings:
             "egress_proxy=<redacted>, database_path=<redacted>, "
             "profiles_root=<redacted>, diagnostics_root=<redacted>, "
             "adaptive_root=<redacted>, log_path=<redacted>, timezone=<redacted>, "
-            "backup_status_path=<redacted>, data_go_kr_service_key=<redacted>)"
+            "backup_status_path=<redacted>, data_go_kr_service_key=<redacted>, "
+            "billing=<redacted>)"
         )
 
     @classmethod
@@ -67,6 +92,7 @@ class Settings:
             values,
             "PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY",
         )
+        billing = _billing_settings(values)
         database_path = _optional_path(
             values,
             "PERSONAL_MONITOR_DATABASE_PATH",
@@ -122,6 +148,7 @@ class Settings:
             timezone=timezone,
             backup_status_path=backup_status_path,
             data_go_kr_service_key=data_go_kr_service_key,
+            billing=billing,
         )
 
 
@@ -203,3 +230,29 @@ def _validate_proxy(value: str, name: str) -> None:
         EgressProxyPolicy.from_url(value)
     except (TypeError, ValueError):
         raise ConfigurationError(f"{name}: value must be a valid proxy URL") from None
+
+
+def _billing_settings(values: Mapping[str, str]) -> BillingSettings | None:
+    project_name = "PERSONAL_MONITOR_BILLING_PROJECT_ID"
+    dataset_name = "PERSONAL_MONITOR_BILLING_DATASET_ID"
+    maximum_name = "PERSONAL_MONITOR_BILLING_MAXIMUM_BYTES"
+    project = values.get(project_name, "")
+    dataset = values.get(dataset_name, "")
+    maximum = values.get(maximum_name, "100000000")
+    if project == "" and dataset == "":
+        return None
+    if type(project) is not str or _GCP_PROJECT_ID.fullmatch(project) is None:
+        raise ConfigurationError(f"{project_name}: value is invalid")
+    if type(dataset) is not str or _BIGQUERY_DATASET_ID.fullmatch(dataset) is None:
+        raise ConfigurationError(f"{dataset_name}: value is invalid")
+    if (
+        type(maximum) is not str
+        or not maximum.isascii()
+        or not maximum.isdigit()
+        or maximum.startswith("0")
+    ):
+        raise ConfigurationError(f"{maximum_name}: value is invalid")
+    parsed = int(maximum)
+    if not 1 <= parsed <= 1_000_000_000:
+        raise ConfigurationError(f"{maximum_name}: value is invalid")
+    return BillingSettings(project, dataset, parsed)

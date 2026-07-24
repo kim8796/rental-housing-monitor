@@ -74,6 +74,89 @@ def test_database_init_applies_migrations_and_closes_connection(tmp_path: Path) 
         connection.close()
 
 
+def test_billing_register_credit_seeds_exact_console_baseline_idempotently(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database_path = tmp_path / "monitor.sqlite3"
+    assert main(["database", "init", "--path", str(database_path)]) == 0
+    command = [
+        "billing",
+        "register-credit",
+        "--database",
+        str(database_path),
+        "--id",
+        "free-trial",
+        "--name",
+        "Free Trial",
+        "--original-won",
+        "460418.00",
+        "--remaining-won",
+        "455463.26",
+        "--starts-on",
+        "2026-07-08",
+        "--ends-on",
+        "2026-10-08",
+        "--as-of",
+        "2026-07-24T03:10:00Z",
+    ]
+
+    assert main(command) == 0
+    assert main(command) == 0
+
+    connection = sqlite3.connect(database_path)
+    try:
+        assert connection.execute(
+            "SELECT original_micros, baseline_remaining_micros "
+            "FROM billing_credit_grants WHERE id = 'free-trial'"
+        ).fetchone() == (460_418_000_000, 455_463_260_000)
+        assert connection.execute("SELECT count(*) FROM billing_snapshots").fetchone() == (1,)
+    finally:
+        connection.close()
+    captured = capsys.readouterr()
+    assert captured.out == "billing credit registered\nbilling credit registered\n"
+
+
+def test_billing_register_credit_rejects_non_exact_money_without_echo(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database_path = tmp_path / "monitor.sqlite3"
+    assert main(["database", "init", "--path", str(database_path)]) == 0
+    secret = "NaN-private"
+
+    assert (
+        main(
+            [
+                "billing",
+                "register-credit",
+                "--database",
+                str(database_path),
+                "--id",
+                "free-trial",
+                "--name",
+                "Free Trial",
+                "--original-won",
+                secret,
+                "--remaining-won",
+                "455463.26",
+                "--starts-on",
+                "2026-07-08",
+                "--ends-on",
+                "2026-10-08",
+                "--as-of",
+                "2026-07-24T03:10:00Z",
+            ]
+        )
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "billing credit registration failed\n"
+    assert secret not in captured.err
+
+
 def test_database_integrity_check_returns_safe_nonzero_for_failure(
     monkeypatch, tmp_path: Path, capsys
 ) -> None:

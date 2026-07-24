@@ -24,9 +24,15 @@ export PERSONAL_MONITOR_PROVISION_CONFIRM=local-social-native-wlk-0720/personal-
 bash infra/gcp/provision.sh --apply
 ```
 
-스크립트는 월 50,000원 예산을 먼저 검증하거나 생성한 다음 API, 서비스 계정, 백업
-버킷, 방화벽, VM을 순서대로 준비한다. 같은 설정이 이미 있으면 재사용하고, 동일 이름의
-리소스가 다른 설정이면 중단한다.
+스크립트는 월 50,000원 예산을 먼저 검증하거나 생성한 다음 API, 서비스 계정,
+US 멀티 리전 BigQuery `billing_monitor` 데이터셋, 백업 버킷, 방화벽, VM을 순서대로
+준비한다. VM 서비스 계정에는 BigQuery job 실행·조회 역할을 부여하고 VM OAuth
+scope는 `cloud-platform`으로 제한 위임한다. 같은 설정이 이미 있으면 재사용하고,
+동일 이름의 리소스가 다른 설정이면 중단한다.
+
+데이터셋 생성 뒤 Google Cloud 콘솔에서 **Cloud Billing Standard usage export**의
+대상으로 `local-social-native-wlk-0720.billing_monitor`를 한 번 선택해야 한다.
+결제 내보내기 설정은 이 스크립트가 대신 변경하지 않는다.
 
 생성되는 VM은 IAP 대역의 SSH만 허용하고 공개 애플리케이션 포트는 열지 않는다.
 `startup.sh`는 Docker와 호스트 디렉터리만 준비하며 자격증명, Codex 로그인 정보,

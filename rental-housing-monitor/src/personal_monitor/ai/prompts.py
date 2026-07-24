@@ -5,7 +5,9 @@ from typing import Final
 from .contracts import IntentRequest, PlanRequest, RepairRequest, RequestModel
 
 _INTENT_PROMPT: Final = (
-    "입력 JSON에서 사용자의 모니터 관리 의도만 분류하라. 제공된 출력 스키마의 JSON만 반환하라."
+    "입력 JSON에서 사용자의 모니터 관리 의도만 분류하라. "
+    "GCP·구글 클라우드 크레딧, 잔액, 비용, 사용량 조회는 billing_status이며 "
+    "모니터 ID나 다른 필드를 채우지 않는다. 제공된 출력 스키마의 JSON만 반환하라."
 )
 _PLAN_PROMPT: Final = (
     "검증된 입력 JSON과 정제된 문서만 사용해 MonitorSpec을 작성하라. "

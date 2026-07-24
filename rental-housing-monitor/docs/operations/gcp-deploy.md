@@ -68,6 +68,9 @@ PERSONAL_MONITOR_TELEGRAM_USER_ID=<허용할 Telegram 사용자 숫자 ID>
 PERSONAL_MONITOR_TELEGRAM_COMMAND_CHAT_ID=<명령 채팅 숫자 ID>
 PERSONAL_MONITOR_TELEGRAM_DELIVERY_CHAT_ID=<알림 채팅 숫자 ID>
 PERSONAL_MONITOR_DATA_GO_KR_SERVICE_KEY=<공공데이터포털 Decoding 키>
+PERSONAL_MONITOR_BILLING_PROJECT_ID=local-social-native-wlk-0720
+PERSONAL_MONITOR_BILLING_DATASET_ID=billing_monitor
+PERSONAL_MONITOR_BILLING_MAXIMUM_BYTES=100000000
 AGE_RECIPIENT=<오프서버 identity의 공개 recipient>
 PERSONAL_MONITOR_BACKUP_BUCKET=gs://local-social-native-wlk-0720-personal-monitor-backups
 ```
@@ -85,7 +88,29 @@ ChatGPT Pro의 Codex 로그인을 사용하므로 `OPENAI_API_KEY`와 `CODEX_API
 sudo personal-monitor-compose build
 sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor database init --path /srv/personal-monitor/db/monitor.db
+sudo personal-monitor-compose run --rm --no-deps monitor \
+  personal-monitor billing register-credit \
+  --database /srv/personal-monitor/db/monitor.db \
+  --id free-trial \
+  --name "Free Trial" \
+  --original-won 460418.00 \
+  --remaining-won 455463.26 \
+  --starts-on 2026-07-08 \
+  --ends-on 2026-10-08 \
+  --as-of 2026-07-24T03:10:00Z
 ```
+
+인프라 스크립트는 US 멀티 리전 `billing_monitor` 데이터셋과 VM 서비스 계정의
+BigQuery 조회 권한을 만든다. Google Cloud 콘솔의 **결제 → 결제 내보내기 →
+BigQuery 내보내기**에서 **Cloud Billing Standard usage export**를 편집해 프로젝트
+`local-social-native-wlk-0720`, 데이터셋 `billing_monitor`를 선택하고 저장한다.
+내보내기 테이블이 생성될 때까지는 위 콘솔 기준 잔액이 표시되며, 생성 후 첫 동기화가
+그 시점의 누적 차감액을 기준점으로 고정한다.
+
+크레딧 동기화는 매일 12:10 KST, 잔액·프로젝트별 사용액 요약은 12:20 KST다.
+잔액 30%/10%/5%, 만료 30일/7일/1일, 예상 30일 이내 소진은 별도 경보한다.
+10% 이하는 백업 검증과 재연결 체크리스트를 보여주지만 사용자 승인 전에 서버를
+자동 이전하지 않는다.
 
 인증되지 않은 `codex-worker`는 의도적으로 시작을 거부한다. 따라서 먼저 일회성
 컨테이너에서 사용자 본인이 `codex login --device-auth`를 완료한 뒤 worker를
