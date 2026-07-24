@@ -1526,6 +1526,7 @@ def _rental_spec(owner_id: str) -> MonitorSpec:
             max_items=10_000,
             allowed_link_domains=(
                 "apply.lh.or.kr",
+                "apply.gh.or.kr",
                 "www.gh.or.kr",
                 "www.i-sh.co.kr",
             ),

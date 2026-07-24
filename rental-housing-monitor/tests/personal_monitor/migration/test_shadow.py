@@ -35,6 +35,12 @@ SEOUL_TODAY = date(2026, 7, 30)
 STATUSES = {"LH": "ok", "SH": "ok", "GH": "ok"}
 
 
+def test_rental_spec_allows_current_official_gh_application_host() -> None:
+    spec = _rental_spec("telegram-user:1")
+
+    assert "apply.gh.or.kr" in spec.validators.allowed_link_domains
+
+
 def snapshot(
     *item_ids: str,
     statuses: dict[str, str] | None = None,
