@@ -186,6 +186,29 @@ async def test_worker_socket_happy_path_permissions_and_busy_rejection() -> None
 
 
 @async_test
+async def test_client_waits_for_model_response_beyond_request_frame_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory, socket_path = short_socket_path()
+    harness = SecureHarness(directory)
+    server = CodexWorkerServer(
+        socket_path,
+        harness.cli,
+        auth_check=harness.guard.check,
+    )
+    monkeypatch.setattr("personal_monitor.ai.worker._READ_TIMEOUT", 0.01)
+    await server.start()
+    try:
+        result = await CodexWorkerClient(socket_path).run(intent())
+        assert isinstance(result, IntentResult)
+        assert result.kind is IntentKind.CREATE
+        assert harness.exec_calls == 1
+    finally:
+        await server.close()
+        shutil.rmtree(directory)
+
+
+@async_test
 @pytest.mark.parametrize("length", [0, 256 * 1024 + 1])
 async def test_worker_rejects_invalid_frame_without_codex(length: int) -> None:
     directory, socket_path = short_socket_path()
