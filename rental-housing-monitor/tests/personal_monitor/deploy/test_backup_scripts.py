@@ -243,6 +243,7 @@ def test_backup_rejects_links_and_special_files_without_mutating_live_tree(
 
 def test_backup_uses_deterministic_tar_and_closed_manifest(backup_text: str) -> None:
     for flag in (
+        "--create",
         "--sort=name",
         "--mtime=@0",
         "--owner=0",

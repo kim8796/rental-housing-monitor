@@ -502,6 +502,7 @@ PY
 
 tar_stream() {
     tar \
+        --create \
         --sort=name \
         --mtime=@0 \
         --owner=0 \
