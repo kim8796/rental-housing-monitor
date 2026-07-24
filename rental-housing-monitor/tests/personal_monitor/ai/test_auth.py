@@ -93,6 +93,18 @@ async def test_auth_uses_exact_argv_and_scrubbed_environment(tmp_path: Path) -> 
 
 
 @async_test
+async def test_auth_accepts_exact_chatgpt_status_on_stderr(tmp_path: Path) -> None:
+    home = tmp_path / "codex"
+    home.mkdir(mode=0o700)
+
+    async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
+        return FakeProcess(b"", b"Logged in using ChatGPT\n")
+
+    guard = CodexAuthGuard("/usr/bin/true", home, process_factory=spawn)
+    await guard.check()
+
+
+@async_test
 @pytest.mark.parametrize(
     ("stdout", "returncode"),
     [

@@ -188,9 +188,15 @@ class CodexAuthGuard:
                     env=env,
                     start_new_session=True,
                 )
-                stdout, _stderr, returncode = await _wait_status(process)
-            if returncode != 0 or stdout.decode("utf-8", "strict").strip() != (
-                "Logged in using ChatGPT"
+                stdout, stderr, returncode = await _wait_status(process)
+            status_channels = (
+                stdout.decode("utf-8", "strict").strip(),
+                stderr.decode("utf-8", "strict").strip(),
+            )
+            expected = "Logged in using ChatGPT"
+            if returncode != 0 or status_channels not in (
+                (expected, ""),
+                ("", expected),
             ):
                 raise CodexAuthError(_AUTH_ERROR)
         except asyncio.CancelledError:
