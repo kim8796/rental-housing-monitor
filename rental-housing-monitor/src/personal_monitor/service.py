@@ -571,6 +571,14 @@ def _prepare_personal_identity(
             )
         elif user["telegram_user_id"] != telegram_user_id:
             raise ValueError("personal owner identity mismatch")
+        existing = connection.execute(
+            "SELECT id FROM delivery_targets "
+            "WHERE owner_id = ? AND kind = 'telegram' AND address = ? "
+            "ORDER BY id LIMIT 1",
+            (owner_id, str(delivery_chat_id)),
+        ).fetchone()
+        if existing is not None:
+            return owner_id, existing["id"]
         target = connection.execute(
             "SELECT owner_id FROM delivery_targets WHERE id = ?",
             (target_id,),

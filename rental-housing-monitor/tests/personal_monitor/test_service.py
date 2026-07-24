@@ -299,6 +299,38 @@ def test_production_heartbeat_uses_worker_auth_without_monitor_codex_home() -> N
     assert "auth_guard=worker" in source
 
 
+def test_personal_identity_reuses_imported_telegram_delivery_target(tmp_path: Path) -> None:
+    connection = storage_module.open_database(tmp_path / "monitor.db")
+    owner_id = "telegram-user:123"
+    try:
+        connection.execute(
+            "INSERT INTO users(id, telegram_user_id, status, created_at) "
+            "VALUES (?, ?, 'active', ?)",
+            (owner_id, 123, "2026-07-24T00:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO delivery_targets(id, owner_id, kind, address, created_at) "
+            "VALUES ('telegram-main', ?, 'telegram', ?, ?)",
+            (owner_id, "-456", "2026-07-24T00:00:00+00:00"),
+        )
+
+        identity = service_module._prepare_personal_identity(
+            connection,
+            telegram_user_id=123,
+            delivery_chat_id=-456,
+        )
+        targets = connection.execute(
+            "SELECT id, owner_id, kind, address FROM delivery_targets ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert identity == (owner_id, "telegram-main")
+    assert [tuple(row) for row in targets] == [
+        ("telegram-main", owner_id, "telegram", "-456")
+    ]
+
+
 def test_telegram_delivery_uses_configured_address_not_untrusted_outbox_address() -> None:
     telegram = FakeTelegram()
     sender = TelegramDeliverySender(telegram, delivery_chat_id=123)
