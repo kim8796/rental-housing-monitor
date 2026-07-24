@@ -255,6 +255,7 @@ def test_squid_image_is_exact_minimal_distribution_package() -> None:
     assert "squid" in dockerfile
     assert "ca-certificates" in dockerfile
     assert "COPY deploy/squid.conf /etc/squid/squid.conf" in dockerfile
+    assert "RUN squid -k parse -f /etc/squid/squid.conf" in dockerfile
     assert "COPY . " not in dockerfile
     assert "EXPOSE" not in dockerfile
 
