@@ -94,10 +94,10 @@ sudo personal-monitor-compose run --rm --no-deps monitor \
   --id free-trial \
   --name "Free Trial" \
   --original-won 460418.00 \
-  --remaining-won 455463.26 \
+  --remaining-won 455145.36 \
   --starts-on 2026-07-08 \
   --ends-on 2026-10-08 \
-  --as-of 2026-07-24T03:10:00Z
+  --as-of 2026-07-24T12:10:00Z
 ```
 
 인프라 스크립트는 US 멀티 리전 `billing_monitor` 데이터셋과 VM 서비스 계정의

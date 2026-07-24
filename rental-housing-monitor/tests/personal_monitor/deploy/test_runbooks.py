@@ -195,7 +195,7 @@ def test_deploy_runbook_configures_and_seeds_gcp_billing_monitor() -> None:
         "Cloud Billing Standard usage export",
         "personal-monitor billing register-credit",
         "--original-won 460418.00",
-        "--remaining-won 455463.26",
+        "--remaining-won 455145.36",
         "--starts-on 2026-07-08",
         "--ends-on 2026-10-08",
     ):
