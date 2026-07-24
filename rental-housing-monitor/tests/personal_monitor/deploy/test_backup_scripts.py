@@ -19,7 +19,7 @@ BACKUP = ROOT / "scripts" / "backup_personal_monitor.sh"
 RESTORE = ROOT / "scripts" / "restore_personal_monitor.sh"
 VERIFY = ROOT / "scripts" / "verify_backup.sh"
 LIFECYCLE = ROOT / "deploy" / "gcs-lifecycle.json"
-ARCHIVE_TIMESTAMP = "2026-07-19T123456Z"
+ARCHIVE_TIMESTAMP = "2026-07-18T193456Z"
 
 
 def _text(path: Path) -> str:
@@ -88,7 +88,7 @@ def _valid_archive_files() -> dict[str, bytes]:
         "secrets/master.key": b"encrypted-master-key\n",
         "config/compose.yaml": b"services: {}\n",
         "manifest/backup.json": (
-            b'{"archive_timestamp":"2026-07-19T123456Z","schema_version":1}\n'
+            b'{"archive_timestamp":"2026-07-18T193456Z","schema_version":1}\n'
         ),
     }
     manifest = "".join(
@@ -262,8 +262,11 @@ def test_backup_uploads_create_only_and_verifies_remote_metadata(
 ) -> None:
     assert "daily/${ARCHIVE_TIMESTAMP}.tar.age" in backup_text
     assert "weekly/${ARCHIVE_TIMESTAMP}.tar.age" in backup_text
-    assert 'date -u "+%Y-%m-%dT%H%M%SZ %u"' in backup_text
-    assert backup_text.count('date -u "+%Y-%m-%dT%H%M%SZ %u"') == 1
+    assert 'date -u "+%Y-%m-%dT%H%M%SZ"' in backup_text
+    assert backup_text.count('date -u "+%Y-%m-%dT%H%M%SZ"') == 1
+    assert 'ZoneInfo("Asia/Seoul")' in backup_text
+    assert "astimezone" in backup_text
+    assert 'date -u "+%Y-%m-%dT%H%M%SZ %u"' not in backup_text
     assert "--if-generation-match=0" in backup_text
     assert "--custom-metadata" in backup_text
     assert "--content-type=application/octet-stream" in backup_text
@@ -726,7 +729,7 @@ def _prepare_backup_harness(
         """#!/usr/bin/env bash
 set -eu
 case "${*: -1}" in
-  "+%Y-%m-%dT%H%M%SZ %u") printf '%s\n' "2026-07-19T123456Z 7" ;;
+  "+%Y-%m-%dT%H%M%SZ") printf '%s\n' "2026-07-18T193456Z" ;;
   *) exit 2 ;;
 esac
 """,
@@ -887,13 +890,13 @@ def test_backup_fake_command_flow_is_ordered_verified_and_weekly(
     assert result.returncode == 0, result.stderr
     events = Path(environment["FAKE_EVENT_LOG"]).read_text(encoding="utf-8")
     assert events.index("sqlite-backup") < events.index("tar") < events.index("age")
-    assert "daily/2026-07-19T123456Z.tar.age" in events
-    assert "weekly/2026-07-19T123456Z.tar.age" in events
+    assert "daily/2026-07-18T193456Z.tar.age" in events
+    assert "weekly/2026-07-18T193456Z.tar.age" in events
     assert events.count("--if-generation-match=0") == 2
     assert events.count("storage objects describe") == 2
     assert result.stdout.splitlines() == [
         "personal monitor backup succeeded",
-        "2026-07-19T123456Z",
+        "2026-07-18T193456Z",
     ]
     assert result.stderr == ""
     status = source / "logs" / "backup-status.json"

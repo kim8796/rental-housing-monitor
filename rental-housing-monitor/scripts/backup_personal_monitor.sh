@@ -83,11 +83,23 @@ for required_command in chmod chown date dirname mktemp mv python3 rm; do
     command -v "$required_command" >/dev/null 2>&1 || fail
 done
 
-TIME_SNAPSHOT=$(date -u "+%Y-%m-%dT%H%M%SZ %u")
-[[ "$TIME_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z\ [1-7]$ ]] || fail
-ARCHIVE_TIMESTAMP=${TIME_SNAPSHOT% *}
-ARCHIVE_WEEKDAY=${TIME_SNAPSHOT##* }
+ARCHIVE_TIMESTAMP=$(date -u "+%Y-%m-%dT%H%M%SZ")
 [[ "$ARCHIVE_TIMESTAMP" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z$ ]] || fail
+ARCHIVE_WEEKDAY=$(python3 - "$ARCHIVE_TIMESTAMP" <<'PY'
+import datetime as dt
+import sys
+from zoneinfo import ZoneInfo
+
+try:
+    timestamp = dt.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H%M%SZ").replace(
+        tzinfo=dt.timezone.utc
+    )
+except (IndexError, ValueError):
+    raise SystemExit(1)
+print(timestamp.astimezone(ZoneInfo("Asia/Seoul")).isoweekday())
+PY
+) || fail
+[[ "$ARCHIVE_WEEKDAY" =~ ^[1-7]$ ]] || fail
 
 python3 - "$STATUS_FILE" "$SERVICE_UID" "$SERVICE_GID" <<'PY' || exit 1
 import os
