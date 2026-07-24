@@ -121,6 +121,17 @@ def test_provision_is_describe_then_create_and_uses_exact_resources() -> None:
     assert "deploy/gcs-lifecycle.json" in text
 
 
+def test_bucket_iam_binding_retries_bounded_service_account_propagation() -> None:
+    text = _text(PROVISION)
+    assert "bind_bucket_object_user" in text
+    assert "for attempt in 1 2 3 4 5 6" in text
+    assert '[[ "$attempt" -lt 6 ]] || return 1' in text
+    assert "sleep 5" in text
+    assert text.index("gcloud iam service-accounts create") < text.rindex(
+        "bind_bucket_object_user || fail"
+    )
+
+
 def test_firewall_and_vm_policy_are_exact() -> None:
     text = _text(PROVISION)
     for value in (

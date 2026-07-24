@@ -24,11 +24,26 @@ fail() {
     exit 1
 }
 
+bind_bucket_object_user() {
+    local attempt
+    for attempt in 1 2 3 4 5 6; do
+        if gcloud storage buckets add-iam-policy-binding "$BUCKET" \
+            --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
+            --role=roles/storage.objectUser \
+            --quiet >/dev/null 2>&1; then
+            return 0
+        fi
+        [[ "$attempt" -lt 6 ]] || return 1
+        sleep 5
+    done
+    return 1
+}
+
 [[ "${1-}" == "--apply" ]] || fail
 [[ $# -eq 1 ]] || fail
 [[ "${PERSONAL_MONITOR_PROVISION_CONFIRM-}" == "$CONFIRM_EXPECTED" ]] || fail
 
-for command_name in gcloud grep mktemp python3 rm; do
+for command_name in gcloud grep mktemp python3 rm sleep; do
     command -v "$command_name" >/dev/null 2>&1 || fail
 done
 [[ -f "$LIFECYCLE_FILE" && ! -L "$LIFECYCLE_FILE" ]] || fail
@@ -225,10 +240,7 @@ fi
 gcloud storage buckets update "$BUCKET" \
     --lifecycle-file="$LIFECYCLE_FILE" \
     --quiet >/dev/null 2>&1 || fail
-gcloud storage buckets add-iam-policy-binding "$BUCKET" \
-    --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
-    --role=roles/storage.objectUser \
-    --quiet >/dev/null 2>&1 || fail
+bind_bucket_object_user || fail
 
 ALLOW_FIREWALL="personal-monitor-iap-ssh"
 DENY_FIREWALL="personal-monitor-deny-ingress"
