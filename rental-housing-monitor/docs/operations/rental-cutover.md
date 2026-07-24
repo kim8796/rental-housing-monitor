@@ -41,15 +41,14 @@ QStash를 아직 Pause하지 않는다. 새 scheduler만 멈춘다.
 ```bash
 sudo systemctl stop personal-monitor.service
 sudo systemctl disable personal-monitor.service
-cd /srv/personal-monitor/app
-sudo docker compose --env-file /srv/personal-monitor/.env ps
+sudo personal-monitor-compose ps
 ```
 
 먼저 dry-run JSON을 보관하고 target DB가 변하지 않았는지 확인한다. owner 숫자는
 컨테이너의 기존 허용 사용자 환경값에서 조합되며 화면에 출력하지 않는다.
 
 ```bash
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose run --rm --no-deps monitor \
   /bin/sh -ceu 'exec personal-monitor migration import-rental \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
@@ -61,7 +60,7 @@ sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps mon
 `status`가 `validated`, `dry_run`이 true인지 검토한 뒤 동일 입력을 실제로 import한다.
 
 ```bash
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose run --rm --no-deps monitor \
   /bin/sh -ceu 'exec personal-monitor migration import-rental \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
@@ -84,106 +83,106 @@ Day 1:
 
 ```bash
 RUN_DATE=YYYY-MM-DD
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration shadow-run \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
   --run-date "$RUN_DATE"
-sudo docker compose --env-file /srv/personal-monitor/.env stop egress-proxy
+sudo personal-monitor-compose stop egress-proxy
 ```
 
 Day 2:
 
 ```bash
 RUN_DATE=YYYY-MM-DD
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration shadow-run \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
   --run-date "$RUN_DATE"
-sudo docker compose --env-file /srv/personal-monitor/.env stop egress-proxy
+sudo personal-monitor-compose stop egress-proxy
 ```
 
 Day 3:
 
 ```bash
 RUN_DATE=YYYY-MM-DD
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration shadow-run \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
   --run-date "$RUN_DATE"
-sudo docker compose --env-file /srv/personal-monitor/.env stop egress-proxy
+sudo personal-monitor-compose stop egress-proxy
 ```
 
 Day 4:
 
 ```bash
 RUN_DATE=YYYY-MM-DD
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration shadow-run \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
   --run-date "$RUN_DATE"
-sudo docker compose --env-file /srv/personal-monitor/.env stop egress-proxy
+sudo personal-monitor-compose stop egress-proxy
 ```
 
 Day 5:
 
 ```bash
 RUN_DATE=YYYY-MM-DD
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration shadow-run \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
   --run-date "$RUN_DATE"
-sudo docker compose --env-file /srv/personal-monitor/.env stop egress-proxy
+sudo personal-monitor-compose stop egress-proxy
 ```
 
 Day 6:
 
 ```bash
 RUN_DATE=YYYY-MM-DD
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration shadow-run \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
   --run-date "$RUN_DATE"
-sudo docker compose --env-file /srv/personal-monitor/.env stop egress-proxy
+sudo personal-monitor-compose stop egress-proxy
 ```
 
 Day 7:
 
 ```bash
 RUN_DATE=YYYY-MM-DD
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration shadow-run \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
   --run-date "$RUN_DATE"
-sudo docker compose --env-file /srv/personal-monitor/.env stop egress-proxy
+sudo personal-monitor-compose stop egress-proxy
 ```
 
 Day 7 결과가 일치한 뒤 duplicate probe와 최종 gate를 실행한다. probe 역시
 `NullDeliverySender`를 사용한다.
 
 ```bash
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration duplicate-probe \
   --database /srv/personal-monitor/db/monitor.db \
   --monitor rental-housing-seoul-gyeonggi
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor migration status \
   --database /srv/personal-monitor/db/monitor.db
-sudo docker compose --env-file /srv/personal-monitor/.env stop egress-proxy
+sudo personal-monitor-compose stop egress-proxy
 ```
 
 status JSON은 `consecutive_matches=7`, `unresolved_differences=0`,
@@ -199,9 +198,8 @@ GitHub Actions 실행 중인 job이 없는지 확인한다. Upstash QStash 콘�
 VM에서 한 번만 실제 전송 run을 수행한다.
 
 ```bash
-cd /srv/personal-monitor/app
-sudo docker compose --env-file /srv/personal-monitor/.env up -d egress-proxy
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose up -d egress-proxy
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor run-once \
   --database /srv/personal-monitor/db/monitor.db \
   --monitor rental-housing-seoul-gyeonggi \
@@ -215,7 +213,7 @@ sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps mon
 sudo systemctl enable personal-monitor.service
 sudo systemctl start personal-monitor.service
 sudo systemctl status personal-monitor.service --no-pager
-sudo docker compose --env-file /srv/personal-monitor/.env ps
+sudo personal-monitor-compose ps
 ```
 
 다음 12:13 Asia/Seoul 예약과 Telegram 자연어 명령을 관찰한다. QStash schedule 삭제는
@@ -229,8 +227,7 @@ sudo docker compose --env-file /srv/personal-monitor/.env ps
 ```bash
 sudo systemctl stop personal-monitor.service
 sudo systemctl disable personal-monitor.service
-cd /srv/personal-monitor/app
-sudo docker compose --env-file /srv/personal-monitor/.env stop --timeout 90
+sudo personal-monitor-compose stop --timeout 90
 ```
 
 그 다음 Upstash QStash 콘솔에서 같은 schedule을 **Resume**하고 상세를 다시 조회해

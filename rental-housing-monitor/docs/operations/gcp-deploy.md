@@ -35,6 +35,7 @@ sudo chmod 0600 /tmp/personal-monitor-src.tar.gz
 sudo -u personal-monitor tar -xzf /tmp/personal-monitor-src.tar.gz \
   -C /srv/personal-monitor/app
 sudo rm -f /tmp/personal-monitor-src.tar.gz
+sudo install -o root -g root -m 0755 /srv/personal-monitor/app/deploy/personal-monitor-compose /usr/local/sbin/personal-monitor-compose
 ```
 
 ## 2. 비밀정보 준비
@@ -79,41 +80,50 @@ ChatGPT Pro의 Codex 로그인을 사용하므로 `OPENAI_API_KEY`와 `CODEX_API
 먼저 이미지를 만들고 빈 DB의 스키마를 초기화한다.
 
 ```bash
-cd /srv/personal-monitor/app
-sudo docker compose --env-file /srv/personal-monitor/.env build
-sudo docker compose --env-file /srv/personal-monitor/.env run --rm --no-deps monitor \
+sudo personal-monitor-compose build
+sudo personal-monitor-compose run --rm --no-deps monitor \
   personal-monitor database init --path /srv/personal-monitor/db/monitor.db
 ```
 
-기본 서비스를 올리기 전에 `codex-worker`만 시작하고 사용자 본인이 device auth를
-완료한다. 로그인 정보는 `codex-home` Docker volume에 남고 백업 아카이브에는
+인증되지 않은 `codex-worker`는 의도적으로 시작을 거부한다. 따라서 먼저 일회성
+컨테이너에서 사용자 본인이 `codex login --device-auth`를 완료한 뒤 worker를
+시작한다. 로그인 정보는 `codex-home` Docker volume에 남고 백업 아카이브에는
 포함되지 않는다.
 
 ```bash
-sudo docker compose --env-file /srv/personal-monitor/.env up -d --build codex-worker
-sudo docker compose --env-file /srv/personal-monitor/.env exec \
+sudo personal-monitor-compose run --rm --no-deps --entrypoint codex \
   -e CODEX_HOME=/srv/personal-monitor/codex-home \
   -e HOME=/srv/personal-monitor/codex-home codex-worker \
-  codex login --device-auth
-sudo docker compose --env-file /srv/personal-monitor/.env exec -T \
+  login --device-auth
+sudo personal-monitor-compose run --rm --no-deps --entrypoint codex \
+  -e CODEX_HOME=/srv/personal-monitor/codex-home \
+  -e HOME=/srv/personal-monitor/codex-home codex-worker \
+  login status
+sudo personal-monitor-compose up -d codex-worker
+sudo personal-monitor-compose exec -T \
   -e CODEX_HOME=/srv/personal-monitor/codex-home \
   -e HOME=/srv/personal-monitor/codex-home codex-worker \
   codex login status
-sudo docker compose --env-file /srv/personal-monitor/.env stop --timeout 90
+sudo personal-monitor-compose stop --timeout 90
 ```
 
 상태 명령이 성공한 뒤 systemd 파일을 설치하고 기본 서비스를 시작한다.
 
 ```bash
-sudo install -o root -g root -m 0644 deploy/systemd/personal-monitor.service \
+sudo install -o root -g root -m 0644 \
+  /srv/personal-monitor/app/deploy/systemd/personal-monitor.service \
   /etc/systemd/system/personal-monitor.service
-sudo install -o root -g root -m 0644 deploy/systemd/personal-monitor-backup.service \
+sudo install -o root -g root -m 0644 \
+  /srv/personal-monitor/app/deploy/systemd/personal-monitor-backup.service \
   /etc/systemd/system/personal-monitor-backup.service
-sudo install -o root -g root -m 0644 deploy/systemd/personal-monitor-backup.timer \
+sudo install -o root -g root -m 0644 \
+  /srv/personal-monitor/app/deploy/systemd/personal-monitor-backup.timer \
   /etc/systemd/system/personal-monitor-backup.timer
-sudo install -o root -g root -m 0644 deploy/systemd/personal-monitor-verify.service \
+sudo install -o root -g root -m 0644 \
+  /srv/personal-monitor/app/deploy/systemd/personal-monitor-verify.service \
   /etc/systemd/system/personal-monitor-verify.service
-sudo install -o root -g root -m 0644 deploy/systemd/personal-monitor-verify.timer \
+sudo install -o root -g root -m 0644 \
+  /srv/personal-monitor/app/deploy/systemd/personal-monitor-verify.timer \
   /etc/systemd/system/personal-monitor-verify.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now personal-monitor.service
@@ -132,16 +142,15 @@ shadow 중 예약 전송이 발생하지 않게 한다.
 Compose와 systemd:
 
 ```bash
-cd /srv/personal-monitor/app
 sudo systemctl status personal-monitor.service --no-pager
-sudo docker compose --env-file /srv/personal-monitor/.env ps
+sudo personal-monitor-compose ps
 sudo journalctl -u personal-monitor.service --since today --no-pager
 ```
 
 DB 무결성:
 
 ```bash
-sudo docker compose --env-file /srv/personal-monitor/.env exec -T monitor \
+sudo personal-monitor-compose exec -T monitor \
   personal-monitor database integrity-check --path /srv/personal-monitor/db/monitor.db
 ```
 
@@ -173,7 +182,7 @@ sudo sqlite3 /srv/personal-monitor/db/monitor.db \
 Codex 인증:
 
 ```bash
-sudo docker compose --env-file /srv/personal-monitor/.env exec -T \
+sudo personal-monitor-compose exec -T \
   -e CODEX_HOME=/srv/personal-monitor/codex-home \
   -e HOME=/srv/personal-monitor/codex-home codex-worker \
   codex login status

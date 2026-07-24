@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 SYSTEMD = ROOT / "deploy" / "systemd"
 OPERATIONS = ROOT / "docs" / "operations"
+COMPOSE_WRAPPER = ROOT / "deploy" / "personal-monitor-compose"
 MAIN_SERVICE = SYSTEMD / "personal-monitor.service"
 BACKUP_SERVICE = SYSTEMD / "personal-monitor-backup.service"
 BACKUP_TIMER = SYSTEMD / "personal-monitor-backup.timer"
@@ -24,6 +25,7 @@ def _text(path: Path) -> str:
 
 def test_required_units_and_runbooks_exist() -> None:
     for path in (
+        COMPOSE_WRAPPER,
         MAIN_SERVICE,
         BACKUP_SERVICE,
         BACKUP_TIMER,
@@ -34,6 +36,24 @@ def test_required_units_and_runbooks_exist() -> None:
         RENTAL_CUTOVER,
     ):
         assert path.is_file()
+
+
+def test_compose_wrapper_enters_private_app_directory_as_root() -> None:
+    text = _text(COMPOSE_WRAPPER)
+    assert text.startswith("#!/usr/bin/env bash\nset -Eeuo pipefail\n")
+    assert "cd /srv/personal-monitor/app" in text
+    assert (
+        'exec docker compose --env-file /srv/personal-monitor/.env "$@"'
+        in text
+    )
+    assert "$*" not in text
+    result = subprocess.run(
+        ["bash", "-n", COMPOSE_WRAPPER],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_main_service_owns_foreground_compose_lifecycle() -> None:
@@ -90,7 +110,7 @@ def test_deploy_runbook_keeps_secrets_out_of_git_and_uses_chatgpt_login() -> Non
         "chown 10001:10001 /etc/personal-monitor/master.key",
         "AGE_RECIPIENT",
         "PERSONAL_MONITOR_BACKUP_BUCKET",
-        "docker compose --env-file /srv/personal-monitor/.env up -d --build codex-worker",
+        "personal-monitor-compose run --rm --no-deps --entrypoint codex",
         "codex login --device-auth",
         "codex login status",
         "OPENAI_API_KEY",
@@ -116,10 +136,38 @@ def test_deploy_runbook_hands_private_source_archive_to_service_uid() -> None:
     assert text.index(chown) < text.index(chmod) < text.index(extract)
 
 
+def test_runbooks_use_root_compose_wrapper_for_private_app_directory() -> None:
+    deploy = _text(GCP_DEPLOY)
+    cutover = _text(RENTAL_CUTOVER)
+    assert (
+        "sudo install -o root -g root -m 0755 "
+        "/srv/personal-monitor/app/deploy/personal-monitor-compose "
+        "/usr/local/sbin/personal-monitor-compose"
+        in deploy
+    )
+    for text in (deploy, cutover):
+        assert "cd /srv/personal-monitor/app" not in text
+        assert "sudo docker compose" not in text
+        assert "sudo personal-monitor-compose" in text
+
+
+def test_device_login_uses_one_shot_container_before_worker_start() -> None:
+    text = _text(GCP_DEPLOY)
+    login = text.index("codex login --device-auth")
+    worker_start = text.index("sudo personal-monitor-compose up -d codex-worker")
+    assert (
+        "sudo personal-monitor-compose run --rm --no-deps "
+        "--entrypoint codex"
+        in text
+    )
+    assert login < worker_start
+    assert "up -d --build codex-worker" not in text
+
+
 def test_deploy_runbook_has_separate_health_checks() -> None:
     text = _text(GCP_DEPLOY)
     for value in (
-        "docker compose --env-file /srv/personal-monitor/.env ps",
+        "personal-monitor-compose ps",
         "personal-monitor database integrity-check",
         "health_write_probe",
         "next_run_at",
@@ -185,6 +233,7 @@ def test_cutover_runbook_has_seven_day_shadow_and_exact_rollback() -> None:
 def test_all_referenced_repository_paths_exist() -> None:
     for relative in (
         "compose.yaml",
+        "deploy/personal-monitor-compose",
         "scripts/backup_personal_monitor.sh",
         "scripts/restore_personal_monitor.sh",
         "scripts/verify_backup.sh",

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+cd /srv/personal-monitor/app
+exec docker compose --env-file /srv/personal-monitor/.env "$@"
