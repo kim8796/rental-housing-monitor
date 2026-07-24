@@ -15,8 +15,10 @@
 최신 DB를 가져온다.
 
 ```bash
-git fetch origin data
-git show origin/data:data/announcements.db > /tmp/legacy-announcements.db
+git -C "$(git rev-parse --show-toplevel)" fetch origin data
+git -C "$(git rev-parse --show-toplevel)" show \
+  origin/data:rental-housing-monitor/data/announcements.db \
+  > /tmp/legacy-announcements.db
 sqlite3 /tmp/legacy-announcements.db 'PRAGMA integrity_check;'
 gcloud compute scp /tmp/legacy-announcements.db \
   personal-monitor-1:/tmp/legacy-announcements.db \
@@ -54,6 +56,7 @@ sudo personal-monitor-compose run --rm --no-deps monitor \
   --database /srv/personal-monitor/db/monitor.db \
   --owner "telegram-user:${PERSONAL_MONITOR_TELEGRAM_USER_ID}" \
   --target telegram-main \
+  --target-address "${PERSONAL_MONITOR_TELEGRAM_DELIVERY_CHAT_ID}" \
   --dry-run'
 ```
 
@@ -65,7 +68,8 @@ sudo personal-monitor-compose run --rm --no-deps monitor \
   --source /srv/personal-monitor/db/legacy-announcements.db \
   --database /srv/personal-monitor/db/monitor.db \
   --owner "telegram-user:${PERSONAL_MONITOR_TELEGRAM_USER_ID}" \
-  --target telegram-main'
+  --target telegram-main \
+  --target-address "${PERSONAL_MONITOR_TELEGRAM_DELIVERY_CHAT_ID}"'
 ```
 
 출력은 `status=complete`, `import_complete=true`여야 한다. 같은 명령을 한 번 더 실행해

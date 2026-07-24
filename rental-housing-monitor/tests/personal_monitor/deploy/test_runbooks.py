@@ -128,12 +128,15 @@ def test_deploy_runbook_keeps_secrets_out_of_git_and_uses_chatgpt_login() -> Non
 
 def test_deploy_runbook_hands_private_source_archive_to_service_uid() -> None:
     text = _text(GCP_DEPLOY)
+    repository_root = 'git -C "$(git rev-parse --show-toplevel)" archive'
     chown = "sudo chown 10001:10001 /tmp/personal-monitor-src.tar.gz"
     chmod = "sudo chmod 0600 /tmp/personal-monitor-src.tar.gz"
     extract = (
         "sudo -u personal-monitor sh -c "
         "'umask 022; exec tar -xzf /tmp/personal-monitor-src.tar.gz"
     )
+    assert repository_root in text
+    assert "HEAD:rental-housing-monitor" in text
     assert chown in text
     assert chmod in text
     assert text.index(chown) < text.index(chmod) < text.index(extract)
@@ -204,12 +207,15 @@ def test_cutover_runbook_has_seven_day_shadow_and_exact_rollback() -> None:
     text = _text(RENTAL_CUTOVER)
     for value in (
         "origin/data",
-        "data/announcements.db",
+        "origin/data:rental-housing-monitor/data/announcements.db",
+        'git -C "$(git rev-parse --show-toplevel)" fetch origin data',
         "migration import-rental",
         "--dry-run",
         "--owner",
         "telegram-user:",
         "--target telegram-main",
+        "--target-address",
+        "PERSONAL_MONITOR_TELEGRAM_DELIVERY_CHAT_ID",
         "migration shadow-run",
         "NullDeliverySender",
         "migration duplicate-probe",

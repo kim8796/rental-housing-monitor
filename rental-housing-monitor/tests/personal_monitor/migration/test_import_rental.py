@@ -473,6 +473,43 @@ def test_existing_owned_target_disambiguates_multiple_legacy_chats(
     assert report.imported_deliveries == 1
 
 
+def test_legacy_default_alias_requires_and_uses_explicit_target_address(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    legacy = _create_legacy(old_path)
+    _seed_three_agencies(legacy)
+    legacy.execute("UPDATE deliveries SET chat_id = 'telegram-default'")
+    legacy.commit()
+    legacy.close()
+
+    with pytest.raises(RuntimeError, match="target"):
+        import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    report = import_rental_state(
+        old_path,
+        new_path,
+        OWNER,
+        TARGET,
+        target_address="-10012345",
+    )
+
+    assert report.imported_deliveries == 1
+    with sqlite3.connect(new_path) as target:
+        address = target.execute(
+            "SELECT address FROM delivery_targets WHERE id = ?",
+            (TARGET,),
+        ).fetchone()[0]
+        assert address == "-10012345"
+        assert (
+            target.execute(
+                "SELECT COUNT(*) FROM delivery_targets WHERE address = 'telegram-default'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_rejects_symlink_hardlink_and_same_path_aliases(tmp_path: Path) -> None:
     old_path = tmp_path / "legacy.db"
     _create_legacy(old_path).close()
@@ -544,6 +581,8 @@ def test_cli_prints_one_canonical_json_report(tmp_path: Path, capsys) -> None:
             OWNER,
             "--target",
             TARGET,
+            "--target-address",
+            CHAT,
         ]
     )
 
@@ -573,6 +612,8 @@ def test_cli_failure_is_fixed_and_redacts_all_arguments(tmp_path: Path, capsys) 
             "telegram-user:998877",
             "--target",
             "private-target",
+            "--target-address",
+            "private-address",
             "--dry-run",
         ]
     )
@@ -970,6 +1011,36 @@ def test_invalid_legacy_message_ids_abort_without_target_mutation(
         import_rental_state(old_path, new_path, OWNER, TARGET)
 
     assert not new_path.exists()
+
+
+def test_pre_run_zero_message_id_imports_as_legacy_baseline(
+    tmp_path: Path,
+) -> None:
+    old_path = tmp_path / "legacy.db"
+    new_path = tmp_path / "personal.db"
+    legacy = _create_legacy(old_path)
+    _seed_three_agencies(legacy)
+    seen_at = datetime(2026, 7, 19, 3, tzinfo=UTC).isoformat()
+    delivered_at = datetime(2026, 7, 19, 4, tzinfo=UTC).isoformat()
+    legacy.execute(
+        "UPDATE announcements SET first_seen_at = ?, last_seen_at = ?",
+        (seen_at, seen_at),
+    )
+    legacy.execute(
+        "UPDATE deliveries SET delivered_at = ?, message_id = 0",
+        (delivered_at,),
+    )
+    legacy.commit()
+    legacy.close()
+
+    report = import_rental_state(old_path, new_path, OWNER, TARGET)
+
+    assert report.imported_deliveries == 1
+    with sqlite3.connect(new_path) as target:
+        assert (
+            target.execute("SELECT external_message_id FROM deliveries").fetchone()[0]
+            == "legacy-baseline"
+        )
 
 
 def test_legacy_foreign_key_violation_aborts_without_target_mutation(

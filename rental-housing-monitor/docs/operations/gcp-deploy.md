@@ -11,7 +11,10 @@ Cloud Run 서비스 `local-social-api`는 이 절차의 변경 대상이 아니�
 
 ```bash
 git status --short
-git archive --format=tar.gz --output=/tmp/personal-monitor-src.tar.gz HEAD:rental-housing-monitor
+git -C "$(git rev-parse --show-toplevel)" archive \
+  --format=tar.gz \
+  --output=/tmp/personal-monitor-src.tar.gz \
+  HEAD:rental-housing-monitor
 chmod 0600 /tmp/personal-monitor-src.tar.gz
 shasum -a 256 /tmp/personal-monitor-src.tar.gz
 gcloud compute scp /tmp/personal-monitor-src.tar.gz personal-monitor-1:/tmp/personal-monitor-src.tar.gz \

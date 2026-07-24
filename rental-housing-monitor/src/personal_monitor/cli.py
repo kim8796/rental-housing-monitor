@@ -67,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_rental.add_argument("--database", type=Path, required=True)
     import_rental.add_argument("--owner", required=True)
     import_rental.add_argument("--target", required=True)
+    import_rental.add_argument("--target-address", required=True)
     import_rental.add_argument("--dry-run", action="store_true")
     shadow_run = migration_subcommands.add_parser("shadow-run")
     shadow_run.add_argument("--source", type=Path, required=True)
@@ -135,6 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.database,
                 arguments.owner,
                 arguments.target,
+                arguments.target_address,
                 dry_run=arguments.dry_run,
             )
         if arguments.migration_action == "shadow-run":
@@ -400,6 +402,7 @@ def _migration_import_rental(
     database: Path,
     owner: str,
     target: str,
+    target_address: str,
     *,
     dry_run: bool,
 ) -> int:
@@ -412,6 +415,7 @@ def _migration_import_rental(
             database,
             owner,
             target,
+            target_address=target_address,
             dry_run=dry_run,
         )
     except Exception:

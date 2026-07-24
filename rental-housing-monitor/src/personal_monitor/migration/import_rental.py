@@ -55,6 +55,8 @@ _MAX_ROWS = 100_000
 _MAX_JSON_BYTES = 4096
 _FIXED_TIME = datetime(2000, 1, 1, tzinfo=UTC)
 _EXPECTED_TABLES = frozenset({"announcements", "deliveries", "runs"})
+_LEGACY_BASELINE_MESSAGE_ID = "legacy-baseline"
+_LEGACY_DEFAULT_TARGET_ALIAS = "telegram-default"
 _ALLOWED_RUN_STATUS = frozenset({"running", "success", "partial_failure", "telegram_failure"})
 _ALLOWED_SOURCE_STATUS = frozenset({"ok", "failed"})
 _EXPECTED_LEGACY_SQL = {
@@ -412,6 +414,7 @@ def import_rental_state(
     owner_id: str,
     target_id: str,
     *,
+    target_address: str | None = None,
     dry_run: bool = False,
 ) -> ImportReport:
     """Validate and atomically import the fixed legacy rental monitor aggregate."""
@@ -421,6 +424,7 @@ def import_rental_state(
             new_path,
             owner_id,
             target_id,
+            target_address=target_address,
             dry_run=dry_run,
         )
 
@@ -431,6 +435,7 @@ def _import_rental_state_locked(
     owner_id: str,
     target_id: str,
     *,
+    target_address: str | None,
     dry_run: bool,
 ) -> ImportReport:
     try:
@@ -439,6 +444,7 @@ def _import_rental_state_locked(
         source_path, target_path, source_identity = _validated_paths(old_path, new_path)
         telegram_user_id = _telegram_user_id(owner_id)
         _validate_target_id(target_id)
+        _validate_requested_target_address(target_address)
         source = _read_source(source_path, source_identity)
         counts: _ImportCounts | None = None
         for _attempt in range(4):
@@ -454,6 +460,7 @@ def _import_rental_state_locked(
                     owner_id,
                     telegram_user_id,
                     target_id,
+                    target_address,
                     dry_run=dry_run,
                 )
             except BaseException:
@@ -629,6 +636,7 @@ def _read_source(path: Path, expected_identity: _FileIdentity) -> _SourceSnapsho
             "runs",
         )
         evidence = [_validate_run(row) for row in run_rows]
+        _validate_legacy_baselines(deliveries, run_rows)
         timestamps = [
             *(row.first_seen_at for row in announcements),
             *(row.last_seen_at for row in announcements),
@@ -975,11 +983,33 @@ def _delivery(row: sqlite3.Row, announcement_keys: set[str]) -> _DeliveryRow:
             raise ValueError
         delivered_at = _canonical_timestamp(row["delivered_at"])
         message_id = row["message_id"]
-        if type(message_id) is not int or message_id <= 0 or message_id > 9_223_372_036_854_775_807:
+        if type(message_id) is not int or message_id < 0 or message_id > 9_223_372_036_854_775_807:
             raise ValueError
-        return _DeliveryRow(key, chat_id, delivered_at, str(message_id))
+        stored_message_id = (
+            _LEGACY_BASELINE_MESSAGE_ID if message_id == 0 else str(message_id)
+        )
+        return _DeliveryRow(key, chat_id, delivered_at, stored_message_id)
     except (TypeError, ValueError):
         raise _row_error("deliveries", key_for_error) from None
+
+
+def _validate_legacy_baselines(
+    deliveries: tuple[_DeliveryRow, ...],
+    run_rows: list[sqlite3.Row],
+) -> None:
+    baselines = tuple(
+        row for row in deliveries if row.message_id == _LEGACY_BASELINE_MESSAGE_ID
+    )
+    if not baselines:
+        return
+    if not run_rows:
+        raise RentalImportError("legacy baseline delivery is invalid")
+    first_run = min(
+        datetime.fromisoformat(_canonical_timestamp(row["started_at"]))
+        for row in run_rows
+    )
+    if any(datetime.fromisoformat(row.delivered_at) >= first_run for row in baselines):
+        raise RentalImportError("legacy baseline delivery is invalid")
 
 
 def _validate_run(row: sqlite3.Row) -> str:
@@ -1511,6 +1541,7 @@ def _map_target(
     owner_id: str,
     telegram_user_id: int,
     target_id: str,
+    requested_target_address: str | None,
     *,
     dry_run: bool,
 ) -> _ImportCounts:
@@ -1518,7 +1549,14 @@ def _map_target(
     context = nullcontext() if dry_run else transaction(connection, immediate=True)
     with context:
         _phase_hook("identity")
-        target_address = _target_address(connection, source, owner_id, telegram_user_id, target_id)
+        target_address, source_delivery_address = _target_routing(
+            connection,
+            source,
+            owner_id,
+            telegram_user_id,
+            target_id,
+            requested_target_address,
+        )
         counts.identity_created = _ensure_user(
             connection, owner_id, telegram_user_id, source.evidence_time, dry_run
         )
@@ -1543,7 +1581,10 @@ def _map_target(
             else:
                 counts.already_present_observations += 1
         selected_deliveries = tuple(
-            row for row in source.deliveries if row.chat_id == target_address
+            row
+            for row in source.deliveries
+            if source_delivery_address is not None
+            and row.chat_id == source_delivery_address
         )
         _phase_hook("outbox")
         outbox_rows: list[tuple[str, _DeliveryRow]] = []
@@ -1573,13 +1614,21 @@ def _phase_hook(_phase: str) -> None:
     """Test seam for asserting all mapping phases share one transaction."""
 
 
-def _target_address(
+def _validate_requested_target_address(value: str | None) -> None:
+    if value is not None and (
+        not _valid_chat_address(value) or value == _LEGACY_DEFAULT_TARGET_ALIAS
+    ):
+        raise RentalImportError("target address is invalid")
+
+
+def _target_routing(
     connection: sqlite3.Connection,
     source: _SourceSnapshot,
     owner_id: str,
     telegram_user_id: int,
     target_id: str,
-) -> str:
+    requested_address: str | None,
+) -> tuple[str, str | None]:
     chat_ids = {row.chat_id for row in source.deliveries}
     existing = connection.execute(
         "SELECT owner_id, kind, address FROM delivery_targets WHERE id = ?",
@@ -1593,14 +1642,30 @@ def _target_address(
         ):
             raise RentalImportError("target aggregate conflicts")
         address = existing["address"]
-        if (chat_ids and address not in chat_ids) or (
-            not chat_ids and address != str(telegram_user_id)
-        ):
+        if requested_address is not None and address != requested_address:
+            raise RentalImportError("target aggregate conflicts")
+        if not chat_ids:
+            expected_address = requested_address or str(telegram_user_id)
+            if address != expected_address:
+                raise RentalImportError("legacy delivery target conflicts")
+            return address, None
+        if chat_ids == {_LEGACY_DEFAULT_TARGET_ALIAS}:
+            return address, _LEGACY_DEFAULT_TARGET_ALIAS
+        if address not in chat_ids:
             raise RentalImportError("legacy delivery target conflicts")
-        return address
+        return address, address
     if len(chat_ids) > 1:
         raise RentalImportError("legacy delivery target is ambiguous")
-    return next(iter(chat_ids), str(telegram_user_id))
+    if not chat_ids:
+        return requested_address or str(telegram_user_id), None
+    source_address = next(iter(chat_ids))
+    if source_address == _LEGACY_DEFAULT_TARGET_ALIAS:
+        if requested_address is None:
+            raise RentalImportError("legacy delivery target address is required")
+        return requested_address, source_address
+    if requested_address is not None and requested_address != source_address:
+        raise RentalImportError("legacy delivery target conflicts")
+    return source_address, source_address
 
 
 def _valid_chat_address(value: object) -> bool:
@@ -2066,13 +2131,7 @@ def _validate_imported_rental_aggregate(connection: sqlite3.Connection) -> None:
             if delivery is None or delivery["target_id"] != target_id:
                 raise RentalImportError("delivery aggregate conflicts")
             message_id = delivery["external_message_id"]
-            if (
-                type(message_id) is not str
-                or not message_id.isascii()
-                or not message_id.isdecimal()
-                or str(int(message_id)) != message_id
-                or not 0 < int(message_id) <= 9_223_372_036_854_775_807
-            ):
+            if not _valid_imported_message_id(message_id):
                 raise RentalImportError("delivery aggregate conflicts")
             delivered_at = _canonical_timestamp(delivery["delivered_at"])
             available_at = _canonical_timestamp(outbox["available_at"])
@@ -2131,3 +2190,15 @@ def _validate_imported_rental_aggregate(connection: sqlite3.Connection) -> None:
         raise
     except Exception:
         raise RentalImportError("imported aggregate is invalid") from None
+
+
+def _valid_imported_message_id(value: object) -> bool:
+    if value == _LEGACY_BASELINE_MESSAGE_ID:
+        return True
+    return (
+        type(value) is str
+        and value.isascii()
+        and value.isdecimal()
+        and str(int(value)) == value
+        and 0 < int(value) <= 9_223_372_036_854_775_807
+    )
