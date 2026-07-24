@@ -56,10 +56,10 @@ services:
     command: [personal-monitor, ai-worker, --socket, /run/personal-monitor-ai/worker.sock]
     restart: unless-stopped
     environment:
-      - PERSONAL_MONITOR_CODEX_BINARY=codex
+      - PERSONAL_MONITOR_CODEX_BINARY=/usr/local/bin/codex
       - PERSONAL_MONITOR_CODEX_HOME=/srv/personal-monitor/codex-home
       - PERSONAL_MONITOR_CODEX_TASK_ROOT=/work
-      - PERSONAL_MONITOR_NODE_BINARY=${PERSONAL_MONITOR_NODE_BINARY:-node}
+      - PERSONAL_MONITOR_NODE_BINARY=/usr/local/bin/node
     volumes:
       - codex-home:/srv/personal-monitor/codex-home
       - ai-socket:/run/personal-monitor-ai

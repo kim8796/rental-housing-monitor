@@ -176,10 +176,10 @@ def test_worker_has_only_codex_socket_mounts_and_allowlisted_environment() -> No
         "env_file:",
     ):
         assert forbidden not in worker
-    assert "PERSONAL_MONITOR_CODEX_BINARY=codex" in worker
+    assert "PERSONAL_MONITOR_CODEX_BINARY=/usr/local/bin/codex" in worker
     assert "PERSONAL_MONITOR_CODEX_HOME=/srv/personal-monitor/codex-home" in worker
     assert "PERSONAL_MONITOR_CODEX_TASK_ROOT=/work" in worker
-    assert "PERSONAL_MONITOR_NODE_BINARY=${PERSONAL_MONITOR_NODE_BINARY:-node}" in worker
+    assert "PERSONAL_MONITOR_NODE_BINARY=/usr/local/bin/node" in worker
 
 
 def test_monitor_and_worker_share_private_socket_without_tcp() -> None:
