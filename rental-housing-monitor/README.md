@@ -2,6 +2,9 @@
 
 매일 LH, SH, GH의 공식 공고만 확인해 서울특별시와 경기도의 다음 모집공고를 Telegram으로 전송하는 Python 프로젝트입니다.
 
+- AI/Codex 작업자는 시작 전에 [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md)를 읽고,
+  작업을 마칠 때 현재 상태와 다음 할 일을 갱신합니다.
+
 - 행복주택
 - 국민임대
 - 신혼부부·신생아 대상 매입임대
