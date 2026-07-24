@@ -12,6 +12,7 @@ Cloud Run 서비스 `local-social-api`는 이 절차의 변경 대상이 아니�
 ```bash
 git status --short
 git archive --format=tar.gz --output=/tmp/personal-monitor-src.tar.gz HEAD:rental-housing-monitor
+chmod 0600 /tmp/personal-monitor-src.tar.gz
 shasum -a 256 /tmp/personal-monitor-src.tar.gz
 gcloud compute scp /tmp/personal-monitor-src.tar.gz personal-monitor-1:/tmp/personal-monitor-src.tar.gz \
   --project=local-social-native-wlk-0720 \
@@ -29,6 +30,8 @@ VM이 `asia-northeast3-b`에 만들어졌다면 두 명령의 zone만 `asia-nort
 ```bash
 set -Eeuo pipefail
 sudo test -z "$(sudo find /srv/personal-monitor/app -mindepth 1 -maxdepth 1 -print -quit)"
+sudo chown 10001:10001 /tmp/personal-monitor-src.tar.gz
+sudo chmod 0600 /tmp/personal-monitor-src.tar.gz
 sudo -u personal-monitor tar -xzf /tmp/personal-monitor-src.tar.gz \
   -C /srv/personal-monitor/app
 sudo rm -f /tmp/personal-monitor-src.tar.gz

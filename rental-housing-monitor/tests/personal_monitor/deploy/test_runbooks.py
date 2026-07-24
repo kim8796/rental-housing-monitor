@@ -106,6 +106,16 @@ def test_deploy_runbook_keeps_secrets_out_of_git_and_uses_chatgpt_login() -> Non
     assert text.count("-e HOME=/srv/personal-monitor/codex-home") >= 3
 
 
+def test_deploy_runbook_hands_private_source_archive_to_service_uid() -> None:
+    text = _text(GCP_DEPLOY)
+    chown = "sudo chown 10001:10001 /tmp/personal-monitor-src.tar.gz"
+    chmod = "sudo chmod 0600 /tmp/personal-monitor-src.tar.gz"
+    extract = "sudo -u personal-monitor tar -xzf /tmp/personal-monitor-src.tar.gz"
+    assert chown in text
+    assert chmod in text
+    assert text.index(chown) < text.index(chmod) < text.index(extract)
+
+
 def test_deploy_runbook_has_separate_health_checks() -> None:
     text = _text(GCP_DEPLOY)
     for value in (
