@@ -36,6 +36,7 @@ sudo test -z "$(sudo find /srv/personal-monitor/app -mindepth 1 -maxdepth 1 -pri
 sudo chown 10001:10001 /tmp/personal-monitor-src.tar.gz
 sudo chmod 0600 /tmp/personal-monitor-src.tar.gz
 sudo -u personal-monitor sh -c 'umask 022; exec tar -xzf /tmp/personal-monitor-src.tar.gz -C /srv/personal-monitor/app'
+sudo test "$(sudo stat -c '%a %u:%g' /srv/personal-monitor/app/compose.yaml)" = "644 10001:10001"
 sudo rm -f /tmp/personal-monitor-src.tar.gz
 sudo install -o root -g root -m 0755 /srv/personal-monitor/app/deploy/personal-monitor-compose /usr/local/sbin/personal-monitor-compose
 ```

@@ -135,11 +135,16 @@ def test_deploy_runbook_hands_private_source_archive_to_service_uid() -> None:
         "sudo -u personal-monitor sh -c "
         "'umask 022; exec tar -xzf /tmp/personal-monitor-src.tar.gz"
     )
+    verify_compose = (
+        """sudo test "$(sudo stat -c '%a %u:%g' """
+        """/srv/personal-monitor/app/compose.yaml)" = "644 10001:10001\""""
+    )
     assert repository_root in text
     assert "HEAD:rental-housing-monitor" in text
     assert chown in text
     assert chmod in text
-    assert text.index(chown) < text.index(chmod) < text.index(extract)
+    assert verify_compose in text
+    assert text.index(chown) < text.index(chmod) < text.index(extract) < text.index(verify_compose)
 
 
 def test_runbooks_use_root_compose_wrapper_for_private_app_directory() -> None:

@@ -161,8 +161,12 @@ def test_provision_prepares_billing_export_dataset_and_least_privilege_roles() -
     assert 'BILLING_DATASET="billing_monitor"' in text
     assert "--location=US" in text
     assert "roles/bigquery.jobUser" in text
-    assert "roles/bigquery.dataViewer" in text
     assert "gcloud projects add-iam-policy-binding" in text
+    assert '"role": "READER"' in text
+    assert '"userByEmail": sys.argv[4]' in text
+    assert "--update_mode=UPDATE_ACL" in text
+    assert 'bq --project_id="$PROJECT" update --dataset' in text
+    assert "add-iam-policy-binding --dataset" not in text
 
 
 def test_existing_firewall_rules_are_described_as_json_and_validated() -> None:
