@@ -229,3 +229,48 @@ gcloud storage objects list \
 
 `backup-status.json`은 `status=ok`와 최근 UTC `updated_at`이어야 한다. 백업 및 복구
 검증의 상세 절차는 `docs/operations/backup-restore.md`를 따른다.
+
+## 5. 기존 서버의 안전한 업그레이드
+
+운영 중인 서버는 `app` 디렉터리 위에 소스를 덮어쓰지 않는다. 배포할 Git 커밋을
+아카이브하고 `app-next-<sha>`에서 이미지를 먼저 만든 뒤, DB migration이 성공한
+경우에만 systemd를 정지하고 디렉터리를 교체한다. 기존 앱 디렉터리와 이미지에는
+각각 `app-rollback-before-<sha>`, `personal-monitor:rollback-<sha>` 이름을
+붙여 보존한다.
+
+Compose 네트워크에는 고정 subnet이 있으므로 운영 stack이 실행 중일 때 임시 Compose
+project로 migration 컨테이너를 띄우면 subnet 충돌이 날 수 있다. 새 이미지를 빌드할
+때는 `--project-directory`로 다음 릴리스의 build context를 고정하고, migration은
+Compose가 아닌 네트워크 없는 일회성 컨테이너로 실행한다.
+
+```bash
+release=<검증한-짧은-커밋-SHA>
+next="/srv/personal-monitor/app-next-$release"
+
+sudo docker tag personal-monitor:local "personal-monitor:rollback-$release"
+sudo docker compose \
+  --project-directory "$next" \
+  --env-file /srv/personal-monitor/.env \
+  --file "$next/compose.yaml" \
+  build monitor egress-proxy
+sudo docker run --rm --network none --user 10001:10001 \
+  -v /srv/personal-monitor/db:/srv/personal-monitor/db \
+  personal-monitor:local \
+  personal-monitor database init \
+  --path /srv/personal-monitor/db/monitor.db
+```
+
+그다음 `personal-monitor.service`를 정지하고 `app`과 `next`를 `mv`로 교체한다.
+새 systemd unit과 Compose wrapper를 다시 설치하고 서비스를 시작한 뒤 아래 항목을
+모두 확인한다.
+
+- systemd가 `active`이고 Compose 서비스가 정확히 3개 실행 중
+- DB `quick_check=ok`, 최신 migration, heartbeat가 90초 이내
+- `codex login status`가 `Logged in using ChatGPT`
+- 최근 operator event와 service journal에 새 오류가 없음
+- 백업 서비스를 한 번 실행한 뒤 상태가 `ok`이고 새 GCS 객체가 존재함
+
+서비스 시작이나 점검이 실패하면 새 `app`을 실패 보존 경로로 옮기고 rollback
+디렉터리와 이미지 태그를 원래 이름으로 복구한 뒤 서비스를 다시 시작한다. 정상
+검증 후에는 rollback 이미지와 디렉터리는 남기고 재생성 가능한 build cache만
+`docker builder prune -f`로 정리할 수 있다.
