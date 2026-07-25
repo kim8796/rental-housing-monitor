@@ -24,6 +24,7 @@ from .contracts import (
     PlanRequest,
     RepairRequest,
     RequestModel,
+    UrlDiscoveryRequest,
     WorkerFailure,
     WorkerRequest,
     request_kind,
@@ -147,6 +148,8 @@ def _parse_worker_request(value: object) -> WorkerRequest:
     model_type: type[RequestModel]
     if kind == "intent":
         model_type = IntentRequest
+    elif kind == "url_discovery":
+        model_type = UrlDiscoveryRequest
     elif kind == "plan":
         model_type = PlanRequest
     elif kind == "repair":

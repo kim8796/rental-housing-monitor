@@ -56,6 +56,7 @@ def _result(
     *,
     targets: list[str] | None = None,
     url: str | None = None,
+    discovery_query: str | None = None,
     condition: str | None = None,
     schedule: str | None = None,
     clarification: str | None = None,
@@ -65,6 +66,7 @@ def _result(
         kind=kind,
         target_monitor_ids=[] if targets is None else targets,
         target_url=url,
+        discovery_query=discovery_query,
         condition_text=condition,
         schedule_text=schedule,
         clarification=clarification,
@@ -549,15 +551,58 @@ def test_syntactically_valid_create_urls_are_preserved(url: str) -> None:
     assert len(worker.calls) == 1
 
 
+def test_create_without_url_accepts_bounded_site_discovery_query() -> None:
+    output = _result(
+        IntentKind.CREATE,
+        discovery_query="서울주택도시공사 임대주택 모집공고 게시판",
+        condition="강남구 공고",
+    )
+    router, _, worker = _router([output])
+
+    result = run(router.route(REQUEST("SH 임대주택 모집공고에서 강남구 공고를 알려줘")))
+
+    assert result is output
+    assert result.target_url is None
+    assert result.discovery_query == "서울주택도시공사 임대주택 모집공고 게시판"
+    assert len(worker.calls) == 1
+
+
+def test_create_requires_exactly_one_url_or_discovery_query() -> None:
+    missing = _result(IntentKind.CREATE)
+    conflicting = _result(
+        IntentKind.CREATE,
+        url="https://example.com/notices",
+        discovery_query="Example notices",
+    )
+    missing_router, _, missing_worker = _router([missing, object(), object()])
+    conflict_router, _, conflict_worker = _router([conflicting, object(), object()])
+
+    missing_result = run(missing_router.route(REQUEST("새 모니터 만들어줘")))
+    conflict_result = run(conflict_router.route(REQUEST("이 사이트를 모니터해줘")))
+
+    assert missing_result.kind is IntentKind.UNKNOWN
+    assert conflict_result.kind is IntentKind.UNKNOWN
+    assert len(missing_worker.calls) == 3
+    assert len(conflict_worker.calls) == 3
+
+
 @pytest.mark.parametrize(
     "field",
-    ["target_monitor_ids", "target_url", "condition_text", "schedule_text", "clarification"],
+    [
+        "target_monitor_ids",
+        "target_url",
+        "discovery_query",
+        "condition_text",
+        "schedule_text",
+        "clarification",
+    ],
 )
 def test_worker_control_characters_are_rejected(field: str) -> None:
     values: dict[str, object] = {
         "kind": IntentKind.CREATE,
         "target_monitor_ids": [],
         "target_url": "https://example.com",
+        "discovery_query": None,
         "condition_text": None,
         "schedule_text": None,
         "clarification": None,

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from personal_monitor.domain.spec import MonitorSpec, MonitorStatus
@@ -15,6 +18,8 @@ from personal_monitor.storage.schema import (
     utc_now,
     utc_timestamp,
 )
+
+_OWNER_RE = re.compile(r"telegram-user:[1-9][0-9]{0,18}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +110,46 @@ class RegistryRepository:
                 (target_id, owner_id, address, utc_now().isoformat()),
             )
 
-    def create_monitor(self, spec: MonitorSpec, *, created_by: str) -> str:
+    def get_url_alias(self, owner_id: str, name: str) -> str | None:
+        normalized = _normalize_url_alias(owner_id, name)
+        row = self.connection.execute(
+            "SELECT url FROM url_aliases WHERE owner_id = ? AND normalized_name = ?",
+            (owner_id, normalized),
+        ).fetchone()
+        if row is None:
+            return None
+        url = row["url"]
+        if not _valid_alias_url(url):
+            raise ValueError("invalid stored URL alias")
+        return url
+
+    def upsert_url_alias(self, owner_id: str, name: str, url: str) -> None:
+        normalized = _normalize_url_alias(owner_id, name)
+        if not _valid_alias_url(url):
+            raise ValueError("invalid URL alias")
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO url_aliases(owner_id, normalized_name, url, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(owner_id, normalized_name) DO UPDATE SET "
+                "url = excluded.url, updated_at = excluded.updated_at",
+                (owner_id, normalized, url, utc_now().isoformat()),
+            )
+
+    def create_monitor(
+        self,
+        spec: MonitorSpec,
+        *,
+        created_by: str,
+        url_alias: str | None = None,
+    ) -> str:
         if created_by != spec.owner_id:
             raise ValueError("initial monitor approver must be the monitor owner")
+        normalized_alias = (
+            None
+            if url_alias is None
+            else _normalize_url_alias(spec.owner_id, url_alias)
+        )
         monitor_id = uuid4().hex
         version_id = uuid4().hex
         created_at = utc_now().isoformat()
@@ -143,6 +185,19 @@ class RegistryRepository:
                 "UPDATE monitors SET active_version_id = ? WHERE id = ?",
                 (version_id, monitor_id),
             )
+            if normalized_alias is not None:
+                self.connection.execute(
+                    "INSERT INTO url_aliases(owner_id, normalized_name, url, updated_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(owner_id, normalized_name) DO UPDATE SET "
+                    "url = excluded.url, updated_at = excluded.updated_at",
+                    (
+                        spec.owner_id,
+                        normalized_alias,
+                        spec.target_url,
+                        created_at,
+                    ),
+                )
         return monitor_id
 
     def add_version(
@@ -717,6 +772,41 @@ def _safe_optional_timestamp(value: object) -> datetime | None:
     if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError
     return parsed
+
+
+def _normalize_url_alias(owner_id: str, name: str) -> str:
+    if type(owner_id) is not str or _OWNER_RE.fullmatch(owner_id) is None:
+        raise ValueError("invalid URL alias owner")
+    if (
+        type(name) is not str
+        or any(unicodedata.category(character).startswith("C") for character in name)
+    ):
+        raise ValueError("invalid URL alias name")
+    normalized = " ".join(unicodedata.normalize("NFKC", name).casefold().split())
+    if not 1 <= len(normalized) <= 300:
+        raise ValueError("invalid URL alias name")
+    return normalized
+
+
+def _valid_alias_url(value: object) -> bool:
+    try:
+        if (
+            type(value) is not str
+            or not 1 <= len(value) <= 2_048
+            or any(unicodedata.category(character).startswith("C") for character in value)
+        ):
+            return False
+        parsed = urlsplit(value)
+        _ = parsed.port
+        return (
+            parsed.scheme.casefold() in {"http", "https"}
+            and parsed.hostname is not None
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.fragment
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _next_run_at(spec: MonitorSpec, monitor_id: str, after: datetime) -> datetime:

@@ -29,6 +29,7 @@ _ACTIONS: Final = frozenset(
         "repair_activation",
         "resume",
         "schedule_change",
+        "select_url",
         "update",
     }
 )

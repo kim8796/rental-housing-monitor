@@ -59,7 +59,7 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
     assert second.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert second.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
     versions = second.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5, 6, 7]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4, 5, 6, 7, 8]
     columns = {
         row["name"]: row for row in second.execute("PRAGMA table_info(diagnostic_snapshots)")
     }
@@ -131,6 +131,14 @@ def test_schema_migration_is_idempotent(tmp_path) -> None:
         ]
         == "monitors"
     )
+    alias_columns = {
+        row["name"]: row for row in second.execute("PRAGMA table_info(url_aliases)")
+    }
+    assert tuple(alias_columns) == ("owner_id", "normalized_name", "url", "updated_at")
+    assert any(
+        row["from"] == "owner_id" and row["table"] == "users"
+        for row in second.execute("PRAGMA foreign_key_list(url_aliases)")
+    )
     second.close()
 
 
@@ -152,7 +160,7 @@ def test_existing_v1_database_migrates_to_v2_atomically_and_reruns(tmp_path) -> 
 
     migrated = open_database(database_path)
     migrated_versions = migrated.execute("SELECT version FROM schema_migrations")
-    assert [row["version"] for row in migrated_versions] == [1, 2, 3, 4, 5, 6, 7]
+    assert [row["version"] for row in migrated_versions] == [1, 2, 3, 4, 5, 6, 7, 8]
     assert migrated.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='diagnostic_snapshots'"
     ).fetchone()
@@ -173,7 +181,7 @@ def test_schema_rejects_a_migration_newer_than_the_binary(tmp_path) -> None:
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
     )
     connection.execute(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?)",
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (9, ?)",
         (datetime.now(UTC).isoformat(),),
     )
     connection.commit()
@@ -377,6 +385,40 @@ def test_get_delivery_target_resolves_internal_id_and_returns_existing_row_type(
     )
     with pytest.raises(ValueError, match="delivery target does not exist"):
         registry.get_delivery_target("chat-address")
+
+
+def test_url_aliases_are_normalized_owner_scoped_and_upserted(
+    registry: RegistryRepository,
+) -> None:
+    registry.upsert_url_alias(
+        "telegram-user:1",
+        "  서울주택도시공사   모집공고 ",
+        "https://www.i-sh.co.kr/notices",
+    )
+
+    assert (
+        registry.get_url_alias("telegram-user:1", "서울주택도시공사 모집공고")
+        == "https://www.i-sh.co.kr/notices"
+    )
+    assert registry.get_url_alias("telegram-user:2", "서울주택도시공사 모집공고") is None
+
+    registry.upsert_url_alias(
+        "telegram-user:1",
+        "서울주택도시공사 모집공고",
+        "https://www.i-sh.co.kr/notices/latest",
+    )
+
+    assert (
+        registry.get_url_alias("telegram-user:1", "  서울주택도시공사 모집공고  ")
+        == "https://www.i-sh.co.kr/notices/latest"
+    )
+    assert (
+        registry.connection.execute(
+            "SELECT count(*) FROM url_aliases WHERE owner_id = ?",
+            ("telegram-user:1",),
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def test_immediate_operation_rejects_a_caller_owned_transaction_before_work(

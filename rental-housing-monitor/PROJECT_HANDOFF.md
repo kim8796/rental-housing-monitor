@@ -21,7 +21,7 @@
 - 마지막 갱신: 2026-07-25 KST
 - 저장소: `kim8796/rental-housing-monitor`
 - 기본 브랜치: `main`
-- 최근 기능 기준: `24f55a2` (PR #7 GCP 크레딧 모니터 병합)
+- 최근 기능 기준: `4b00a8f` (PR #9 Telegram 모니터 요청 형식 문서 병합)
 - 서비스 성격: 현재 개인용이며, 사용자·소유자 경계를 유지해 향후 다중 사용자
   서비스로 확장 가능하게 설계한다.
 - 사용자 개발 방식: 사용자가 직접 코딩하기보다 Codex에 자연어로 요청한다. 기능뿐
@@ -72,6 +72,11 @@ Telegram에서 새 모니터를 등록할 때는 JSON이나 slash command가 아
 - 요청을 받으면 페이지를 시험 수집한 뒤 이름, 대상, 현재 예시값, 조건, 시간대,
   확인 주기, Scrapling 수집 방식, robots.txt, 로그인 필요 여부를 미리 보여준다.
   사용자가 `등록` 버튼을 눌러야 실제 모니터가 생성되며 `수정`과 `취소`도 가능하다.
+- `codex/url-discovery-registration` 브랜치는 URL 대신 구체적인 사이트명·게시판명을
+  받는 흐름을 구현한다. URL 없는 신규 등록에서만 Codex 웹 검색을 켜고, 공식 후보를
+  URL 정책과 Scrapling 실제 접속으로 검증한다. 후보가 여러 개면 Telegram 선택
+  버튼을 표시하며 최종 등록 확인 때 사용자별 URL 별칭을 schema migration 8에
+  저장한다. 아직 운영 VM에는 배포하지 않았다.
 
 ### 3. GCP 크레딧 모니터
 
@@ -177,10 +182,12 @@ git diff --check
 
 ## 다음 세션의 첫 행동
 
-1. `git status -sb`, `git log -5 --oneline`으로 이 문서 이후 변경을 확인한다.
-2. Upstash에서 QStash schedule의 실제 pause 상태를 확인한다.
-3. GCP VM에서 2026-07-25 12:10 KST 이후 최신 billing snapshot이
+1. `codex/url-discovery-registration`의 전체 테스트를 Linux 또는 CI에서 확인하고
+   리뷰 후 main 병합 여부를 결정한다.
+2. 병합·배포한다면 VM DB migration 8 적용과 URL 없는 Telegram 등록을 smoke test한다.
+3. Upstash에서 QStash schedule의 실제 pause 상태를 확인한다.
+4. GCP VM에서 2026-07-25 12:10 KST 이후 최신 billing snapshot이
    `source=bigquery`인지 확인한다.
-4. 12:13 KST 임대주택 실행이 한 경로에서만 수행됐고 Telegram 중복 전송이 없는지
+5. 12:13 KST 임대주택 실행이 한 경로에서만 수행됐고 Telegram 중복 전송이 없는지
    확인한다.
-5. 이상이 없으면 이 섹션에서 완료 항목을 제거하고 다음 실제 작업으로 교체한다.
+6. 이상이 없으면 이 섹션에서 완료 항목을 제거하고 다음 실제 작업으로 교체한다.

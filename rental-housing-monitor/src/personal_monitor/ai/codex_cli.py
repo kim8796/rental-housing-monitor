@@ -24,6 +24,7 @@ from .contracts import (
     RepairRequest,
     RequestModel,
     ResultModel,
+    UrlDiscoveryRequest,
     result_type_for,
 )
 from .launcher import LauncherError, resolve_launcher
@@ -47,6 +48,10 @@ _ALLOWED_MODELS: Final = {
 }
 _ALLOWED_ITEM_TYPES: Final = {"agent_message", "reasoning"}
 ProcessFactory = Callable[..., Awaitable[object]]
+
+
+def _web_search_mode(request: RequestModel) -> str:
+    return "live" if type(request) is UrlDiscoveryRequest else "disabled"
 
 
 class CodexProtocolError(RuntimeError):
@@ -234,7 +239,7 @@ def _walk_json(value: object) -> None:
                 raise CodexProtocolError
 
 
-def _validate_event(line: bytes, state: int) -> int:
+def _validate_event(line: bytes, state: int, *, allow_web_search: bool = False) -> int:
     value = _bounded_json(line)
     if type(value) is not dict:
         raise CodexProtocolError
@@ -254,6 +259,17 @@ def _validate_event(line: bytes, state: int) -> int:
         return 2
     if state != 2:
         raise CodexProtocolError
+    if event_type in {"item.started", "item.updated", "item.completed"}:
+        item = value.get("item")
+        if (
+            allow_web_search
+            and set(value) == {"type", "item"}
+            and type(item) is dict
+            and item.get("type") == "web_search"
+            and type(item.get("id")) is str
+            and 1 <= len(item["id"]) <= 128
+        ):
+            return 2
     if event_type == "item.completed":
         if set(value) != {"type", "item"}:
             raise CodexProtocolError
@@ -286,7 +302,12 @@ def _validate_event(line: bytes, state: int) -> int:
     raise CodexProtocolError
 
 
-async def _read_stream(stream: object, *, events: bool) -> bytes:
+async def _read_stream(
+    stream: object,
+    *,
+    events: bool,
+    allow_web_search: bool = False,
+) -> bytes:
     data = bytearray()
     pending = bytearray()
     event_count = 0
@@ -312,7 +333,11 @@ async def _read_stream(stream: object, *, events: bool) -> bytes:
             if event_count > MAX_EVENTS:
                 raise CodexProtocolError
             if events:
-                state = _validate_event(bytes(raw_line), state)
+                state = _validate_event(
+                    bytes(raw_line),
+                    state,
+                    allow_web_search=allow_web_search,
+                )
     if pending:
         if len(pending) > MAX_LINE_BYTES:
             raise CodexProtocolError
@@ -320,7 +345,11 @@ async def _read_stream(stream: object, *, events: bool) -> bytes:
         if event_count > MAX_EVENTS:
             raise CodexProtocolError
         if events:
-            state = _validate_event(bytes(pending), state)
+            state = _validate_event(
+                bytes(pending),
+                state,
+                allow_web_search=allow_web_search,
+            )
     if events and state != 3:
         raise CodexProtocolError
     return bytes(data)
@@ -342,9 +371,19 @@ def _scan_secrets(value: object) -> None:
             raise CodexProtocolError
 
 
-async def _wait_process_streams(process: object) -> tuple[bytes, bytes, int]:
+async def _wait_process_streams(
+    process: object,
+    *,
+    allow_web_search: bool = False,
+) -> tuple[bytes, bytes, int]:
     tasks = (
-        asyncio.create_task(_read_stream(process.stdout, events=True)),  # type: ignore[attr-defined]
+        asyncio.create_task(  # type: ignore[attr-defined]
+            _read_stream(
+                process.stdout,
+                events=True,
+                allow_web_search=allow_web_search,
+            )
+        ),
         asyncio.create_task(_read_stream(process.stderr, events=False)),  # type: ignore[attr-defined]
         asyncio.create_task(process.wait()),  # type: ignore[attr-defined]
     )
@@ -357,7 +396,12 @@ async def _wait_process_streams(process: object) -> tuple[bytes, bytes, int]:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _interact_with_process(process: object, request_data: bytes) -> tuple[bytes, bytes, int]:
+async def _interact_with_process(
+    process: object,
+    request_data: bytes,
+    *,
+    allow_web_search: bool = False,
+) -> tuple[bytes, bytes, int]:
     written = process.stdin.write(request_data)  # type: ignore[attr-defined]
     if inspect.isawaitable(written):
         await written
@@ -365,7 +409,7 @@ async def _interact_with_process(process: object, request_data: bytes) -> tuple[
     process.stdin.close()  # type: ignore[attr-defined]
     with suppress(AttributeError):
         await process.stdin.wait_closed()  # type: ignore[attr-defined]
-    return await _wait_process_streams(process)
+    return await _wait_process_streams(process, allow_web_search=allow_web_search)
 
 
 async def _cleanup_process(process: object) -> None:
@@ -460,7 +504,8 @@ class CodexCli:
     ) -> ResultModel:
         if (
             (model, effort) not in _ALLOWED_MODELS
-            or type(request) not in {IntentRequest, PlanRequest, RepairRequest}
+            or type(request)
+            not in {IntentRequest, UrlDiscoveryRequest, PlanRequest, RepairRequest}
             or type(schema) is not dict
             or self._process_factory is not self._process_factory_anchor
             or self._auth_guard is not self._auth_guard_anchor
@@ -534,7 +579,7 @@ class CodexCli:
                 "-c",
                 f'model_reasoning_effort="{effort}"',
                 "-c",
-                'web_search="disabled"',
+                f'web_search="{_web_search_mode(request)}"',
                 "-c",
                 'forced_login_method="chatgpt"',
                 "-c",
@@ -568,7 +613,11 @@ class CodexCli:
                     env=env,
                     start_new_session=True,
                 )
-                _stdout, _stderr, returncode = await _interact_with_process(process, request_data)
+                _stdout, _stderr, returncode = await _interact_with_process(
+                    process,
+                    request_data,
+                    allow_web_search=type(request) is UrlDiscoveryRequest,
+                )
             if returncode != 0:
                 raise CodexProtocolError
             raw = _read_pinned(result_path, result_identity, MAX_RESULT_BYTES)

@@ -26,6 +26,10 @@ from personal_monitor.control.planner import (
     update_scope_is_valid,
 )
 from personal_monitor.control.preview import render_preview
+from personal_monitor.control.url_discovery import (
+    UrlDiscoveryOutcome,
+    ValidatedUrlCandidate,
+)
 from personal_monitor.domain.spec import MonitorStatus, RuleKind, RuleSpec
 from personal_monitor.storage.registry import ControlMonitor, RegistryRepository
 from personal_monitor.storage.schema import canonical_json, transaction, utc_now
@@ -36,6 +40,9 @@ _SAFE_FAILURE: Final = "요청을 처리하지 못했습니다. 모니터 상태
 _NOT_FOUND: Final = "해당 모니터를 확인할 수 없습니다."
 _CLARIFY: Final = "대상과 원하는 작업을 하나씩 더 구체적으로 알려주세요."
 _EDIT_GUIDANCE: Final = "원하는 변경 내용을 새 메시지로 보내주세요."
+_DISCOVERY_CLARIFY: Final = (
+    "공식 사이트를 확인하지 못했습니다. 사이트명이나 게시판명을 더 알려주세요."
+)
 
 
 class ControlService:
@@ -47,6 +54,7 @@ class ControlService:
         "_billing_status",
         "_billing_status_anchor",
         "_connection_anchor",
+        "_discover_anchor",
         "_now_source",
         "_now_source_anchor",
         "_now_call_anchor",
@@ -60,6 +68,9 @@ class ControlService:
         "_route_anchor",
         "_router",
         "_router_anchor",
+        "_url_discovery",
+        "_url_discovery_anchor",
+        "_validate_selected_url_anchor",
         "_validate_create_anchor",
     )
 
@@ -72,6 +83,7 @@ class ControlService:
         *,
         now_source: object = utc_now,
         billing_status: object | None = None,
+        url_discovery: object | None = None,
     ) -> None:
         if (
             type(registry) is not RegistryRepository
@@ -114,12 +126,24 @@ class ControlService:
             billing_status_call = (
                 _capture_callable(billing_status) if billing_status is not None else None
             )
+            discover = None
+            validate_selected_url = None
+            if url_discovery is not None:
+                discover = url_discovery.discover
+                validate_selected_url = url_discovery.validate_selected_url
             if (
                 not callable(route)
                 or not callable(propose)
                 or not callable(claim)
                 or not callable(validate_create)
                 or planner_actions is not actions
+                or (
+                    url_discovery is not None
+                    and (
+                        not callable(discover)
+                        or not callable(validate_selected_url)
+                    )
+                )
             ):
                 raise TypeError
             if not all(callable(method) for _, method in (*registry_methods, *actions_methods)):
@@ -151,6 +175,14 @@ class ControlService:
         object.__setattr__(self, "_now_call_anchor", now_call)
         object.__setattr__(self, "_billing_status", billing_status)
         object.__setattr__(self, "_billing_status_anchor", billing_status_call)
+        object.__setattr__(self, "_url_discovery", url_discovery)
+        object.__setattr__(self, "_url_discovery_anchor", url_discovery)
+        object.__setattr__(self, "_discover_anchor", discover)
+        object.__setattr__(
+            self,
+            "_validate_selected_url_anchor",
+            validate_selected_url,
+        )
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("ControlService composition is sealed")
@@ -175,6 +207,8 @@ class ControlService:
         if type(value) is ConsumedAction:
             if not self._claim_anchor(value) or not self._integrity_ok():
                 return ControlReply(_SAFE_FAILURE)
+            if value.action == "select_url":
+                return await self._confirm_url_selection(value)
             return self._handle_action(value)
         return ControlReply(_SAFE_FAILURE)
 
@@ -212,6 +246,12 @@ class ControlService:
         if fresh.kind is IntentKind.BILLING_STATUS:
             return self._billing_status_reply()
         if fresh.kind is IntentKind.CREATE:
+            if fresh.target_url is None:
+                if fresh.discovery_query is None:
+                    return ControlReply(_CLARIFY)
+                return await self._discover_create(safe_request, fresh)
+            if fresh.discovery_query is not None:
+                return ControlReply(_CLARIFY)
             return await self._create_preview(safe_request, fresh)
         if len(fresh.target_monitor_ids) != 1:
             return self._clarification(safe_request.owner_id)
@@ -235,7 +275,11 @@ class ControlService:
         if action.action == "create":
             try:
                 confirmed = reconstruct_confirmed_spec(action, owner_id=owner_id)
-                self._registry.create_monitor(confirmed.spec, created_by=owner_id)
+                self._registry.create_monitor(
+                    confirmed.spec,
+                    created_by=owner_id,
+                    url_alias=confirmed.url_alias,
+                )
             except Exception:
                 return ControlReply(_SAFE_FAILURE)
             return ControlReply(
@@ -265,10 +309,19 @@ class ControlService:
         self,
         request: ControlRequest,
         intent: IntentResult,
+        *,
+        alias_name: str | None = None,
     ) -> ControlReply:
         proposal: object | None = None
         try:
-            proposal = await self._propose_anchor(request, intent)
+            if alias_name is None:
+                proposal = await self._propose_anchor(request, intent)
+            else:
+                proposal = await self._propose_anchor(
+                    request,
+                    intent,
+                    alias_name=alias_name,
+                )
             if not self._integrity_ok():
                 raise ValueError
             if type(proposal) is not ProposedMonitor or proposal.spec.owner_id != request.owner_id:
@@ -283,6 +336,7 @@ class ControlService:
                     proposal.spec_hash,
                 ),
                 "spec": proposal.spec.model_dump(mode="json"),
+                "url_alias": alias_name,
             }
             if not self._validate_create_anchor(
                 proposal.pending_action,
@@ -301,6 +355,149 @@ class ControlService:
             if _is_fatal_exception(error):
                 raise
             return ControlReply(_SAFE_FAILURE)
+
+    async def _discover_create(
+        self,
+        request: ControlRequest,
+        intent: IntentResult,
+    ) -> ControlReply:
+        query = intent.discovery_query
+        if (
+            query is None
+            or self._discover_anchor is None
+            or self._validate_selected_url_anchor is None
+            or not self._integrity_ok()
+        ):
+            return ControlReply(_DISCOVERY_CLARIFY)
+        try:
+            value = await self._discover_anchor(request.owner_id, query)
+            if not self._integrity_ok() or type(value) is not UrlDiscoveryOutcome:
+                raise ValueError
+            outcome = UrlDiscoveryOutcome(
+                alias_name=value.alias_name,
+                candidates=tuple(
+                    ValidatedUrlCandidate(candidate.name, candidate.url)
+                    for candidate in value.candidates
+                ),
+                clarification=value.clarification,
+            )
+            if outcome.alias_name != query:
+                raise ValueError
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return ControlReply(_DISCOVERY_CLARIFY)
+        if not outcome.candidates:
+            clarification = safe_plain(
+                outcome.clarification or _DISCOVERY_CLARIFY,
+                limit=500,
+            )
+            return ControlReply(clarification or _DISCOVERY_CLARIFY)
+        if len(outcome.candidates) == 1:
+            resolved = _resolved_create_intent(intent, outcome.candidates[0].url)
+            if resolved is None:
+                return ControlReply(_DISCOVERY_CLARIFY)
+            return await self._create_preview(
+                request,
+                resolved,
+                alias_name=outcome.alias_name,
+            )
+        return self._url_selection_reply(request, intent, outcome)
+
+    def _url_selection_reply(
+        self,
+        request: ControlRequest,
+        intent: IntentResult,
+        outcome: UrlDiscoveryOutcome,
+    ) -> ControlReply:
+        pending_actions = []
+        try:
+            if not self._integrity_ok():
+                raise ValueError
+            now = _safe_now(self._call_now())
+            for candidate in outcome.candidates:
+                pending = self._actions.create(
+                    request.owner_id,
+                    "select_url",
+                    {
+                        "owner_id": request.owner_id,
+                        "chat_id": request.chat_id,
+                        "alias_name": outcome.alias_name,
+                        "candidate_name": candidate.name,
+                        "url": candidate.url,
+                        "condition_text": intent.condition_text,
+                        "schedule_text": intent.schedule_text,
+                    },
+                    now=now,
+                )
+                pending_actions.append(pending)
+            buttons = tuple(
+                (
+                    InlineButton(
+                        safe_plain(candidate.name, limit=120),
+                        pending.confirm_callback,
+                    ),
+                )
+                for candidate, pending in zip(
+                    outcome.candidates,
+                    pending_actions,
+                    strict=True,
+                )
+            )
+            return ControlReply(
+                "공식 URL 후보가 여러 개입니다. 사용할 사이트를 선택해 주세요.",
+                buttons,
+            )
+        except BaseException as error:
+            for pending in pending_actions:
+                with suppress(Exception):
+                    self._actions.revoke(pending.token, request.owner_id)
+            if _is_fatal_exception(error):
+                raise
+            return ControlReply(_DISCOVERY_CLARIFY)
+
+    async def _confirm_url_selection(self, action: ConsumedAction) -> ControlReply:
+        owner_id = action.owner_id
+        values = _url_selection_payload(action.payload)
+        if (
+            action.operation != "confirm"
+            or values is None
+            or values["owner_id"] != owner_id
+            or self._validate_selected_url_anchor is None
+            or not self._integrity_ok()
+        ):
+            return ControlReply(_SAFE_FAILURE)
+        try:
+            validated_url = await self._validate_selected_url_anchor(
+                owner_id,
+                values["url"],
+            )
+            if type(validated_url) is not str or not self._integrity_ok():
+                raise ValueError
+            intent = IntentResult(
+                kind=IntentKind.CREATE,
+                target_monitor_ids=[],
+                target_url=validated_url,
+                discovery_query=None,
+                condition_text=values["condition_text"],
+                schedule_text=values["schedule_text"],
+                clarification=None,
+                confidence=1.0,
+            )
+            request = ControlRequest(
+                owner_id,
+                values["chat_id"],
+                _selection_request_text(values),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return ControlReply(_DISCOVERY_CLARIFY)
+        return await self._create_preview(
+            request,
+            intent,
+            alias_name=values["alias_name"],
+        )
 
     def _list_reply(self, owner_id: str) -> ControlReply:
         if not self._integrity_ok():
@@ -649,6 +846,7 @@ class ControlService:
                 and self._registry is self._registry_anchor
                 and self._planner is self._planner_anchor
                 and self._actions is self._actions_anchor
+                and self._url_discovery is self._url_discovery_anchor
                 and self._now_source is self._now_source_anchor
                 and (
                     (self._billing_status is None and self._billing_status_anchor is None)
@@ -658,6 +856,28 @@ class ControlService:
                         and _captured_callable_intact(
                             self._billing_status,
                             self._billing_status_anchor,
+                        )
+                    )
+                )
+                and (
+                    (
+                        self._url_discovery_anchor is None
+                        and self._discover_anchor is None
+                        and self._validate_selected_url_anchor is None
+                    )
+                    or (
+                        self._url_discovery_anchor is not None
+                        and self._discover_anchor is not None
+                        and self._validate_selected_url_anchor is not None
+                        and _callable_still_attached(
+                            self._discover_anchor,
+                            self._url_discovery_anchor,
+                            "discover",
+                        )
+                        and _callable_still_attached(
+                            self._validate_selected_url_anchor,
+                            self._url_discovery_anchor,
+                            "validate_selected_url",
                         )
                     )
                 )
@@ -842,6 +1062,77 @@ def _repair_payload(payload: Mapping[str, object]) -> dict[str, str] | None:
         return result  # type: ignore[return-value]
     except Exception:
         return None
+
+
+def _url_selection_payload(
+    payload: Mapping[str, object],
+) -> dict[str, str | None] | None:
+    keys = {
+        "owner_id",
+        "chat_id",
+        "alias_name",
+        "candidate_name",
+        "url",
+        "condition_text",
+        "schedule_text",
+    }
+    try:
+        if set(payload) != keys:
+            return None
+        result = {key: payload[key] for key in keys}
+        required = (
+            result["owner_id"],
+            result["chat_id"],
+            result["alias_name"],
+            result["candidate_name"],
+            result["url"],
+        )
+        if not all(type(value) is str and value for value in required):
+            return None
+        if any(
+            value is not None and (type(value) is not str or not value)
+            for value in (
+                result["condition_text"],
+                result["schedule_text"],
+            )
+        ):
+            return None
+        return result  # type: ignore[return-value]
+    except Exception:
+        return None
+
+
+def _resolved_create_intent(
+    source: IntentResult,
+    target_url: str,
+) -> IntentResult | None:
+    with suppress(Exception):
+        return IntentResult(
+            kind=IntentKind.CREATE,
+            target_monitor_ids=[],
+            target_url=target_url,
+            discovery_query=None,
+            condition_text=source.condition_text,
+            schedule_text=source.schedule_text,
+            clarification=None,
+            confidence=source.confidence,
+        )
+    return None
+
+
+def _selection_request_text(values: Mapping[str, str | None]) -> str:
+    parts = [
+        f"선택한 사이트: {safe_plain(values['alias_name'] or '', limit=300)}",
+    ]
+    if values["condition_text"] is not None:
+        parts.append(
+            f"조건: {safe_plain(values['condition_text'], limit=2_000)}"
+        )
+    if values["schedule_text"] is not None:
+        parts.append(
+            f"일정: {safe_plain(values['schedule_text'], limit=500)}"
+        )
+    return "\n".join(parts)
 
 
 def _status_lines(monitor: ControlMonitor, *, prefix: str = "") -> list[str]:

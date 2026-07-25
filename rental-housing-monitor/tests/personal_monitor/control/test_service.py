@@ -26,6 +26,10 @@ from personal_monitor.control.planner import (
     _runtime_material,
 )
 from personal_monitor.control.service import ControlService
+from personal_monitor.control.url_discovery import (
+    UrlDiscoveryOutcome,
+    ValidatedUrlCandidate,
+)
 from personal_monitor.domain.spec import FetchStrategy, MonitorSpec, MonitorStatus
 from personal_monitor.engine.scheduler import next_run_at
 from personal_monitor.security.robots import RobotsDecision
@@ -93,9 +97,17 @@ class FakePlanner:
         self.proposal = proposal
         self.action_service = action_service
         self.calls: list[tuple[ControlRequest, IntentResult]] = []
+        self.alias_calls: list[str | None] = []
 
-    async def propose(self, request: ControlRequest, intent: IntentResult) -> ProposedMonitor:
+    async def propose(
+        self,
+        request: ControlRequest,
+        intent: IntentResult,
+        *,
+        alias_name: str | None = None,
+    ) -> ProposedMonitor:
         self.calls.append((request, intent))
+        self.alias_calls.append(alias_name)
         return self.proposal
 
 
@@ -138,6 +150,21 @@ class BoundUnusedPlanner(UnusedPlanner):
         super().__init__(action_service)
 
 
+class FakeUrlDiscovery:
+    def __init__(self, outcome: UrlDiscoveryOutcome) -> None:
+        self.outcome = outcome
+        self.calls: list[tuple[str, str]] = []
+        self.validation_calls: list[tuple[str, str]] = []
+
+    async def discover(self, owner_id: str, query: str) -> UrlDiscoveryOutcome:
+        self.calls.append((owner_id, query))
+        return self.outcome
+
+    async def validate_selected_url(self, owner_id: str, url: str) -> str:
+        self.validation_calls.append((owner_id, url))
+        return url
+
+
 def _intent(kind: IntentKind, monitor_id: str | None = None) -> IntentResult:
     return IntentResult(
         kind=kind,
@@ -167,7 +194,11 @@ def _deep_exception_group(leaf: BaseException, *, depth: int = 1_105) -> BaseExc
     return result
 
 
-def _proposal(actions: PendingActionService) -> ProposedMonitor:
+def _proposal(
+    actions: PendingActionService,
+    *,
+    url_alias: str | None = None,
+) -> ProposedMonitor:
     spec = _spec()
     candidate = "1" * 32
     digest = hashlib.sha256(canonical_json(spec.model_dump(mode="json")).encode()).hexdigest()
@@ -179,6 +210,7 @@ def _proposal(actions: PendingActionService) -> ProposedMonitor:
             "spec_hash": digest,
             "binding_hash": _proposal_binding(OWNER, candidate, digest),
             "spec": spec.model_dump(mode="json"),
+            "url_alias": url_alias,
         },
         now=NOW,
     )
@@ -773,6 +805,116 @@ def test_create_is_absent_before_confirmation_and_created_for_authenticated_owne
     assert "등록했습니다" in result.text
     assert len(registry.list_monitors(OWNER)) == 1
     assert registry.list_monitors("telegram-user:8") == []
+    connection.close()
+
+
+def test_url_less_create_with_one_candidate_opens_preview_and_saves_alias() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    query = "LH 청약플러스 임대 공고"
+    proposal = _proposal(actions, url_alias=query)
+    planner = FakePlanner(proposal, actions)
+    discovery = FakeUrlDiscovery(
+        UrlDiscoveryOutcome(
+            alias_name=query,
+            candidates=(
+                ValidatedUrlCandidate("LH 청약플러스", proposal.spec.target_url),
+            ),
+            clarification=None,
+        )
+    )
+    create_intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=None,
+        discovery_query=query,
+        condition_text="새 임대 공고",
+        schedule_text=None,
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(create_intent),
+        registry,
+        planner,
+        actions,
+        now_source=lambda: NOW,
+        url_discovery=discovery,
+    )
+
+    preview = _run(service.handle(_request("LH 청약플러스 새 임대 공고 알려줘")))
+
+    assert discovery.calls == [(OWNER, query)]
+    assert planner.calls[0][1].target_url == proposal.spec.target_url
+    assert planner.calls[0][1].discovery_query is None
+    assert planner.alias_calls == [query]
+    assert preview.buttons[0][0].text == "등록"
+    assert registry.get_url_alias(OWNER, query) is None
+
+    consumed = actions.consume(proposal.pending_action.token, OWNER, now=NOW)
+    result = _run(service.handle(consumed))
+
+    assert "등록했습니다" in result.text
+    assert registry.get_url_alias(OWNER, query) == proposal.spec.target_url
+    connection.close()
+
+
+def test_url_less_create_with_multiple_candidates_uses_buttons_and_revalidates_selection() -> None:
+    registry, connection = _registry()
+    actions = PendingActionService(connection)
+    query = "시청 임대 게시판"
+    proposal = _proposal(actions, url_alias=query)
+    planner = FakePlanner(proposal, actions)
+    first_url = proposal.spec.target_url
+    second_url = "https://example.org/housing"
+    discovery = FakeUrlDiscovery(
+        UrlDiscoveryOutcome(
+            alias_name=query,
+            candidates=(
+                ValidatedUrlCandidate("서울시 주거 공고", first_url),
+                ValidatedUrlCandidate("서울주거포털", second_url),
+            ),
+            clarification=None,
+        )
+    )
+    create_intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=None,
+        discovery_query=query,
+        condition_text="새 공고",
+        schedule_text="매일 오전 9시",
+        clarification=None,
+        confidence=1.0,
+    )
+    service = ControlService(
+        FakeIntentRouter(create_intent),
+        registry,
+        planner,
+        actions,
+        now_source=lambda: NOW,
+        url_discovery=discovery,
+    )
+
+    choices = _run(service.handle(_request("시청 임대 게시판 새 공고 알려줘")))
+
+    assert "후보" in choices.text
+    assert tuple(button.text for row in choices.buttons for button in row) == (
+        "서울시 주거 공고",
+        "서울주거포털",
+    )
+    assert planner.calls == []
+
+    token = choices.buttons[0][0].callback_data.removeprefix("confirm:")
+    selected = actions.consume(token, OWNER, now=NOW)
+    preview = _run(service.handle(selected))
+
+    assert discovery.validation_calls == [(OWNER, first_url)]
+    assert planner.calls[0][1].target_url == first_url
+    assert planner.calls[0][1].condition_text == "새 공고"
+    assert planner.calls[0][1].schedule_text == "매일 오전 9시"
+    assert planner.alias_calls == [query]
+    assert preview.buttons[0][0].text == "등록"
     connection.close()
 
 
