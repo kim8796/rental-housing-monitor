@@ -150,16 +150,35 @@ def test_deploy_runbook_hands_private_source_archive_to_service_uid() -> None:
 def test_runbooks_use_root_compose_wrapper_for_private_app_directory() -> None:
     deploy = _text(GCP_DEPLOY)
     cutover = _text(RENTAL_CUTOVER)
+    initial_deploy = deploy.split("## 5. 기존 서버의 안전한 업그레이드", maxsplit=1)[0]
     assert (
         "sudo install -o root -g root -m 0755 "
         "/srv/personal-monitor/app/deploy/personal-monitor-compose "
         "/usr/local/sbin/personal-monitor-compose"
         in deploy
     )
-    for text in (deploy, cutover):
+    for text in (initial_deploy, cutover):
         assert "cd /srv/personal-monitor/app" not in text
         assert "sudo docker compose" not in text
         assert "sudo personal-monitor-compose" in text
+
+
+def test_upgrade_runbook_builds_next_release_without_compose_network_collision() -> None:
+    deploy = _text(GCP_DEPLOY)
+    upgrade = deploy.split("## 5. 기존 서버의 안전한 업그레이드", maxsplit=1)[1]
+    for value in (
+        'next="/srv/personal-monitor/app-next-$release"',
+        'personal-monitor:rollback-$release',
+        "sudo docker compose",
+        '--project-directory "$next"',
+        '--file "$next/compose.yaml"',
+        "sudo docker run --rm --network none --user 10001:10001",
+        "-v /srv/personal-monitor/db:/srv/personal-monitor/db",
+        "personal-monitor database init",
+        "DB `quick_check=ok`",
+        "`docker builder prune -f`",
+    ):
+        assert value in upgrade
 
 
 def test_device_login_uses_one_shot_container_before_worker_start() -> None:
