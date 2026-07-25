@@ -21,7 +21,8 @@
 - 마지막 갱신: 2026-07-25 KST
 - 저장소: `kim8796/rental-housing-monitor`
 - 기본 브랜치: `main`
-- 최근 확인한 `main`: `4b00a8f` (PR #9 Telegram 요청 형식 문서화)
+- 이번 작업 시작 시 `main`: `315d366` (PR #10 운영 점검 기록)
+- 운영 배포 기준: `904b141` (결제 동기화와 백업 배포 복구)
 - 최근 기능 기준: `24f55a2` (PR #7 GCP 크레딧 모니터 병합)
 - 서비스 성격: 현재 개인용이며, 사용자·소유자 경계를 유지해 향후 다중 사용자
   서비스로 확장 가능하게 설계한다.
@@ -68,6 +69,9 @@ Telegram에서 새 모니터를 등록할 때는 JSON이나 slash command가 아
 - 예: `https://example.com/notices 새 글 중 청년 키워드가 있으면 평일 오전 9시에 알려줘`
 - 현재 의도 분석은 대화 기록 전체가 아니라 현재 메시지를 기준으로 하므로, 추가
   설명을 보낼 때도 URL과 조건을 포함한 완전한 요청을 다시 보내는 편이 안전하다.
+- 사이트 이름과 게시판·키워드만 말하면 Codex가 공개 웹에서 후보 URL을 찾고
+  사용자 확인 뒤 등록하는 URL 없는 생성 흐름은 설계 승인됐지만 아직 구현되지
+  않았다. 현재 운영 버전은 생성 요청에 URL이 필요하다.
 - 최소 확인 간격은 15분이다. Telegram에 계정 비밀번호, API key, token을 보내지
   않는다. 로그인 사이트는 별도 인증 프로필 등록이 먼저 필요하다.
 - 요청을 받으면 페이지를 시험 수집한 뒤 이름, 대상, 현재 예시값, 조건, 시간대,
@@ -129,23 +133,36 @@ Telegram 연결을 다시 확인한다.
   - 종료일: 2026-10-08
 - Cloud Billing Standard usage export가 활성화됐다.
 - `billing_monitor`에 `gcp_billing_export_v1_*` 테이블 생성까지 확인했다.
-- 첫 BigQuery 기반 일일 동기화는 아직 확인하지 않았다. 현재 최신 DB snapshot
-  source는 `console`이다.
+- 이 항목은 당시 상태 기록이다. 첫 BigQuery 동기화와 백업 복구는 아래
+  `2026-07-25 운영 복구`에서 완료됐다.
 - 구현 배포와 PR #7 병합 직전 전체 테스트 결과는 `5310 passed`, Ruff 통과다.
 
-## 2026-07-25 운영 점검
+## 2026-07-25 운영 복구
 
-- 16:09 KST 기준 VM, systemd, 세 Compose 컨테이너와 DB heartbeat는 정상이다.
-- 12:10 KST 크레딧 동기화는 예약대로 시작했지만 `BigQueryBillingError`로 실패했다.
-- BigQuery SQL과 권한은 정상이며 조회 결과도 반환된다.
-- 원인은 Standard usage export의 `month_cost`, `promotion_consumed`,
-  `recent_7d_consumed` schema가 `FLOAT`인데
-  `src/personal_monitor/billing/bigquery.py`가 `NUMERIC`만 허용하는 형식 불일치다.
-- 최신 billing snapshot은 여전히 2026-07-24 21:10 KST의 `console` 기준값이다.
-  12:20 요약이 실제 Telegram에 전달됐는지는 별도로 검증하지 않았다.
-- `backup_failed` 운영 이벤트가 2026-07-24 03:10 KST 이후 반복됐고,
-  `backup-status.json`은 그 시각 이후 갱신되지 않았다. 크레딧 파서 수정과 별개로
-  백업 실패 원인을 조사해야 한다.
+- 16:34 KST 기준 `904b141`을 VM에 배포했고 systemd와 세 Compose 컨테이너,
+  SQLite 무결성 및 heartbeat가 정상이다.
+- 결제 동기화 실패에는 두 원인이 있었다.
+  - Standard usage export의 세 금액 필드가 `FLOAT`인데 파서가 `NUMERIC`만
+    허용했다.
+  - VM 서비스 계정에 `billing_monitor` 데이터셋 `READER` ACL이 없었다.
+- 파서를 실제 schema에 맞추고 데이터셋에 최소 읽기 ACL을 부여했다.
+  `infra/gcp/provision.sh`도 allowlist가 필요한
+  `bq add-iam-policy-binding --dataset` 대신 기존 ACL과 etag를 보존하는
+  `bq update --update_mode=UPDATE_ACL` 방식을 사용한다.
+- 16:34 KST 수동 동기화가 성공했고 최신 billing snapshot은
+  `source=bigquery`, 잔액 ₩455,145.36, 98.85%다. 아직 export 사용행이 없어
+  프로젝트별 사용액은 0건이며, 다음 자동 동기화는 매일 12:10 KST다.
+- 배포 이후 `billing_iteration_failed`는 0건이다. 12:20 자동 Telegram 요약은
+  다음 예약 실행 때 별도 확인한다.
+- 백업 실패 원인은 앱의 `compose.yaml`이 group-writable mode `0664`로 배포돼
+  백업 스크립트의 보안 검사를 통과하지 못한 것이었다.
+- 배포 파일을 서비스 계정 소유 `0644`로 바로잡고 배포 runbook에 mode/owner
+  검사를 추가했다.
+- 16:34 KST 백업 서비스가 `success/0`, `backup-status.json`이 `status=ok`로
+  끝났고 GCS에 `daily/2026-07-25T073428Z.tar.age` 객체가 생성됐다.
+- 백업 timer는 active이며 다음 예약은 2026-07-26 03:10 KST다.
+- 복구 및 재발 방지 변경 후 전체 테스트 `5310 passed`, Ruff, `bash -n`,
+  `git diff --check`가 통과했다.
 
 ## 중요한 운영 경계
 
@@ -193,8 +210,7 @@ git diff --check
 ## 다음 세션의 첫 행동
 
 1. `git status -sb`, `git log -5 --oneline`으로 이 문서 이후 변경을 확인한다.
-2. BigQuery 결과의 안전한 `FLOAT` 파싱을 테스트 우선으로 수정하고 VM에 배포한다.
-3. 수동 동기화 또는 다음 12:10 KST 실행으로 최신 billing snapshot이
-   `source=bigquery`인지 확인한다.
-4. 반복된 `backup_failed`의 실제 오류와 GCS 최신 객체를 확인해 별도로 복구한다.
-5. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
+2. 다음 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하는지 확인한다.
+3. 승인된 URL 없는 생성 흐름을 짧은 구현 명세로 확정하고, URL이 없는 생성
+   요청에만 Codex Pro 공개 웹 검색을 사용해 후보 사이트를 제안하도록 구현한다.
+4. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
