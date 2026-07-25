@@ -171,7 +171,15 @@ async def _remove_workspace(path: Path, identity: tuple[int, int]) -> None:
         raise CodexProtocolError from None
 
 
-def _bounded_json(data: bytes) -> object:
+def _bounded_json(
+    data: bytes,
+    *,
+    object_pairs_hook: Callable[
+        [list[tuple[str, object]]],
+        dict[str, object],
+    ]
+    | None = None,
+) -> object:
     if not data or len(data) > MAX_FRAME_BYTES:
         raise CodexProtocolError
     try:
@@ -180,7 +188,7 @@ def _bounded_json(data: bytes) -> object:
             text,
             parse_int=lambda raw: _bounded_int(raw),
             parse_constant=lambda _raw: (_ for _ in ()).throw(CodexProtocolError()),
-            object_pairs_hook=_unique_object,
+            object_pairs_hook=object_pairs_hook or _unique_object,
         )
     except CodexProtocolError:
         raise
@@ -202,6 +210,27 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         if key in value:
             raise CodexProtocolError
         value[key] = item
+    return value
+
+
+def _codex_event_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    duplicate_id = False
+    for key, item in pairs:
+        if key in value:
+            if (
+                key != "id"
+                or type(value[key]) is not str
+                or type(item) is not str
+                or not 1 <= len(value[key]) <= 128
+                or not 1 <= len(item) <= 128
+            ):
+                raise CodexProtocolError
+            duplicate_id = True
+            continue
+        value[key] = item
+    if duplicate_id and value.get("type") != "web_search":
+        raise CodexProtocolError
     return value
 
 
@@ -240,7 +269,7 @@ def _walk_json(value: object) -> None:
 
 
 def _validate_event(line: bytes, state: int, *, allow_web_search: bool = False) -> int:
-    value = _bounded_json(line)
+    value = _bounded_json(line, object_pairs_hook=_codex_event_object)
     if type(value) is not dict:
         raise CodexProtocolError
     event_type = value.get("type")

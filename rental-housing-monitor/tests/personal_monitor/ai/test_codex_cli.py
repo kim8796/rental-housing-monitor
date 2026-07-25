@@ -370,6 +370,27 @@ def test_web_search_stream_item_is_allowed_only_for_discovery_run() -> None:
     assert _validate_event(search, state, allow_web_search=True) == state
 
 
+def test_codex_web_search_event_accepts_only_bounded_string_duplicate_ids() -> None:
+    event = (
+        b'{"type":"item.started","item":{"id":"search-1","type":"web_search",'
+        b'"action":"search","query":"official housing notices","id":"action-2"}}'
+    )
+    wrong_type = event.replace(
+        b'"id":"action-2"}}',
+        b'"id":2}}',
+    )
+    wrong_event = event.replace(
+        b'"type":"web_search"',
+        b'"type":"agent_message"',
+    )
+
+    assert _validate_event(event, 2, allow_web_search=True) == 2
+    with pytest.raises(CodexProtocolError):
+        _validate_event(wrong_type, 2, allow_web_search=True)
+    with pytest.raises(CodexProtocolError):
+        _validate_event(wrong_event, 2, allow_web_search=True)
+
+
 @async_test
 @pytest.mark.parametrize(
     ("model", "effort"),
@@ -573,6 +594,68 @@ def test_url_discovery_worker_discriminator_result_type_and_prompt_are_fixed() -
     assert result_type_for(value) is UrlDiscoveryResult
     assert "공식" in prompt_for(UrlDiscoveryRequest)
     assert "최대 3개" in prompt_for(UrlDiscoveryRequest)
+
+
+@pytest.mark.parametrize("result_type", [PlanResult, RepairResult])
+def test_spec_result_transports_named_fields_as_an_array_and_restores_monitor_spec(
+    result_type: type[PlanResult] | type[RepairResult],
+) -> None:
+    current = spec()
+    kwargs: dict[str, object] = {
+        "spec": current,
+        "explanation": "가격 필드를 기준으로 구성했습니다.",
+    }
+    if result_type is RepairResult:
+        kwargs["changed_fields"] = []
+    encoded = result_type(**kwargs).model_dump(mode="json")
+
+    assert encoded["spec"]["extract"]["fields"] == [
+        {
+            "name": "price",
+            "selector": ".price",
+            "type": "krw",
+            "required": True,
+            "attribute": None,
+            "pattern": None,
+        }
+    ]
+    assert result_type.model_validate(encoded).spec == current
+
+
+@pytest.mark.parametrize("result_type", [PlanResult, RepairResult])
+def test_spec_output_schema_is_strict_structured_output_compatible(
+    result_type: type[PlanResult] | type[RepairResult],
+) -> None:
+    schema = result_type.model_json_schema()
+    definitions = schema["$defs"]
+
+    def resolved(value: dict[str, object]) -> dict[str, object]:
+        reference = value.get("$ref")
+        if isinstance(reference, str):
+            return definitions[reference.rsplit("/", 1)[-1]]
+        return value
+
+    spec_schema = resolved(schema["properties"]["spec"])
+    extract_schema = resolved(spec_schema["properties"]["extract"])
+    fields_schema = resolved(extract_schema["properties"]["fields"])
+    item_schema = resolved(fields_schema["items"])
+
+    assert fields_schema["type"] == "array"
+    assert item_schema["additionalProperties"] is False
+    assert set(item_schema["required"]) == set(item_schema["properties"])
+
+    stack: list[object] = [schema]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            assert "default" not in current
+            properties = current.get("properties")
+            if isinstance(properties, dict):
+                assert current["additionalProperties"] is False
+                assert set(current["required"]) == set(properties)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
 
 
 @async_test
