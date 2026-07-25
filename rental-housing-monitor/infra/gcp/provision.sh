@@ -227,28 +227,74 @@ gcloud projects add-iam-policy-binding "$PROJECT" \
 BILLING_DATASET_FILE="$WORKSPACE/billing-dataset.json"
 if bq --project_id="$PROJECT" show --format=prettyjson \
     "$PROJECT:$BILLING_DATASET" >"$BILLING_DATASET_FILE" 2>/dev/null; then
-    python3 - "$BILLING_DATASET_FILE" "$PROJECT" "$BILLING_DATASET" <<'PY' || exit 1
+    :
+else
+    bq --project_id="$PROJECT" --location=US mk --dataset \
+        "$PROJECT:$BILLING_DATASET" >/dev/null 2>&1 || fail
+    bq --project_id="$PROJECT" show --format=prettyjson \
+        "$PROJECT:$BILLING_DATASET" >"$BILLING_DATASET_FILE" 2>/dev/null || fail
+fi
+BILLING_DATASET_ACL_FILE="$WORKSPACE/billing-dataset-acl.json"
+python3 - \
+    "$BILLING_DATASET_FILE" \
+    "$PROJECT" \
+    "$BILLING_DATASET" \
+    "$SERVICE_ACCOUNT_EMAIL" \
+    "$BILLING_DATASET_ACL_FILE" <<'PY' || exit 1
 import json
 import sys
 from pathlib import Path
 
 dataset = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 reference = dataset.get("datasetReference", {})
+access = dataset.get("access")
+etag = dataset.get("etag")
 if (
     reference.get("projectId") != sys.argv[2]
     or reference.get("datasetId") != sys.argv[3]
     or dataset.get("location") != "US"
+    or type(access) is not list
+    or type(etag) is not str
+    or not etag
+):
+    raise SystemExit(1)
+desired = {"role": "READER", "userByEmail": sys.argv[4]}
+if desired not in access:
+    access.append(desired)
+payload = {"access": access, "etag": etag}
+Path(sys.argv[5]).write_text(
+    json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+bq --project_id="$PROJECT" update --dataset \
+    --source="$BILLING_DATASET_ACL_FILE" \
+    --update_mode=UPDATE_ACL \
+    "$PROJECT:$BILLING_DATASET" >/dev/null 2>&1 || fail
+bq --project_id="$PROJECT" show --format=prettyjson \
+    "$PROJECT:$BILLING_DATASET" >"$BILLING_DATASET_FILE" 2>/dev/null || fail
+python3 - \
+    "$BILLING_DATASET_FILE" \
+    "$PROJECT" \
+    "$BILLING_DATASET" \
+    "$SERVICE_ACCOUNT_EMAIL" <<'PY' || exit 1
+import json
+import sys
+from pathlib import Path
+
+dataset = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+reference = dataset.get("datasetReference", {})
+access = dataset.get("access")
+desired = {"role": "READER", "userByEmail": sys.argv[4]}
+if (
+    reference.get("projectId") != sys.argv[2]
+    or reference.get("datasetId") != sys.argv[3]
+    or dataset.get("location") != "US"
+    or type(access) is not list
+    or desired not in access
 ):
     raise SystemExit(1)
 PY
-else
-    bq --project_id="$PROJECT" --location=US mk --dataset \
-        "$PROJECT:$BILLING_DATASET" >/dev/null 2>&1 || fail
-fi
-bq --project_id="$PROJECT" add-iam-policy-binding --dataset \
-    --member="serviceAccount:$SERVICE_ACCOUNT_EMAIL" \
-    --role=roles/bigquery.dataViewer \
-    "$PROJECT:$BILLING_DATASET" >/dev/null 2>&1 || fail
 
 BUCKET_FILE="$WORKSPACE/bucket.json"
 if gcloud storage buckets describe "$BUCKET" \

@@ -37,9 +37,9 @@ def test_source_uses_fixed_metadata_and_bounded_parameterized_query() -> None:
                     "fields": [
                         {"name": "project_id", "type": "STRING"},
                         {"name": "project_name", "type": "STRING"},
-                        {"name": "month_cost", "type": "NUMERIC"},
-                        {"name": "promotion_consumed", "type": "NUMERIC"},
-                        {"name": "recent_7d_consumed", "type": "NUMERIC"},
+                        {"name": "month_cost", "type": "FLOAT"},
+                        {"name": "promotion_consumed", "type": "FLOAT"},
+                        {"name": "recent_7d_consumed", "type": "FLOAT"},
                     ]
                 },
                 "rows": [

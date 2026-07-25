@@ -23,9 +23,9 @@ _MAX_RESPONSE_BYTES: Final = 1024 * 1024
 _FIELDS: Final = (
     ("project_id", "STRING"),
     ("project_name", "STRING"),
-    ("month_cost", "NUMERIC"),
-    ("promotion_consumed", "NUMERIC"),
-    ("recent_7d_consumed", "NUMERIC"),
+    ("month_cost", "FLOAT"),
+    ("promotion_consumed", "FLOAT"),
+    ("recent_7d_consumed", "FLOAT"),
 )
 _QUERY: Final = """
 WITH usage AS (
