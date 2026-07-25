@@ -130,6 +130,7 @@ class ConfirmedProposal:
     spec: MonitorSpec
     candidate_version_id: str
     spec_hash: str
+    url_alias: str | None = None
 
     def __repr__(self) -> str:
         return "<ConfirmedProposal redacted>"
@@ -281,20 +282,45 @@ class MonitorPlanner:
             raise PlanningFailed
         return actions
 
+    async def validate_discovery_url(self, owner_id: str, url: str) -> str:
+        if (
+            type(owner_id) is not str
+            or _OWNER_RE.fullmatch(owner_id) is None
+            or type(url) is not str
+            or not self._all_dependencies_intact()
+        ):
+            raise PlanningFailed
+        target = await self._validate_target(url)
+        probe = await self._probe_once(owner_id, target)
+        if probe.target.normalized_url != target.normalized_url:
+            raise PlanningFailed
+        return probe.target.normalized_url
+
     async def propose(
         self,
         request: ControlRequest,
         intent: IntentResult,
+        *,
+        alias_name: str | None = None,
     ) -> ProposedMonitor:
         validated_input = _validate_input(request, intent)
-        if validated_input is None or not self._all_dependencies_intact():
+        if (
+            validated_input is None
+            or not _valid_url_alias_name(alias_name)
+            or not self._all_dependencies_intact()
+        ):
             raise PlanningFailed
         safe_request, safe_intent = validated_input
         spec_value, items, trusted_probe = await self._build_candidate(
             safe_request,
             safe_intent,
         )
-        return self._persist_proposal(spec_value, items, trusted_probe)
+        return self._persist_proposal(
+            spec_value,
+            items,
+            trusted_probe,
+            alias_name=alias_name,
+        )
 
     async def plan_update(
         self,
@@ -678,6 +704,8 @@ class MonitorPlanner:
         spec: MonitorSpec,
         items: tuple[ObservedItem, ...],
         probe: ProbeResult,
+        *,
+        alias_name: str | None,
     ) -> ProposedMonitor:
         snapshot = _capture_proposal_snapshot(spec, items, probe)
         if snapshot is None:
@@ -717,6 +745,7 @@ class MonitorPlanner:
                 digest,
             ),
             "spec": spec_json,
+            "url_alias": alias_name,
         }
         runtime_material = _runtime_material(
             fresh_spec.owner_id,
@@ -804,13 +833,21 @@ def reconstruct_confirmed_spec(
             or _OWNER_RE.fullmatch(owner_id) is None
             or action.owner_id != owner_id
             or type(action.payload) not in {dict, MappingProxyType}
-            or set(action.payload) != {"candidate_version_id", "spec_hash", "binding_hash", "spec"}
+            or set(action.payload)
+            != {
+                "candidate_version_id",
+                "spec_hash",
+                "binding_hash",
+                "spec",
+                "url_alias",
+            }
             or not isinstance(action.payload["spec"], Mapping)
         ):
             raise ValueError
         candidate_version_id = action.payload["candidate_version_id"]
         spec_hash = action.payload["spec_hash"]
         binding_hash = action.payload["binding_hash"]
+        url_alias = action.payload["url_alias"]
         if (
             type(candidate_version_id) is not str
             or _OPAQUE_ID_RE.fullmatch(candidate_version_id) is None
@@ -819,6 +856,7 @@ def reconstruct_confirmed_spec(
             or type(binding_hash) is not str
             or _HASH_RE.fullmatch(binding_hash) is None
             or binding_hash != _proposal_binding(owner_id, candidate_version_id, spec_hash)
+            or not _valid_url_alias_name(url_alias)
         ):
             raise ValueError
         value = MonitorSpec.model_validate(_thaw_json(action.payload["spec"]))
@@ -828,7 +866,7 @@ def reconstruct_confirmed_spec(
             or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != spec_hash
         ):
             raise ValueError
-        result = ConfirmedProposal(value, candidate_version_id, spec_hash)
+        result = ConfirmedProposal(value, candidate_version_id, spec_hash, url_alias)
     if result is None:
         raise PlanningFailed
     return result
@@ -1412,6 +1450,18 @@ def _fresh_action_input(value: object) -> dict[str, object] | None:
             raise TypeError
         result = rebuilt
     return result
+
+
+def _valid_url_alias_name(value: object) -> bool:
+    if value is None:
+        return True
+    if type(value) is not str or not 1 <= len(value) <= 300 or not value.strip():
+        return False
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return False
+    return not any(unicodedata.category(character).startswith("C") for character in value)
 
 
 def _fresh_target(value: object, *, expected_url: str) -> ResolvedTarget | None:

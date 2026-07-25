@@ -11,7 +11,12 @@ import pytest
 from pydantic import ValidationError
 
 from personal_monitor.ai.auth import CodexAuthGuard
-from personal_monitor.ai.codex_cli import CodexCli, CodexProtocolError
+from personal_monitor.ai.codex_cli import (
+    CodexCli,
+    CodexProtocolError,
+    _validate_event,
+    _web_search_mode,
+)
 from personal_monitor.ai.contracts import (
     IntentKind,
     IntentRequest,
@@ -20,10 +25,22 @@ from personal_monitor.ai.contracts import (
     PlanResult,
     RepairRequest,
     RepairResult,
+    UrlCandidate,
+    UrlDiscoveryRequest,
+    UrlDiscoveryResult,
     WorkerRequest,
+    request_kind,
+    result_type_for,
 )
+from personal_monitor.ai.prompts import prompt_for
 from personal_monitor.domain.spec import MonitorSpec
 from tests.credential_alias_cases import PUNCTUATED_ASSIGNMENTS, SENSITIVE_ASSIGNMENTS
+
+TRUE_BINARY = (
+    str(Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Git/usr/bin/true.exe")
+    if os.name == "nt"
+    else "/usr/bin/true"
+)
 
 
 def async_test(function):
@@ -40,6 +57,13 @@ def request() -> IntentRequest:
         owner_id="telegram-user:7",
         message="서울 임대주택을 모니터해줘",
         monitor_summaries=[],
+    )
+
+
+def discovery_request() -> UrlDiscoveryRequest:
+    return UrlDiscoveryRequest(
+        request_id="discovery-1",
+        query="서울주택도시공사 임대주택 모집공고 게시판",
     )
 
 
@@ -72,7 +96,7 @@ def auth_guard(home: Path) -> CodexAuthGuard:
     async def spawn(*_argv: str, **_kwargs: object) -> FakeProcess:
         return FakeProcess(b"Logged in using ChatGPT\n")
 
-    return CodexAuthGuard("/usr/bin/true", home, process_factory=spawn)
+    return CodexAuthGuard(TRUE_BINARY, home, process_factory=spawn)
 
 
 def make_cli(
@@ -84,7 +108,7 @@ def make_cli(
     kwargs: dict[str, object] = {"auth_guard": auth_guard(home)}
     if process_factory is not None:
         kwargs["process_factory"] = process_factory
-    return CodexCli("/usr/bin/true", home, root, **kwargs)  # type: ignore[arg-type]
+    return CodexCli(TRUE_BINARY, home, root, **kwargs)  # type: ignore[arg-type]
 
 
 def valid_events(*, text: str | None = None) -> bytes:
@@ -229,7 +253,7 @@ async def test_cli_exact_argv_env_stdin_and_cleanup(tmp_path: Path) -> None:
     assert observed is not None
     argv, kwargs, process = observed
     assert argv[:15] == (
-        "/usr/bin/true",
+        TRUE_BINARY,
         "--sandbox",
         "read-only",
         "--ask-for-approval",
@@ -257,6 +281,93 @@ async def test_cli_exact_argv_env_stdin_and_cleanup(tmp_path: Path) -> None:
     decoded = json.loads(process.stdin.data)
     assert decoded["message"] == "서울 임대주택을 모니터해줘"
     assert list(task_root.iterdir()) == []
+
+
+@async_test
+@pytest.mark.skipif(os.name == "nt", reason="Codex launcher permission checks require POSIX")
+async def test_url_discovery_enables_live_search_and_accepts_only_search_event(
+    tmp_path: Path,
+) -> None:
+    home, task_root = cli_paths(tmp_path)
+    observed_argv: tuple[str, ...] | None = None
+
+    async def spawn(*argv: str, **_kwargs: object) -> FakeProcess:
+        nonlocal observed_argv
+        observed_argv = argv
+        result_path = Path(argv[argv.index("--output-last-message") + 1])
+        result_path.write_text(
+            UrlDiscoveryResult(
+                candidates=[
+                    UrlCandidate(
+                        name="서울주택도시공사 임대주택 공고",
+                        url="https://www.i-sh.co.kr/main/lay2/program/S1T294C295/www/brd/m_247/list.do",
+                    )
+                ],
+                clarification=None,
+            ).model_dump_json(),
+            encoding="utf-8",
+        )
+        events = [
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "search-1",
+                    "type": "web_search",
+                    "query": "서울주택도시공사 임대주택 모집공고 게시판",
+                },
+            },
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1},
+            },
+        ]
+        stdout = b"".join(
+            json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n" for event in events
+        )
+        return FakeProcess(stdout)
+
+    cli = make_cli(home, task_root, process_factory=spawn)
+
+    result = await cli.run(
+        discovery_request(),
+        UrlDiscoveryResult.model_json_schema(),
+        "gpt-5.6-terra",
+        "medium",
+    )
+
+    assert result.candidates[0].name == "서울주택도시공사 임대주택 공고"
+    assert observed_argv is not None
+    assert 'web_search="live"' in observed_argv
+    assert 'web_search="disabled"' not in observed_argv
+
+
+def test_only_url_discovery_request_selects_live_web_search() -> None:
+    assert _web_search_mode(discovery_request()) == "live"
+    assert _web_search_mode(request()) == "disabled"
+
+
+def test_web_search_stream_item_is_allowed_only_for_discovery_run() -> None:
+    started = json.dumps({"type": "thread.started", "thread_id": "thread-1"}).encode()
+    turn = json.dumps({"type": "turn.started"}).encode()
+    search = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "search-1",
+                "type": "web_search",
+                "query": "서울주택도시공사 공고",
+            },
+        },
+        ensure_ascii=False,
+    ).encode()
+    state = _validate_event(started, 0)
+    state = _validate_event(turn, state)
+
+    with pytest.raises(CodexProtocolError):
+        _validate_event(search, state, allow_web_search=False)
+    assert _validate_event(search, state, allow_web_search=True) == state
 
 
 @async_test
@@ -295,7 +406,8 @@ async def test_forbidden_event_rejects_entire_result(
         result_path = Path(argv[argv.index("--output-last-message") + 1])
         result_path.write_text(
             '{"kind":"unknown","target_monitor_ids":[],"target_url":null,'
-            '"condition_text":null,"schedule_text":null,"clarification":null,'
+            '"discovery_query":null,"condition_text":null,"schedule_text":null,'
+            '"clarification":null,'
             '"confidence":0}',
             encoding="utf-8",
         )
@@ -345,6 +457,7 @@ async def test_result_secret_scanner_is_recursive(tmp_path: Path, secret: str) -
             "kind": "unknown",
             "target_monitor_ids": [],
             "target_url": None,
+            "discovery_query": None,
             "condition_text": None,
             "schedule_text": None,
             "clarification": secret,
@@ -417,6 +530,7 @@ def test_intent_output_schema_is_strict_structured_output_compatible() -> None:
     assert set(schema["required"]) == set(properties)
     for name in (
         "target_url",
+        "discovery_query",
         "condition_text",
         "schedule_text",
         "clarification",
@@ -424,9 +538,46 @@ def test_intent_output_schema_is_strict_structured_output_compatible() -> None:
         assert {"type": "null"} in properties[name]["anyOf"]
 
 
+def test_url_discovery_contract_is_strict_and_bounded_to_three_candidates() -> None:
+    result = UrlDiscoveryResult(
+        candidates=[
+            UrlCandidate(
+                name=f"공식 게시판 {index}",
+                url=f"https://example.com/notices/{index}",
+            )
+            for index in range(3)
+        ],
+        clarification=None,
+    )
+    schema = UrlDiscoveryResult.model_json_schema()
+
+    assert len(result.candidates) == 3
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+    with pytest.raises(ValidationError):
+        UrlDiscoveryResult(
+            candidates=[
+                UrlCandidate(name=str(index), url=f"https://example.com/{index}")
+                for index in range(4)
+            ],
+            clarification=None,
+        )
+
+
+def test_url_discovery_worker_discriminator_result_type_and_prompt_are_fixed() -> None:
+    value = discovery_request()
+    packet = WorkerRequest(kind="url_discovery", request=value)
+
+    assert type(packet.request) is UrlDiscoveryRequest
+    assert request_kind(value) == "url_discovery"
+    assert result_type_for(value) is UrlDiscoveryResult
+    assert "공식" in prompt_for(UrlDiscoveryRequest)
+    assert "최대 3개" in prompt_for(UrlDiscoveryRequest)
+
+
 @async_test
-@pytest.mark.parametrize("kind", ["intent", "plan", "repair"])
-async def test_all_three_request_result_pairs_use_fixed_prompts(tmp_path: Path, kind: str) -> None:
+@pytest.mark.parametrize("kind", ["intent", "url_discovery", "plan", "repair"])
+async def test_all_four_request_result_pairs_use_fixed_prompts(tmp_path: Path, kind: str) -> None:
     home, root = cli_paths(tmp_path)
     intent = IntentResult(
         kind=IntentKind.CREATE,
@@ -443,6 +594,19 @@ async def test_all_three_request_result_pairs_use_fixed_prompts(tmp_path: Path, 
             request(),
             intent,
             IntentResult,
+        ),
+        "url_discovery": (
+            discovery_request(),
+            UrlDiscoveryResult(
+                candidates=[
+                    UrlCandidate(
+                        name="공식 임대 공고",
+                        url="https://example.com/housing",
+                    )
+                ],
+                clarification=None,
+            ),
+            UrlDiscoveryResult,
         ),
         "plan": (
             PlanRequest(
@@ -523,7 +687,7 @@ async def test_stream_overflow_and_result_type_mismatch_cleanup(tmp_path: Path) 
 def test_cli_cannot_be_composed_without_exact_auth_guard(tmp_path: Path) -> None:
     home, root = cli_paths(tmp_path)
     with pytest.raises(TypeError):
-        CodexCli("/usr/bin/true", home, root)
+        CodexCli(TRUE_BINARY, home, root)
 
 
 def test_worker_cannot_capture_an_arbitrary_run_callable(tmp_path: Path) -> None:
@@ -585,7 +749,7 @@ async def test_ordinary_agent_text_containing_images_path_is_allowed(tmp_path: P
 
     guard = auth_guard(home)
     cli = CodexCli(
-        "/usr/bin/true",
+        TRUE_BINARY,
         home,
         root,
         auth_guard=guard,
@@ -616,7 +780,7 @@ async def test_event_after_turn_completed_is_rejected(tmp_path: Path) -> None:
 
     guard = auth_guard(home)
     cli = CodexCli(
-        "/usr/bin/true",
+        TRUE_BINARY,
         home,
         root,
         auth_guard=guard,

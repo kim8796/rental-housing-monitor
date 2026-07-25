@@ -58,6 +58,7 @@ class IntentResult(RedactedModel):
     kind: IntentKind
     target_monitor_ids: list[BoundMonitorId] = Field(max_length=10)
     target_url: BoundUrl = None
+    discovery_query: Annotated[str | None, Field(max_length=300)] = None
     condition_text: BoundOptionalText = None
     schedule_text: Annotated[str | None, Field(max_length=500)] = None
     clarification: BoundOptionalText = None
@@ -67,6 +68,23 @@ class IntentResult(RedactedModel):
     @classmethod
     def parse_kind(cls, value: object) -> object:
         return IntentKind(value) if isinstance(value, str) else value
+
+
+class UrlDiscoveryRequest(RedactedModel):
+    request_id: BoundId
+    query: Annotated[str, Field(min_length=3, max_length=300)]
+
+
+class UrlCandidate(StrictModel):
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    url: Annotated[str, Field(min_length=1, max_length=2_048)]
+
+
+class UrlDiscoveryResult(RedactedModel):
+    model_config = ConfigDict(json_schema_extra=_require_all_properties)
+
+    candidates: list[UrlCandidate] = Field(max_length=3)
+    clarification: Annotated[str | None, Field(max_length=500)] = None
 
 
 class PlanRequest(RedactedModel):
@@ -99,12 +117,12 @@ class RepairResult(RedactedModel):
     ] = Field(max_length=50)
 
 
-RequestModel = IntentRequest | PlanRequest | RepairRequest
-ResultModel = IntentResult | PlanResult | RepairResult
+RequestModel = IntentRequest | UrlDiscoveryRequest | PlanRequest | RepairRequest
+ResultModel = IntentResult | UrlDiscoveryResult | PlanResult | RepairResult
 
 
 class WorkerRequest(RedactedModel):
-    kind: Literal["intent", "plan", "repair"]
+    kind: Literal["intent", "url_discovery", "plan", "repair"]
     request: RequestModel
     model: Literal["gpt-5.6-terra", "gpt-5.6-sol"] = "gpt-5.6-terra"
     effort: Literal["medium", "high"] = "medium"
@@ -113,6 +131,7 @@ class WorkerRequest(RedactedModel):
     def discriminator_matches_request(self) -> WorkerRequest:
         expected = {
             "intent": IntentRequest,
+            "url_discovery": UrlDiscoveryRequest,
             "plan": PlanRequest,
             "repair": RepairRequest,
         }[self.kind]
@@ -140,6 +159,8 @@ class WorkerFailure(StrictModel):
 def request_kind(value: RequestModel) -> str:
     if type(value) is IntentRequest:
         return "intent"
+    if type(value) is UrlDiscoveryRequest:
+        return "url_discovery"
     if type(value) is PlanRequest:
         return "plan"
     if type(value) is RepairRequest:
@@ -150,6 +171,8 @@ def request_kind(value: RequestModel) -> str:
 def result_type_for(value: RequestModel) -> type[ResultModel]:
     if type(value) is IntentRequest:
         return IntentResult
+    if type(value) is UrlDiscoveryRequest:
+        return UrlDiscoveryResult
     if type(value) is PlanRequest:
         return PlanResult
     if type(value) is RepairRequest:

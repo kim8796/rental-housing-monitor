@@ -747,6 +747,7 @@ def build_service(settings: object) -> PersonalMonitorService:
     from personal_monitor.control.intents import IntentRouter
     from personal_monitor.control.planner import MonitorPlanner
     from personal_monitor.control.service import ControlService
+    from personal_monitor.control.url_discovery import UrlDiscoveryService
     from personal_monitor.engine.scheduler import Scheduler
     from personal_monitor.maintenance import Maintenance
     from personal_monitor.observability import (
@@ -795,6 +796,7 @@ def build_service(settings: object) -> PersonalMonitorService:
             worker,
             actions,
         )
+        url_discovery = UrlDiscoveryService(worker, planner, registry)
         billing = None
         billing_settings = getattr(settings, "billing", None)
         if billing_settings is not None:
@@ -825,6 +827,7 @@ def build_service(settings: object) -> PersonalMonitorService:
             planner,
             actions,
             billing_status=billing.render_status if billing is not None else None,
+            url_discovery=url_discovery,
         )
         gateway = TelegramGateway(
             settings.telegram_user_id,

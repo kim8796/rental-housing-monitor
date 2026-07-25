@@ -367,6 +367,7 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
         item is not None and not _safe_text(item, limit)
         for item, limit in (
             (value.target_url, 2_048),
+            (value.discovery_query, 300),
             (value.condition_text, 2_000),
             (value.schedule_text, 500),
         )
@@ -377,6 +378,7 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
         if (
             value.target_monitor_ids
             or value.target_url is not None
+            or value.discovery_query is not None
             or value.condition_text is not None
             or value.schedule_text is not None
         ):
@@ -403,8 +405,13 @@ def _validate_result(value: object, owned_ids: frozenset[str]) -> _Validation:
 
     semantically_valid = True
     if value.kind is IntentKind.CREATE:
-        semantically_valid = _safe_http_url(value.target_url)
-    elif value.target_url is not None:
+        if value.target_url is not None:
+            semantically_valid = (
+                value.discovery_query is None and _safe_http_url(value.target_url)
+            )
+        else:
+            semantically_valid = _safe_text(value.discovery_query, 300)
+    elif value.target_url is not None or value.discovery_query is not None:
         semantically_valid = False
     elif value.kind is IntentKind.UPDATE:
         semantically_valid = value.condition_text is not None or value.schedule_text is not None

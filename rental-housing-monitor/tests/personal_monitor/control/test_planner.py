@@ -241,6 +241,20 @@ def pending_count(connection: sqlite3.Connection) -> int:
     return connection.execute("SELECT count(*) FROM pending_actions").fetchone()[0]
 
 
+def test_discovery_url_validation_reuses_policy_and_real_probe_without_ai_planning(
+    connection: sqlite3.Connection,
+) -> None:
+    value, policy, page_probe, worker = planner(connection, [])
+
+    normalized = run(value.validate_discovery_url(OWNER, TARGET_URL))
+
+    assert normalized == TARGET_URL
+    assert policy.calls == [TARGET_URL]
+    assert page_probe.calls == [(OWNER, target())]
+    assert worker.calls == []
+    assert pending_count(connection) == 0
+
+
 def test_update_planning_reuses_hardened_probe_without_persisting_an_action(
     connection: sqlite3.Connection,
 ) -> None:
@@ -1299,6 +1313,28 @@ def test_confirmation_is_restart_safe_owner_bound_single_use_and_expiring(
         restarted.consume(second.pending_action.token, OWNER, now=NOW + timedelta(minutes=10))
 
 
+def test_confirmed_proposal_preserves_optional_url_alias_until_registration(
+    connection: sqlite3.Connection,
+) -> None:
+    value, _, _, _ = planner(connection, [plan()])
+    proposal = run(
+        value.propose(
+            request(),
+            intent(),
+            alias_name="LH 청약플러스 임대 공고",
+        )
+    )
+
+    consumed = PendingActionService(connection).consume(
+        proposal.pending_action.token,
+        OWNER,
+        now=NOW,
+    )
+    confirmed = reconstruct_confirmed_spec(consumed, owner_id=OWNER)
+
+    assert confirmed.url_alias == "LH 청약플러스 임대 공고"
+
+
 @pytest.mark.parametrize("tamper", ["candidate", "hash", "spec", "owner", "extra"])
 def test_confirmation_rejects_every_tampered_payload_without_oracle(
     connection: sqlite3.Connection,
@@ -1315,6 +1351,7 @@ def test_confirmation_rejects_every_tampered_payload_without_oracle(
             proposal.spec_hash,
         ),
         "spec": proposal.spec.model_dump(mode="json"),
+        "url_alias": None,
     }
     if tamper == "candidate":
         payload["candidate_version_id"] = "f" * 32

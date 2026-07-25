@@ -157,6 +157,15 @@ CREATE INDEX billing_snapshots_grant_observed_idx
 ON billing_snapshots(grant_id, observed_at);
 """
 
+_MIGRATION_8 = """
+CREATE TABLE url_aliases(
+  owner_id TEXT NOT NULL, normalized_name TEXT NOT NULL,
+  url TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY(owner_id, normalized_name),
+  FOREIGN KEY(owner_id) REFERENCES users(id)
+);
+"""
+
 _MIGRATIONS = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -165,6 +174,7 @@ _MIGRATIONS = (
     (5, _MIGRATION_5),
     (6, _MIGRATION_6),
     (7, _MIGRATION_7),
+    (8, _MIGRATION_8),
 )
 
 
