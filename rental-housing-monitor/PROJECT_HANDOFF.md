@@ -23,7 +23,8 @@
 - 기본 브랜치: `main`
 - URL 탐색 통합 전 `main`: `8344325` (PR #12)
 - 운영 배포 코드 기준: `ea35de8` (`codex/accept-codex-web-search-events`)
-- 최종 통합: PR #13 `fix: enable production URL discovery`
+- 최종 통합: PR #13 `fix: enable production URL discovery`, PR #14
+  `test: verify safe server upgrade runbook`
 - 서비스 성격: 현재 개인용이며, 사용자·소유자 경계를 유지해 향후 다중 사용자
   서비스로 확장 가능하게 설계한다.
 - 사용자 개발 방식: 사용자가 직접 코딩하기보다 Codex에 자연어로 요청한다. 기능뿐
@@ -83,7 +84,7 @@ Telegram에서 새 모니터를 등록할 때는 JSON이나 slash command가 아
 - URL 없는 실서비스 요청은 Codex 웹 검색, Scrapling 실제 접속, AI spec 작성,
   `등록/수정/취소` 미리보기까지 검증됐다. 테스트가 만든 pending action은 즉시
   폐기되어 운영 모니터 수는 바뀌지 않았다.
-- PR #13 코드 기준 전체 회귀 테스트 `5334 passed`, Ruff와
+- PR #13·#14 통합 기준 전체 회귀 테스트 `5335 passed`, Ruff와
   `git diff --check`가 통과했다.
 
 ### 3. GCP 크레딧 모니터
@@ -202,7 +203,9 @@ Telegram 연결을 다시 확인한다.
 - 롤백 이미지는 유지하고 Docker build cache만 정리해 약 5.47GB를 회수했다.
   `/srv/personal-monitor` 디스크 여유는 약 16GB, 사용률은 67%다.
 - 안전한 재배포 절차는 `docs/operations/gcp-deploy.md`의
-  `기존 서버의 안전한 업그레이드`에 기록했다.
+  `기존 서버의 안전한 업그레이드`에 기록했다. PR #14는 초기 배포의 Compose
+  wrapper 강제와 업그레이드의 격리 build·network 없는 migration을 각각
+  runbook 테스트로 고정했다.
 
 ## 중요한 운영 경계
 
