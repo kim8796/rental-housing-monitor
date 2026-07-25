@@ -21,6 +21,7 @@
 - 마지막 갱신: 2026-07-25 KST
 - 저장소: `kim8796/rental-housing-monitor`
 - 기본 브랜치: `main`
+- 최근 확인한 `main`: `4b00a8f` (PR #9 Telegram 요청 형식 문서화)
 - 최근 기능 기준: `24f55a2` (PR #7 GCP 크레딧 모니터 병합)
 - 서비스 성격: 현재 개인용이며, 사용자·소유자 경계를 유지해 향후 다중 사용자
   서비스로 확장 가능하게 설계한다.
@@ -132,6 +133,20 @@ Telegram 연결을 다시 확인한다.
   source는 `console`이다.
 - 구현 배포와 PR #7 병합 직전 전체 테스트 결과는 `5310 passed`, Ruff 통과다.
 
+## 2026-07-25 운영 점검
+
+- 16:09 KST 기준 VM, systemd, 세 Compose 컨테이너와 DB heartbeat는 정상이다.
+- 12:10 KST 크레딧 동기화는 예약대로 시작했지만 `BigQueryBillingError`로 실패했다.
+- BigQuery SQL과 권한은 정상이며 조회 결과도 반환된다.
+- 원인은 Standard usage export의 `month_cost`, `promotion_consumed`,
+  `recent_7d_consumed` schema가 `FLOAT`인데
+  `src/personal_monitor/billing/bigquery.py`가 `NUMERIC`만 허용하는 형식 불일치다.
+- 최신 billing snapshot은 여전히 2026-07-24 21:10 KST의 `console` 기준값이다.
+  12:20 요약이 실제 Telegram에 전달됐는지는 별도로 검증하지 않았다.
+- `backup_failed` 운영 이벤트가 2026-07-24 03:10 KST 이후 반복됐고,
+  `backup-status.json`은 그 시각 이후 갱신되지 않았다. 크레딧 파서 수정과 별개로
+  백업 실패 원인을 조사해야 한다.
+
 ## 중요한 운영 경계
 
 - 2026-07-24 QStash 실행 성공과 GCP의 임대주택 모니터 `active` 상태가 모두
@@ -178,9 +193,8 @@ git diff --check
 ## 다음 세션의 첫 행동
 
 1. `git status -sb`, `git log -5 --oneline`으로 이 문서 이후 변경을 확인한다.
-2. Upstash에서 QStash schedule의 실제 pause 상태를 확인한다.
-3. GCP VM에서 2026-07-25 12:10 KST 이후 최신 billing snapshot이
+2. BigQuery 결과의 안전한 `FLOAT` 파싱을 테스트 우선으로 수정하고 VM에 배포한다.
+3. 수동 동기화 또는 다음 12:10 KST 실행으로 최신 billing snapshot이
    `source=bigquery`인지 확인한다.
-4. 12:13 KST 임대주택 실행이 한 경로에서만 수행됐고 Telegram 중복 전송이 없는지
-   확인한다.
-5. 이상이 없으면 이 섹션에서 완료 항목을 제거하고 다음 실제 작업으로 교체한다.
+4. 반복된 `backup_failed`의 실제 오류와 GCS 최신 객체를 확인해 별도로 복구한다.
+5. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
