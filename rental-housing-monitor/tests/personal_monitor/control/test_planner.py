@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+from pydantic import ValidationError
 
 import personal_monitor.control.planner as planner_module
 from personal_monitor.ai.contracts import IntentKind, IntentResult, PlanRequest, PlanResult
@@ -1270,7 +1271,7 @@ def test_hostile_validator_return_mutation_never_writes_pending_action(
     assert pending_count(connection) == 0
 
 
-def test_field_count_bound_and_invalid_preview_never_leave_orphan_action(
+def test_field_count_bound_is_rejected_before_an_action_is_created(
     connection: sqlite3.Connection,
 ) -> None:
     many = spec()
@@ -1282,10 +1283,8 @@ def test_field_count_bound_and_invalid_preview_never_leave_orphan_action(
             "rules": [{"kind": "new_item"}],
         }
     )
-    value, _, _, _ = planner(connection, [plan(many), plan(many), plan(many)])
-
-    with pytest.raises(PlanningFailed):
-        run(value.propose(request(), intent()))
+    with pytest.raises(ValidationError):
+        plan(many)
 
     assert pending_count(connection) == 0
 

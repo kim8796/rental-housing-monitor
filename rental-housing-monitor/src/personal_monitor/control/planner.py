@@ -1623,11 +1623,12 @@ def _fresh_plan_result(value: object) -> PlanResult | None:
         if type(value) is not PlanResult:
             raise TypeError
         dumped = value.model_dump(mode="json")
-        result = PlanResult.model_validate(dumped)
-        if type(result.spec) is not MonitorSpec or not _safe_unicode(
-            result.explanation, max_chars=1_000
+        candidate = PlanResult.model_validate(dumped)
+        if type(candidate.spec) is not MonitorSpec or not _safe_unicode(
+            candidate.explanation, max_chars=1_000
         ):
-            result = None
+            raise ValueError
+        result = candidate
     return result
 
 

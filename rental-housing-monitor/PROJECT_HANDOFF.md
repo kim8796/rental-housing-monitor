@@ -18,12 +18,12 @@
 
 ## 현재 요약
 
-- 마지막 갱신: 2026-07-25 KST
+- 마지막 갱신: 2026-07-26 KST
 - 저장소: `kim8796/rental-housing-monitor`
 - 기본 브랜치: `main`
-- 이번 URL 탐색 통합 시작 시 `main`: `2e0f26c` (PR #11 결제·백업 복구)
-- 운영 배포 기준: `904b141` (결제 동기화와 백업 배포 복구)
-- URL 탐색 기능 기준: `1dbd00b` (`codex/url-discovery-registration`)
+- URL 탐색 통합 전 `main`: `8344325` (PR #12)
+- 운영 배포 코드 기준: `ea35de8` (`codex/accept-codex-web-search-events`)
+- 최종 통합: PR #13 `fix: enable production URL discovery`
 - 서비스 성격: 현재 개인용이며, 사용자·소유자 경계를 유지해 향후 다중 사용자
   서비스로 확장 가능하게 설계한다.
 - 사용자 개발 방식: 사용자가 직접 코딩하기보다 Codex에 자연어로 요청한다. 기능뿐
@@ -80,9 +80,11 @@ Telegram에서 새 모니터를 등록할 때는 JSON이나 slash command가 아
 - URL 대신 구체적인 사이트명·게시판명을 받으면 공식 후보를 URL 정책과 Scrapling
   실제 접속으로 검증한다. 후보가 여러 개면 Telegram 선택 버튼을 표시하며 최종
   등록 확인 때 사용자별 URL 별칭을 schema migration 8에 저장한다.
-- 최신 main 통합 후 URL 탐색 관련 테스트 `965 passed`, 전체 회귀 테스트
-  `5328 passed`, Ruff와 `git diff --check`가 통과했다. 아직 운영 VM에는
-  배포하지 않았다.
+- URL 없는 실서비스 요청은 Codex 웹 검색, Scrapling 실제 접속, AI spec 작성,
+  `등록/수정/취소` 미리보기까지 검증됐다. 테스트가 만든 pending action은 즉시
+  폐기되어 운영 모니터 수는 바뀌지 않았다.
+- PR #13 코드 기준 전체 회귀 테스트 `5334 passed`, Ruff와
+  `git diff --check`가 통과했다.
 
 ### 3. GCP 크레딧 모니터
 
@@ -170,6 +172,38 @@ Telegram 연결을 다시 확인한다.
 - 복구 및 재발 방지 변경 후 전체 테스트 `5310 passed`, Ruff, `bash -n`,
   `git diff --check`가 통과했다.
 
+## 2026-07-26 URL 탐색 운영 배포
+
+- 03:03 KST에 코드 커밋 `ea35de8`을 VM에 배포했다. 새 릴리스 디렉터리에서
+  이미지를 먼저 빌드하고 network 없는 일회성 컨테이너로 migration을 적용한 뒤
+  앱 디렉터리를 교체했다. 이전 앱과 이미지는 rollback 자산으로 보존했다.
+- URL 없는 등록 흐름의 운영 장애 원인은 세 가지였다.
+  - Codex CLI 0.144.1의 `web_search` 이벤트가 서로 다른 값의 중복 `id` 키를
+    보냈다. 일반 JSON의 중복 키 거부는 유지하고, 크기가 제한된 해당 이벤트의
+    문자열 `id`만 허용했다.
+  - Scrapling `adaptive=True`가 읽기 전용 monitor 컨테이너에서 기본 SQLite
+    저장소를 만들려 했다. 프로젝트의 암호화 adaptive 저장소는 별도로 있으므로
+    일반 HTTP fetch에서는 Scrapling 기본 adaptive 저장소를 끈다.
+  - `MonitorSpec.extract.fields`의 동적 객체가 Codex Structured Outputs의 strict
+    schema에서 거부됐다. AI transport에서 명명된 필드 배열로 변환하고 도메인
+    경계에서 다시 매핑으로 복원하며 중복 이름과 최대 50개 제한을 검증한다.
+- 실제 운영 내부 라우터에
+  `서울주택도시공사 임대주택 모집공고 게시판에서 강남구 공고가 나오면 알려줘`
+  요청을 보냈다. `SH 임대주택 강남구 모집공고 알림` 미리보기와
+  `등록/수정/취소` 버튼이 생성됐고 pending action은 `0→0`, cleanup 오류는
+  0건이었다. 실제 모니터는 등록하지 않았다.
+- 배포 후 `personal-monitor.service=active`, Compose 서비스 3개,
+  DB `quick_check=ok`, migration 8, 활성 모니터 1개, heartbeat 54초,
+  최근 operator/service 오류 0건, Codex `Logged in using ChatGPT`를 확인했다.
+- 결제 최신 snapshot은 `source=bigquery`, 잔액 ₩455,145.36,
+  종료일 2026-10-08이다.
+- 03:07 KST 암호화 백업이 `status=ok`로 완료됐고
+  `daily/2026-07-25T180735Z.tar.age` GCS 객체(338,200 bytes)를 확인했다.
+- 롤백 이미지는 유지하고 Docker build cache만 정리해 약 5.47GB를 회수했다.
+  `/srv/personal-monitor` 디스크 여유는 약 16GB, 사용률은 67%다.
+- 안전한 재배포 절차는 `docs/operations/gcp-deploy.md`의
+  `기존 서버의 안전한 업그레이드`에 기록했다.
+
 ## 중요한 운영 경계
 
 - 2026-07-24 QStash 실행 성공과 GCP의 임대주택 모니터 `active` 상태가 모두
@@ -215,7 +249,7 @@ git diff --check
 
 ## 다음 세션의 첫 행동
 
-1. URL 탐색 기능을 운영 VM에 배포하고 DB migration 8 적용, 단일·복수 후보
-   Telegram 등록 흐름을 smoke test한다.
-2. 다음 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하는지 확인한다.
-3. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
+1. 다음 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하는지 확인한다.
+2. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
+3. 사용자가 Telegram에서 첫 URL 없는 모니터를 실제 등록하면 첫 예약 실행 결과와
+   중복 알림 방지를 확인한다.

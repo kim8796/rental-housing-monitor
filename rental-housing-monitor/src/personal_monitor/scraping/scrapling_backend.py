@@ -51,7 +51,7 @@ _RETAINED_HEADERS = frozenset({"content-type", "location", "retry-after"})
 _MEDIA_TOKEN = r"[!#$%&'*+\-.^_`|~0-9a-z]+"
 _MEDIA_TYPE = re.compile(rf"^({_MEDIA_TOKEN})/({_MEDIA_TOKEN})$")
 _SELECTOR_CONFIG = {
-    "adaptive": True,
+    "adaptive": False,
     "keep_comments": False,
     "keep_cdata": False,
 }

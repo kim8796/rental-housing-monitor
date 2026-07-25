@@ -1123,7 +1123,7 @@ def test_http_fetch_uses_approved_url_and_bounded_fetcher_kwargs() -> None:
                 "headers": {"Accept-Encoding": "identity"},
                 "accept_encoding": "identity",
                 "selector_config": {
-                    "adaptive": True,
+                    "adaptive": False,
                     "keep_comments": False,
                     "keep_cdata": False,
                 },
@@ -1171,6 +1171,24 @@ def test_http_fetch_uses_approved_url_and_bounded_fetcher_kwargs() -> None:
     assert curl.options[CurlOpt.TIMEOUT_MS] == 30_000
 
 
+def test_http_fetch_does_not_require_scrapling_default_adaptive_database() -> None:
+    def fetcher(_url: str, **kwargs: object) -> FakeResponse:
+        selector_config = kwargs["selector_config"]
+        assert isinstance(selector_config, dict)
+        if selector_config.get("adaptive") is not False:
+            raise PermissionError("package storage is read-only")
+        return FakeResponse()
+
+    backend = make_test_backend(
+        egress_proxy_url="http://proxy.internal:8080",
+        http_fetcher=fetcher,
+    )
+
+    document = asyncio.run(backend.fetch_http(target()))
+
+    assert document.status == 200
+
+
 @pytest.mark.parametrize(
     ("method_name", "strategy"),
     [
@@ -1209,7 +1227,7 @@ def test_browser_fetch_uses_profile_and_bounded_fetcher_kwargs(
         "proxy": "http://proxy.internal:8080",
         "user_data_dir": str(tmp_path),
         "selector_config": {
-            "adaptive": True,
+            "adaptive": False,
             "keep_comments": False,
             "keep_cdata": False,
         },
