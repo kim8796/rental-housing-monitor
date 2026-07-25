@@ -70,18 +70,19 @@ Telegram에서 새 모니터를 등록할 때는 JSON이나 slash command가 아
 - 현재 의도 분석은 대화 기록 전체가 아니라 현재 메시지를 기준으로 하므로, 추가
   설명을 보낼 때도 URL과 조건을 포함한 완전한 요청을 다시 보내는 편이 안전하다.
 - 사이트 이름과 게시판·키워드만 말하면 Codex가 공개 웹에서 후보 URL을 찾고
-  사용자 확인 뒤 등록하는 URL 없는 생성 흐름은 설계 승인됐지만 아직 구현되지
-  않았다. 현재 운영 버전은 생성 요청에 URL이 필요하다.
+  사용자 확인 뒤 등록하는 URL 없는 생성 흐름이 구현됐다. URL이 있는 기존 요청은
+  검색 없이 처리하고, URL 없는 신규 등록 요청에서만 Codex 실시간 웹 검색을 켠다.
 - 최소 확인 간격은 15분이다. Telegram에 계정 비밀번호, API key, token을 보내지
   않는다. 로그인 사이트는 별도 인증 프로필 등록이 먼저 필요하다.
 - 요청을 받으면 페이지를 시험 수집한 뒤 이름, 대상, 현재 예시값, 조건, 시간대,
   확인 주기, Scrapling 수집 방식, robots.txt, 로그인 필요 여부를 미리 보여준다.
   사용자가 `등록` 버튼을 눌러야 실제 모니터가 생성되며 `수정`과 `취소`도 가능하다.
-- `codex/url-discovery-registration` 브랜치는 URL 대신 구체적인 사이트명·게시판명을
-  받는 흐름을 구현한다. URL 없는 신규 등록에서만 Codex 웹 검색을 켜고, 공식 후보를
-  URL 정책과 Scrapling 실제 접속으로 검증한다. 후보가 여러 개면 Telegram 선택
-  버튼을 표시하며 최종 등록 확인 때 사용자별 URL 별칭을 schema migration 8에
-  저장한다. 아직 운영 VM에는 배포하지 않았다.
+- URL 대신 구체적인 사이트명·게시판명을 받으면 공식 후보를 URL 정책과 Scrapling
+  실제 접속으로 검증한다. 후보가 여러 개면 Telegram 선택 버튼을 표시하며 최종
+  등록 확인 때 사용자별 URL 별칭을 schema migration 8에 저장한다.
+- 최신 main 통합 후 URL 탐색 관련 테스트 `965 passed`, 전체 회귀 테스트
+  `5328 passed`, Ruff와 `git diff --check`가 통과했다. 아직 운영 VM에는
+  배포하지 않았다.
 
 ### 3. GCP 크레딧 모니터
 
@@ -214,8 +215,7 @@ git diff --check
 
 ## 다음 세션의 첫 행동
 
-1. `codex/url-discovery-registration`의 전체 테스트를 Linux 또는 CI에서 확인하고
-   리뷰 후 main 병합 여부를 결정한다.
-2. 병합·배포한다면 VM DB migration 8 적용과 URL 없는 Telegram 등록을 smoke test한다.
-3. 다음 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하는지 확인한다.
-4. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
+1. URL 탐색 기능을 운영 VM에 배포하고 DB migration 8 적용, 단일·복수 후보
+   Telegram 등록 흐름을 smoke test한다.
+2. 다음 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하는지 확인한다.
+3. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.

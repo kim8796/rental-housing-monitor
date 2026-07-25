@@ -20,7 +20,7 @@
 
 ### 1. URL 없는 신규 등록 의도
 
-**수정:** `src/personal_monitor/ai/contracts.py`, `control/intents.py`, `control/service.py`  
+**수정:** `src/personal_monitor/ai/contracts.py`, `control/intents.py`, `control/service.py`
 **테스트:** `tests/personal_monitor/control/test_intents.py`, `test_service.py`
 
 - `CREATE` 의도에서 URL이 없어도 사이트명·게시판명을 검색 요청으로 전달한다.
@@ -28,7 +28,7 @@
 
 ### 2. 검색 전용 Codex 경계
 
-**수정:** `ai/codex_cli.py`, `ai/prompts.py`, `ai/contracts.py`  
+**수정:** `ai/codex_cli.py`, `ai/prompts.py`, `ai/contracts.py`
 **테스트:** `tests/personal_monitor/ai/test_codex_cli.py`
 
 - 구조화된 `UrlDiscoveryRequest`와 최대 3개의 `UrlCandidate` 결과 계약을 만든다.
@@ -37,8 +37,8 @@
 
 ### 3. 후보 URL 검증과 별칭 재사용
 
-**생성:** `src/personal_monitor/control/url_discovery.py`  
-**수정:** `control/planner.py`  
+**생성:** `src/personal_monitor/control/url_discovery.py`
+**수정:** `control/planner.py`
 **테스트:** `tests/personal_monitor/control/test_url_discovery.py`, `control/test_planner.py`
 
 - 저장된 사용자 별칭을 먼저 조회하되 매번 재검증한다.
@@ -47,7 +47,7 @@
 
 ### 4. 사용자별 SQLite URL 별칭
 
-**수정:** `storage/schema.py`, `storage/registry.py`  
+**수정:** `storage/schema.py`, `storage/registry.py`
 **테스트:** `tests/personal_monitor/storage/test_registry.py`
 
 - 새 마이그레이션으로 `url_aliases(owner_id, normalized_name, url, updated_at)`를 추가한다.
@@ -56,7 +56,7 @@
 
 ### 5. Telegram 후보 선택과 기존 승인 연결
 
-**수정:** `control/actions.py`, `control/service.py`  
+**수정:** `control/actions.py`, `control/service.py`
 **테스트:** `tests/personal_monitor/control/test_service.py`
 
 - 복수 후보를 URL이 노출되지 않는 짧은 라벨과 불투명 callback token으로 표시한다.
@@ -65,7 +65,7 @@
 
 ### 6. 통합 검증과 문서화
 
-**수정:** `PROJECT_HANDOFF.md` 및 관련 운영 문서  
+**수정:** `PROJECT_HANDOFF.md` 및 관련 운영 문서
 **테스트:** 신규 Telegram 통합 테스트와 전체 회귀 테스트
 
 - URL 제공, 별칭 재사용, 단일 후보, 복수 후보, 검색 실패, 악성 URL, stale callback을 검증한다.
