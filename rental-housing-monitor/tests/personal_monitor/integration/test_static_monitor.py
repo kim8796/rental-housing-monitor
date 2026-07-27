@@ -51,7 +51,7 @@ def test_static_monitor_runs_real_pipeline_and_deduplicates(integration_harness)
         (
             "target-local",
             '{"text":"모니터 조건에 맞는 변경이 감지되었습니다.\\n'
-            f'종류: new_item\\n출처: {scenario.origin_url}/static"}}',
+            f'종류: 신규 항목\\n출처: {scenario.origin_url}/static"}}',
             "pending",
         )
     ]

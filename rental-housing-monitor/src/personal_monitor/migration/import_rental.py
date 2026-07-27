@@ -14,15 +14,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from personal_monitor.adapters.rental_housing import (
     RENTAL_ANNOUNCEMENT_FIELDS,
     RENTAL_ITEM_SCOPE,
 )
-from personal_monitor.domain.observation import ObservedItem, content_hash
-from personal_monitor.domain.rules import RuleMatch
+from personal_monitor.domain.observation import content_hash
 from personal_monitor.domain.spec import (
     ExtractSpec,
     FetchStrategy,
@@ -33,7 +32,6 @@ from personal_monitor.domain.spec import (
     SourceAdapterKind,
     ValidatorSpec,
 )
-from personal_monitor.engine.runner import render_payload
 from personal_monitor.engine.scheduler import next_run_at
 from personal_monitor.storage.schema import (
     _apply_migrations,
@@ -1869,10 +1867,22 @@ def _outbox_id(dedupe_key: str) -> str:
     return f"rental-import:{sha256(dedupe_key.encode('utf-8')).hexdigest()}"
 
 
+def _imported_delivery_payload(spec: MonitorSpec) -> dict[str, object]:
+    parts = urlsplit(spec.target_url)
+    public_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    return {
+        "text": (
+            "모니터 조건에 맞는 변경이 감지되었습니다.\n"
+            "종류: new_item\n"
+            f"출처: {public_url}"
+        )
+    }
+
+
 def _ensure_outbox(
     connection: sqlite3.Connection,
     delivery: _DeliveryRow,
-    announcement: _AnnouncementRow,
+    _announcement: _AnnouncementRow,
     spec: MonitorSpec,
     target_id: str,
     dry_run: bool,
@@ -1880,11 +1890,7 @@ def _ensure_outbox(
     item_id = f"announcement:{delivery.key}"
     dedupe_key = f"{RENTAL_MONITOR_ID}:{item_id}:new_item"
     outbox_id = _outbox_id(dedupe_key)
-    payload = render_payload(
-        spec,
-        ObservedItem(item_id=item_id, fields=announcement.fields),
-        RuleMatch(RuleKind.NEW_ITEM, None, None, None),
-    )
+    payload = _imported_delivery_payload(spec)
     payload_json = canonical_json(payload)
     existing = connection.execute(
         "SELECT id, monitor_id, target_id, payload_json, status, attempt_count, "
