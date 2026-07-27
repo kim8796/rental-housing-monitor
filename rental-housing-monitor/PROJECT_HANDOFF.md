@@ -18,13 +18,14 @@
 
 ## 현재 요약
 
-- 마지막 갱신: 2026-07-26 KST
+- 마지막 갱신: 2026-07-27 KST
 - 저장소: `kim8796/rental-housing-monitor`
 - 기본 브랜치: `main`
-- URL 탐색 통합 전 `main`: `8344325` (PR #12)
-- 운영 배포 코드 기준: `ea35de8` (`codex/accept-codex-web-search-events`)
+- 임대주택 상세 알림 수정 전 `main`: `8950470` (PR #14)
+- 운영 배포 코드 기준: `da94ec3` (`codex/fix-rental-alert-details`)
 - 최종 통합: PR #13 `fix: enable production URL discovery`, PR #14
-  `test: verify safe server upgrade runbook`
+  `test: verify safe server upgrade runbook`, PR #15
+  `fix: send detailed rental alerts`
 - 서비스 성격: 현재 개인용이며, 사용자·소유자 경계를 유지해 향후 다중 사용자
   서비스로 확장 가능하게 설계한다.
 - 사용자 개발 방식: 사용자가 직접 코딩하기보다 Codex에 자연어로 요청한다. 기능뿐
@@ -207,6 +208,31 @@ Telegram 연결을 다시 확인한다.
   wrapper 강제와 업그레이드의 격리 build·network 없는 migration을 각각
   runbook 테스트로 고정했다.
 
+## 2026-07-27 임대주택 상세 알림 수정
+
+- 12:13 KST 예약 실행에서 실제 신규 공고
+  `오산시 행복주택 입주자격완화 예비입주자 모집(2026.07.27)`을 찾았지만
+  Telegram에는 내부 이벤트명 `new_item`과 LH 목록 URL만 표시됐다.
+- 원인은 공통 `render_payload`가 관측 item을 버리고 monitor의 `target_url`만
+  사용한 것이었다. `new_item` 판정 자체는 신규 항목이라는 의미로 정확했다.
+- 고정 `python_plugin/rental_housing` adapter의 신규 공고만 기존
+  `format_announcement`로 렌더링한다. 이제 제목, 기관, 지역, 주택 유형, 대상,
+  공고일, 접수 기간과 `selectWrtancInfo.do` 상세 URL을 보낸다.
+- 상세 URL은 허용 도메인, scheme, port, credential 및 민감 query 이름을 다시
+  검증한다. 일반 Scrapling 모니터는 수집 콘텐츠를 노출하지 않고 이벤트 종류만
+  `신규 항목`, `값 변경`, `키워드 일치` 같은 한국어로 표시한다.
+- 과거에 이미 전달된 임대주택 import outbox payload는 레거시 형식으로 동결했다.
+  새 렌더러가 바뀌어도 기존 DB를 다시 import할 때 충돌하지 않는다.
+- 최종 커밋·배포 직전 전체 테스트는 `5337 passed`, Ruff와
+  `git diff --check`가 통과했다. 사용자의 운영 방식에 따라 앞으로 테스트는 구현
+  도중 반복하지 않고 코드 변경을 모두 마친 뒤 커밋·배포 직전에 한 번 실행한다.
+- 코드 커밋 `da94ec3`을 rollback 가능한 디렉터리 교체 방식으로 VM에 배포했다.
+  2026-07-27 배포 직후 `personal-monitor.service=active`, Compose 서비스 3개,
+  DB `quick_check=ok`, migration 8, 활성 모니터 1개, 미전송 outbox 0개와 최근
+  서비스 오류 0개를 확인했다. 다음 실행은 2026-07-28 12:13 KST다.
+- 배포 후에는 사용자 지시에 따라 별도 수집·메시지 전송 테스트를 실행하지 않았다.
+  따라서 중복 Telegram 알림은 발생하지 않았다.
+
 ## 중요한 운영 경계
 
 - 2026-07-24 QStash 실행 성공과 GCP의 임대주택 모니터 `active` 상태가 모두
@@ -246,13 +272,15 @@ uv run ruff check .
 git diff --check
 ```
 
-배포 전에는 변경 범위에 맞는 테스트를 먼저 실행하고, 완료를 보고하기 직전에
-운영 서비스·DB·로그를 각각 확인한다. 배포 절차는
+코드 변경을 모두 마친 뒤 커밋·배포 직전에 변경 범위에 맞는 테스트를 한 번
+실행하고, 완료를 보고하기 직전에 운영 서비스·DB·로그를 각각 확인한다. 배포 절차는
 `docs/operations/gcp-deploy.md`를 따른다.
 
 ## 다음 세션의 첫 행동
 
-1. 다음 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하는지 확인한다.
-2. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
-3. 사용자가 Telegram에서 첫 URL 없는 모니터를 실제 등록하면 첫 예약 실행 결과와
+1. 2026-07-28 12:13 KST 신규 임대주택이 있으면 Telegram에 상세 제목과 실제
+   상세 URL이 표시되는지 확인한다.
+2. 다음 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하는지 확인한다.
+3. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
+4. 사용자가 Telegram에서 첫 URL 없는 모니터를 실제 등록하면 첫 예약 실행 결과와
    중복 알림 방지를 확인한다.

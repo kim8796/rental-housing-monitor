@@ -29,25 +29,25 @@
 - Consumes: `MonitorSpec`, `ObservedItem`, `RuleMatch`
 - Produces: `render_payload(...) -> dict[str, object]`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 임대주택 item의 제목·상세 URL·한국어 제목이 payload에 포함되고, 일반 item 콘텐츠는
 계속 제외되며 손상된 임대주택 item은 일반 알림으로 폴백하는 literal assertion을
 추가한다.
 
-- [ ] **Step 2: Run tests to verify RED**
+- [x] **Step 2: Run tests to verify RED**
 
 Run: `.venv/bin/python -m pytest tests/personal_monitor/engine/test_runner.py -k payload -q`
 
 Expected: 임대주택 상세 payload 테스트가 현재 일반 `new_item` payload 때문에 실패.
 
-- [ ] **Step 3: Implement the minimal renderer**
+- [x] **Step 3: Implement the minimal renderer**
 
 `python_plugin/rental_housing`와 `new_item` 조합만 검증된 `Announcement`로 변환해
 `format_announcement`를 사용한다. 변환 실패 또는 일반 monitor는 한국어 kind
 label과 query·fragment가 제거된 기존 public URL을 사용한다.
 
-- [ ] **Step 4: Verify GREEN and regression**
+- [x] **Step 4: Verify GREEN and regression**
 
 Run:
 
@@ -61,8 +61,8 @@ git diff --check
 
 Expected: 모든 테스트와 정적 검사가 통과.
 
-- [ ] **Step 5: Deploy and smoke test**
+- [x] **Step 5: Deploy and verify operational health**
 
-새 커밋을 rollback 가능 절차로 GCP VM에 배포한 뒤, 저장된 오늘 공고 item으로
-`render_payload`를 호출해 제목·상세 URL이 나오고 `new_item`·목록 URL이 없는지
-확인한다. 운영 서비스·DB·heartbeat·백업을 재검증한다.
+새 커밋을 rollback 가능 절차로 GCP VM에 배포한다. 사용자 지시에 따라 배포 후
+별도 수집·메시지 전송 테스트는 생략하고 운영 서비스·컨테이너·DB·로그 상태를
+읽기 전용으로 확인한다.
