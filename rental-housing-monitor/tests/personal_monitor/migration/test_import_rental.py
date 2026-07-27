@@ -183,7 +183,14 @@ def test_import_maps_exact_fields_times_hash_delivery_and_marker(tmp_path: Path)
             "SELECT status, lease_owner, lease_expires_at, last_error, payload_json FROM outbox"
         ).fetchone()
         assert tuple(outbox)[:4] == ("delivered", None, None, None)
-        assert "view=full" not in outbox["payload_json"]
+        assert json.loads(outbox["payload_json"]) == {
+            "text": (
+                "모니터 조건에 맞는 변경이 감지되었습니다.\n"
+                "종류: new_item\n"
+                "출처: https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/"
+                "selectWrtancList.do"
+            )
+        }
         delivery = target.execute(
             "SELECT external_message_id, delivered_at FROM deliveries"
         ).fetchone()

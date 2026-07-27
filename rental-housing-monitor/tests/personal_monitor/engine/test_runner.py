@@ -598,7 +598,67 @@ def test_delivery_key_is_stable_for_new_and_changed_events() -> None:
     )
 
 
-def test_fixed_payload_omits_item_content_and_strips_url_query_and_fragment() -> None:
+def test_rental_new_item_payload_uses_localized_details_and_item_url() -> None:
+    payload = render_payload(
+        make_spec(
+            name="서울·경기 임대주택",
+            target_url=(
+                "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/"
+                "selectWrtancList.do"
+            ),
+            source_adapter="python_plugin",
+            adapter_ref="rental_housing",
+            validators={
+                "min_items": 0,
+                "max_items": 10_000,
+                "allowed_link_domains": [
+                    "apply.lh.or.kr",
+                    "apply.gh.or.kr",
+                    "www.gh.or.kr",
+                    "www.i-sh.co.kr",
+                ],
+            },
+        ),
+        ObservedItem(
+            "announcement:LH:2015122300020387",
+            {
+                "source_id": "2015122300020387",
+                "title": "오산시 행복주택 입주자격완화 예비입주자 모집(2026.07.27)",
+                "agency": "LH",
+                "region": "경기도",
+                "housing_type": "행복주택",
+                "target": "청년·신혼부부 등 행복주택 대상자",
+                "announcement_date": "2026-07-27",
+                "application_start_date": None,
+                "application_end_date": None,
+                "url": (
+                    "https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/"
+                    "selectWrtancInfo.do?panId=2015122300020387"
+                    "&ccrCnntSysDsCd=03&uppAisTpCd=06&aisTpCd=10&mi=1026"
+                ),
+            },
+        ),
+        RuleMatch(RuleKind.NEW_ITEM, None, None, None),
+    )
+
+    assert payload == {
+        "text": (
+            "🏠 신규 임대주택 공고\n"
+            "공고 제목: 오산시 행복주택 입주자격완화 예비입주자 모집(2026.07.27)\n"
+            "기관: LH\n"
+            "지역: 경기도\n"
+            "공급유형: 행복주택\n"
+            "대상: 청년·신혼부부 등 행복주택 대상자\n"
+            "공고일: 2026-07-27\n"
+            "접수기간: 정보 없음\n"
+            "URL: https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/"
+            "selectWrtancInfo.do?panId=2015122300020387"
+            "&ccrCnntSysDsCd=03&uppAisTpCd=06&aisTpCd=10&mi=1026"
+        )
+    }
+
+
+def test_generic_payload_localizes_kind_but_omits_untrusted_item_content() -> None:
     payload = render_payload(
         make_spec(),
         ObservedItem("<script>cookie=session-secret</script>", {"html": "<b>secret</b>"}),
@@ -606,9 +666,44 @@ def test_fixed_payload_omits_item_content_and_strips_url_query_and_fragment() ->
     )
 
     text = str(payload["text"])
+    assert "종류: 신규 항목" in text
+    assert "new_item" not in text
     assert "https://example.com/list" in text
     for forbidden in ("view=private", "#secret", "script", "cookie", "<b>"):
         assert forbidden not in text
+
+
+def test_malformed_rental_item_falls_back_without_exposing_content() -> None:
+    payload = render_payload(
+        make_spec(
+            source_adapter="python_plugin",
+            adapter_ref="rental_housing",
+        ),
+        ObservedItem(
+            "announcement:LH:broken",
+            {
+                "source_id": "broken",
+                "title": "cookie=session-secret",
+                "agency": "LH",
+                "region": "경기도",
+                "housing_type": "행복주택",
+                "target": "청년",
+                "announcement_date": "2026-07-27",
+                "application_start_date": None,
+                "application_end_date": None,
+                "url": "https://0x7f.0.0.1/private",
+            },
+        ),
+        RuleMatch(RuleKind.NEW_ITEM, None, None, None),
+    )
+
+    assert payload == {
+        "text": (
+            "모니터 조건에 맞는 변경이 감지되었습니다.\n"
+            "종류: 신규 항목\n"
+            "출처: https://example.com/list"
+        )
+    }
 
 
 @pytest.mark.parametrize(

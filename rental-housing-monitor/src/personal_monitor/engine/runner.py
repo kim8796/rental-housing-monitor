@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import unicodedata
 from collections.abc import Coroutine
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from personal_monitor.domain.observation import (
@@ -16,17 +17,25 @@ from personal_monitor.domain.observation import (
     diff_items,
 )
 from personal_monitor.domain.rules import RuleMatch, evaluate_rules
-from personal_monitor.domain.spec import MonitorSpec, MonitorStatus, RuleKind
+from personal_monitor.domain.spec import MonitorSpec, MonitorStatus, RuleKind, SourceAdapterKind
 from personal_monitor.domain.validator import BatchValidationError, validate_batch
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.engine.scheduler import next_run_at
 from personal_monitor.ports import AdapterRegistry, Clock
+from personal_monitor.security.credential_names import is_sensitive_credential_name
+from personal_monitor.security.url_policy import (
+    ALLOWED_PORTS,
+    canonicalize_hostname,
+    has_unsafe_url_characters,
+)
 from personal_monitor.storage import (
     DeliveryCandidate,
     MonitorLease,
     RegistryRepository,
     RuntimeRepository,
 )
+from rental_monitor.models import Agency, Announcement, HousingType
+from rental_monitor.telegram import format_announcement
 
 _DIAGNOSTIC_CODES = {
     ErrorClass.TRANSIENT_NETWORK: "network_error",
@@ -36,6 +45,13 @@ _DIAGNOSTIC_CODES = {
     ErrorClass.POLICY: "policy_rejected",
     ErrorClass.DELIVERY: "delivery_failed",
     ErrorClass.INTERNAL: "internal_error",
+}
+_RULE_KIND_LABELS = {
+    RuleKind.NEW_ITEM: "신규 항목",
+    RuleKind.FIELD_CHANGED: "값 변경",
+    RuleKind.NUMERIC_THRESHOLD: "기준값 도달",
+    RuleKind.STATUS_EQUALS: "상태 일치",
+    RuleKind.KEYWORD_MATCH: "키워드 일치",
 }
 
 
@@ -326,14 +342,108 @@ def _current_items(batch: ObservationBatch, previous: list[ObservedItem]) -> lis
 
 
 def render_payload(spec: MonitorSpec, item: ObservedItem, match: RuleMatch) -> dict[str, object]:
-    del item
+    rental_payload = _rental_payload(spec, item, match)
+    if rental_payload is not None:
+        return rental_payload
     return {
         "text": (
             "모니터 조건에 맞는 변경이 감지되었습니다.\n"
-            f"종류: {match.kind.value}\n"
+            f"종류: {_RULE_KIND_LABELS[match.kind]}\n"
             f"출처: {_public_url(spec.target_url)}"
         )
     }
+
+
+def _rental_payload(
+    spec: MonitorSpec,
+    item: ObservedItem,
+    match: RuleMatch,
+) -> dict[str, object] | None:
+    if (
+        spec.source_adapter is not SourceAdapterKind.PYTHON_PLUGIN
+        or spec.adapter_ref != "rental_housing"
+        or match.kind is not RuleKind.NEW_ITEM
+    ):
+        return None
+    try:
+        fields = item.fields
+        source_id = fields.get("source_id")
+        if source_id is not None:
+            source_id = _rental_text(source_id, limit=500, allow_blank=True)
+        announcement = Announcement(
+            source_id=source_id,
+            title=_rental_text(fields["title"], limit=1_000),
+            agency=Agency(_rental_text(fields["agency"], limit=20)),
+            region=_rental_text(fields["region"], limit=200),
+            housing_type=HousingType(_rental_text(fields["housing_type"], limit=100)),
+            target=_rental_text(fields["target"], limit=1_000),
+            announcement_date=_rental_date(fields["announcement_date"]),
+            application_start_date=_optional_rental_date(
+                fields["application_start_date"]
+            ),
+            application_end_date=_optional_rental_date(fields["application_end_date"]),
+            url=_rental_url(fields["url"], spec),
+        )
+        return {"text": format_announcement(announcement)}
+    except (KeyError, TypeError, ValueError, MonitorError):
+        return None
+
+
+def _rental_text(value: object, *, limit: int, allow_blank: bool = False) -> str:
+    if type(value) is not str or not 0 <= len(value) <= limit:
+        raise ValueError
+    normalized = value.strip()
+    if (not allow_blank and not normalized) or any(
+        unicodedata.category(character).startswith("C") for character in normalized
+    ):
+        raise ValueError
+    try:
+        normalized.encode("utf-8", errors="strict")
+    except UnicodeError:
+        raise ValueError from None
+    return normalized
+
+
+def _rental_date(value: object) -> date:
+    text = _rental_text(value, limit=10)
+    parsed = date.fromisoformat(text)
+    if parsed.isoformat() != text:
+        raise ValueError
+    return parsed
+
+
+def _optional_rental_date(value: object) -> date | None:
+    return None if value is None else _rental_date(value)
+
+
+def _rental_url(value: object, spec: MonitorSpec) -> str:
+    url = _rental_text(value, limit=2_048)
+    if has_unsafe_url_characters(url):
+        raise ValueError
+    parts = urlsplit(url)
+    hostname = parts.hostname
+    if (
+        parts.scheme.casefold() not in {"http", "https"}
+        or hostname is None
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        raise ValueError
+    canonical_hostname = canonicalize_hostname(hostname)
+    if canonical_hostname not in spec.validators.allowed_link_domains:
+        raise ValueError
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError from None
+    if port is not None and port not in ALLOWED_PORTS:
+        raise ValueError
+    if any(
+        is_sensitive_credential_name(name)
+        for name, _ in parse_qsl(parts.query, keep_blank_values=True)
+    ):
+        raise ValueError
+    return urlunsplit((parts.scheme.casefold(), parts.netloc, parts.path or "/", parts.query, ""))
 
 
 def render_warning(
