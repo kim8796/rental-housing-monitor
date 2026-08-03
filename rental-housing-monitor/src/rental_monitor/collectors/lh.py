@@ -10,7 +10,7 @@ import httpx
 
 from rental_monitor.collectors.base import ParserStructureError, request_with_retry
 from rental_monitor.filters import classify_housing_type, is_recruitment_title, normalize_region
-from rental_monitor.models import Agency, Announcement, HousingType, canonical_key
+from rental_monitor.models import Agency, Announcement, canonical_key
 
 LH_API_URL = "https://apis.data.go.kr/B552555/lhLeaseNoticeInfo1/lhLeaseNoticeInfo1"
 _REGION_CODES = ("11", "41")
@@ -113,10 +113,10 @@ def parse_lh_response(payload: object) -> tuple[list[Announcement], int]:
                 agency=Agency.LH,
                 region=region,
                 housing_type=housing_type,
-                target=_target_for(housing_type),
+                target=_target_for(title),
                 announcement_date=_parse_date(_require(raw_row, "PAN_NT_ST_DT")),
                 application_start_date=None,
-                application_end_date=None,
+                application_end_date=_optional_date(raw_row.get("CLSG_DT")),
                 url=_require(raw_row, "DTL_URL"),
             )
         )
@@ -153,6 +153,13 @@ def _parse_date(value: str) -> date:
         ) from error
 
 
+def _optional_date(value: object) -> date | None:
+    normalized = str(value or "").strip()
+    if not normalized or normalized == "-":
+        return None
+    return _parse_date(normalized)
+
+
 def _pan_id_from_url(url: str) -> str:
     match = re.search(r"(?:PAN_ID[:=]|panId=)([A-Za-z0-9-]+)", url)
     if not match:
@@ -160,9 +167,15 @@ def _pan_id_from_url(url: str) -> str:
     return match.group(1)
 
 
-def _target_for(housing_type: HousingType) -> str:
-    return {
-        HousingType.HAPPY: "청년·신혼부부 등 행복주택 대상자",
-        HousingType.NATIONAL: "국민임대 입주자격 충족자",
-        HousingType.NEWLYWED_PURCHASE: "신혼부부·예비신혼부부·신생아 가구",
-    }[housing_type]
+def _target_for(title: str) -> str:
+    compact = "".join(title.split())
+    groups: list[str] = []
+    if "청년" in compact:
+        groups.append("청년")
+    if "신혼" in compact:
+        groups.append("신혼부부")
+    if "신생아" in compact:
+        groups.append("신생아 가구")
+    if groups:
+        return f"공고명 기준: {'·'.join(groups)}"
+    return "공식 공고문 신청자격 확인"

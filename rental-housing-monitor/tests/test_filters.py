@@ -1,3 +1,5 @@
+import pytest
+
 from rental_monitor.filters import (
     classify_housing_type,
     is_recruitment_title,
@@ -26,6 +28,18 @@ def test_happy_and_national_rental_are_classified() -> None:
 def test_follow_up_result_post_is_excluded() -> None:
     assert is_recruitment_title("행복주택 당첨자 발표") is False
     assert is_recruitment_title("행복주택 입주자 모집공고") is True
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "[2일차 동호선정 완료] 신혼·신생아 매입임대주택 입주대기자 모집공고",
+        "행복주택 입주자 모집공고 서류심사대상자 발표 및 서류제출 안내",
+        "국민임대주택 예비입주자 모집공고 예비당첨자 발표",
+    ),
+)
+def test_operational_follow_up_posts_are_not_new_recruitment(title: str) -> None:
+    assert is_recruitment_title(title) is False
 
 
 def test_corrected_recruitment_notice_is_included() -> None:

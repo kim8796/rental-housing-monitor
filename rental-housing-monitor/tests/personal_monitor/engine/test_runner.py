@@ -673,6 +673,72 @@ def test_generic_payload_localizes_kind_but_omits_untrusted_item_content() -> No
         assert forbidden not in text
 
 
+def test_generic_payload_shows_the_safe_matched_field_value() -> None:
+    payload = render_payload(
+        make_spec(
+            extract={
+                "item_scope": "article",
+                "fields": {"title": {"selector": "h2", "type": "text"}},
+            },
+            rules=[
+                {"kind": "keyword_match", "field": "title", "keywords": ["정청래"]}
+            ],
+        ),
+        ObservedItem("post-1", {"title": "정청래 관련 새 글"}),
+        RuleMatch(RuleKind.KEYWORD_MATCH, "title", None, "정청래 관련 새 글"),
+    )
+
+    assert payload == {
+        "text": (
+            "모니터 조건에 맞는 변경이 감지되었습니다.\n"
+            "종류: 키워드 일치\n"
+            "일치 필드: title\n"
+            "현재값: 정청래 관련 새 글\n"
+            "출처: https://example.com/list"
+        )
+    }
+
+
+def test_generic_new_item_payload_shows_a_declared_title() -> None:
+    payload = render_payload(
+        make_spec(
+            extract={
+                "item_scope": "article",
+                "fields": {"title": {"selector": "h2", "type": "text"}},
+            },
+        ),
+        ObservedItem("post-1", {"title": "정청래 관련 새 글"}),
+        RuleMatch(RuleKind.NEW_ITEM, None, None, None),
+    )
+
+    assert "항목: 정청래 관련 새 글" in str(payload["text"])
+
+
+def test_generic_payload_redacts_a_sensitive_matched_value() -> None:
+    payload = render_payload(
+        make_spec(
+            extract={
+                "item_scope": "article",
+                "fields": {"title": {"selector": "h2", "type": "text"}},
+            },
+            rules=[
+                {"kind": "keyword_match", "field": "title", "keywords": ["공지"]}
+            ],
+        ),
+        ObservedItem("post-1", {"title": "authorization: private-secret 공지"}),
+        RuleMatch(
+            RuleKind.KEYWORD_MATCH,
+            "title",
+            None,
+            "authorization: private-secret 공지",
+        ),
+    )
+
+    text = str(payload["text"])
+    assert "private-secret" not in text
+    assert "현재값: [숨김]" in text
+
+
 def test_malformed_rental_item_falls_back_without_exposing_content() -> None:
     payload = render_payload(
         make_spec(

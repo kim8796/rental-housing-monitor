@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from personal_monitor.ai.contracts import IntentKind, IntentResult
 from personal_monitor.control.actions import PendingActionService
 from personal_monitor.control.planner import MonitorPlanner, PlanningFailed
 from personal_monitor.control.preview import PreviewMessage, render_preview
@@ -19,12 +20,14 @@ from personal_monitor.storage import open_database
 from tests.credential_alias_cases import PUNCTUATED_ASSIGNMENTS, SENSITIVE_ASSIGNMENTS
 from tests.personal_monitor.control.test_planner import (
     OWNER,
+    TARGET_URL,
     FakePolicy,
     FakeProbe,
     FakeWorker,
     IdSource,
     document,
     intent,
+    keyword_spec,
     plan,
     probe_result,
     projected_url,
@@ -131,6 +134,7 @@ def _custom_proposal(
     profile: str | None = None,
     warnings: tuple[str, ...] = (),
     sanitizer: object | None = None,
+    create_intent: IntentResult | None = None,
 ):
     safe_target = resolved or target(candidate.target_url)
     model_payload = candidate.model_dump(mode="json")
@@ -157,7 +161,38 @@ def _custom_proposal(
         now_source=lambda: NOW,
         **optional,
     )
-    return asyncio.run(planner.propose(request(), intent(candidate.target_url)))
+    return asyncio.run(
+        planner.propose(
+            request(),
+            create_intent or intent(candidate.target_url),
+        )
+    )
+
+
+def test_initial_preview_shows_the_actual_keyword(
+    connection: sqlite3.Connection,
+) -> None:
+    candidate = keyword_spec("정청래")
+    source = document(body="<main><h1>정청래 관련 새 글</h1></main>".encode())
+    create = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=TARGET_URL,
+        condition_text="새 글 제목에 정청래 글자가 들어가면 알려줘",
+        schedule_text="매일 13시",
+        clarification=None,
+        confidence=0.98,
+    )
+    value = _custom_proposal(
+        connection,
+        candidate,
+        source,
+        create_intent=create,
+    )
+
+    preview = render_preview(value)
+
+    assert "조건: 제목 키워드 포함: 정청래" in preview.text
 
 
 def test_preview_caps_four_source_items_to_exactly_three(
@@ -509,12 +544,25 @@ def test_extreme_valid_spec_renders_bounded_without_orphan_confirmation(
         ).encode(),
         strategy=candidate.fetch_strategy.HTTP,
     )
+    matching_intent = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=long_url,
+        condition_text=" ".join(
+            f"가격이 {100_000 + threshold}원 미만"
+            for threshold in range(20)
+        ),
+        schedule_text="6시간마다",
+        clarification=None,
+        confidence=0.96,
+    )
 
     value = _custom_proposal(
         connection,
         candidate,
         source,
         resolved=target(long_url),
+        create_intent=matching_intent,
     )
     preview = render_preview(value)
 

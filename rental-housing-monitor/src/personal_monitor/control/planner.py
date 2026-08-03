@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Final, NamedTuple
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -25,6 +26,7 @@ from personal_monitor.domain.spec import (
     FetchStrategy,
     FieldType,
     MonitorSpec,
+    RuleKind,
     SourceAdapterKind,
 )
 from personal_monitor.engine.errors import MonitorError
@@ -63,6 +65,21 @@ _FEEDBACK_SCHEMA: Final = "candidate_schema_invalid"
 _FEEDBACK_BINDING: Final = "candidate_binding_invalid"
 _FEEDBACK_EXTRACT: Final = "candidate_extract_invalid"
 _FEEDBACK_WORKER: Final = "worker_unavailable"
+_CONDITION_NUMBER_RE: Final = re.compile(
+    r"(?<![0-9.,])([+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?)"
+    r"\s*(억|만|천|백)?\s*(?:원)?"
+)
+_NUMBER_MULTIPLIERS: Final = {
+    "억": Decimal("100000000"),
+    "만": Decimal("10000"),
+    "천": Decimal("1000"),
+    "백": Decimal("100"),
+}
+_LESS_TERMS: Final = ("아래", "미만", "이하", "낮", "내려", "떨어")
+_GREATER_TERMS: Final = ("위", "초과", "이상", "높", "올라", "넘")
+_EQUAL_TERMS: Final = ("같", "동일", "일치")
+_CHANGED_TERMS: Final = ("바뀌", "변경", "달라", "변동")
+_NEW_ITEM_TERMS: Final = ("새", "신규", "새로운", "나오", "올라오", "등록")
 
 
 class PlanningFailed(RuntimeError):
@@ -613,6 +630,8 @@ class MonitorPlanner:
             or spec.auth_profile_ref is not None
             or spec.fetch_strategy not in {FetchStrategy.AUTO, probe.document.strategy}
             or len(spec.extract.fields) > _MAX_FIELDS
+            or spec.validators.min_items < 1
+            or not _condition_preserves_spec(projected_intent.condition_text, spec)
             or _contains_forbidden_value(spec.model_dump(mode="python"), forbidden)
         ):
             return None, _FEEDBACK_BINDING
@@ -678,6 +697,7 @@ class MonitorPlanner:
         if (
             invalid
             or type(validated) is not tuple
+            or not validated
             or any(type(item) is not ObservedItem for item in validated)
         ):
             return None, _FEEDBACK_EXTRACT
@@ -1153,6 +1173,81 @@ def _contains_forbidden_value(value: object, forbidden: tuple[str, ...]) -> bool
         )
     except Exception:
         return True
+
+
+def _condition_preserves_spec(condition: str | None, spec: MonitorSpec) -> bool:
+    if condition is None:
+        return True
+    try:
+        normalized = _normalized_condition(condition)
+        if "[숨김]" in normalized:
+            return True
+        numbers = _condition_numbers(condition)
+        for rule in spec.rules:
+            if rule.kind is RuleKind.KEYWORD_MATCH:
+                if not all(
+                    keyword and _normalized_condition(keyword) in normalized
+                    for keyword in rule.keywords
+                ):
+                    return False
+            elif rule.kind is RuleKind.NUMERIC_THRESHOLD:
+                if Decimal(str(rule.value)) not in numbers:
+                    return False
+                if rule.operator in {"lt", "lte"} and not any(
+                    term in normalized for term in _LESS_TERMS
+                ):
+                    return False
+                if rule.operator in {"gt", "gte"} and not any(
+                    term in normalized for term in _GREATER_TERMS
+                ):
+                    return False
+                if rule.operator == "eq" and not any(
+                    term in normalized for term in _EQUAL_TERMS
+                ):
+                    return False
+            elif rule.kind is RuleKind.STATUS_EQUALS:
+                if not _condition_contains_literal(normalized, numbers, rule.value):
+                    return False
+            elif rule.kind is RuleKind.FIELD_CHANGED:
+                if not any(term in normalized for term in _CHANGED_TERMS):
+                    return False
+            elif rule.kind is RuleKind.NEW_ITEM and not any(
+                term in normalized for term in _NEW_ITEM_TERMS
+            ):
+                return False
+        return True
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _normalized_condition(value: str) -> str:
+    return "".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _condition_numbers(value: str) -> frozenset[Decimal]:
+    numbers: set[Decimal] = set()
+    for match in _CONDITION_NUMBER_RE.finditer(unicodedata.normalize("NFKC", value)):
+        number = Decimal(match.group(1).replace(",", ""))
+        multiplier = _NUMBER_MULTIPLIERS.get(match.group(2), Decimal(1))
+        numbers.add(number * multiplier)
+    return frozenset(numbers)
+
+
+def _condition_contains_literal(
+    normalized: str,
+    numbers: frozenset[Decimal],
+    value: str | int | float | bool | None,
+) -> bool:
+    if type(value) is str:
+        literal = _normalized_condition(value)
+        return bool(literal) and literal in normalized
+    if type(value) in {int, float}:
+        return Decimal(str(value)) in numbers
+    if value is True:
+        return any(term in normalized for term in ("예", "참", "활성", "있음", "true"))
+    if value is False:
+        return any(term in normalized for term in ("아니", "거짓", "비활성", "없음", "false"))
+    return False
 
 
 def _bind_application_spec(
