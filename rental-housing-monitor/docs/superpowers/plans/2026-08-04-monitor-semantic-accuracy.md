@@ -46,6 +46,6 @@
 
 **Files:** `PROJECT_HANDOFF.md`
 
-- [ ] 인수인계 문서를 갱신한다.
+- [x] 인수인계 문서를 갱신한다.
 - [x] 전체 pytest, Ruff, diff 검사를 실행한다.
-- [ ] 커밋, push, PR, merge 후 rollback 가능한 방식으로 GCP VM에 배포하고 운영 상태를 확인한다.
+- [x] 커밋, push, PR, merge 후 rollback 가능한 방식으로 GCP VM에 배포하고 운영 상태를 확인한다.
