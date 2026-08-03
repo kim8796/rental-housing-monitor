@@ -24,7 +24,21 @@ def test_lh_response_normalizes_official_fields() -> None:
     assert notices[0].agency is Agency.LH
     assert notices[0].housing_type is HousingType.HAPPY
     assert notices[0].announcement_date == date(2026, 7, 20)
+    assert notices[0].application_start_date is None
+    assert notices[0].application_end_date == date(2026, 7, 29)
+    assert notices[0].target == "공식 공고문 신청자격 확인"
     assert notices[0].source_id == "2016122300001530"
+
+
+def test_lh_target_uses_only_groups_stated_in_the_official_title() -> None:
+    payload = fixture("lh_notices.json")
+    row = payload["dsList"][0]  # type: ignore[index]
+    row["AIS_TP_CD_NM"] = "매입임대"  # type: ignore[index]
+    row["PAN_NM"] = "[청년신혼부부매입임대리츠] 경기북부 입주자 모집"  # type: ignore[index]
+
+    notices, _ = parse_lh_response(payload)
+
+    assert notices[0].target == "공고명 기준: 청년·신혼부부"
 
 
 def test_lh_response_accepts_current_top_level_list() -> None:

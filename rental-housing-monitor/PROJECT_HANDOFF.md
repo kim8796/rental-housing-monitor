@@ -18,14 +18,15 @@
 
 ## 현재 요약
 
-- 마지막 갱신: 2026-08-03 KST
+- 마지막 갱신: 2026-08-04 KST
 - 저장소: `kim8796/rental-housing-monitor`
 - 기본 브랜치: `main`
 - GCP 결제 동기화 복구 전 `main`: `dc61626` (PR #15)
-- 운영 배포 코드 기준: `6198eb8` (`codex/fix-billing-sync`)
+- 운영 배포 코드 기준: `6a36d15` (`codex/fix-monitor-semantic-accuracy`)
 - 최종 통합: PR #13 `fix: enable production URL discovery`, PR #14
   `test: verify safe server upgrade runbook`, PR #15
   `fix: send detailed rental alerts`, PR #16 `fix: restore GCP billing sync`
+  및 PR #17 `fix: preserve monitor request semantics`
 - 서비스 성격: 현재 개인용이며, 사용자·소유자 경계를 유지해 향후 다중 사용자
   서비스로 확장 가능하게 설계한다.
 - 사용자 개발 방식: 사용자가 직접 코딩하기보다 Codex에 자연어로 요청한다. 기능뿐
@@ -85,8 +86,8 @@ Telegram에서 새 모니터를 등록할 때는 JSON이나 slash command가 아
 - URL 없는 실서비스 요청은 Codex 웹 검색, Scrapling 실제 접속, AI spec 작성,
   `등록/수정/취소` 미리보기까지 검증됐다. 테스트가 만든 pending action은 즉시
   폐기되어 운영 모니터 수는 바뀌지 않았다.
-- PR #13·#14 통합 기준 전체 회귀 테스트 `5335 passed`, Ruff와
-  `git diff --check`가 통과했다.
+- PR #17 기준 전체 회귀 테스트 `5350 passed`, Ruff와 `git diff --check`가
+  통과했다.
 
 ### 3. GCP 크레딧 모니터
 
@@ -219,8 +220,9 @@ Telegram 연결을 다시 확인한다.
   `format_announcement`로 렌더링한다. 이제 제목, 기관, 지역, 주택 유형, 대상,
   공고일, 접수 기간과 `selectWrtancInfo.do` 상세 URL을 보낸다.
 - 상세 URL은 허용 도메인, scheme, port, credential 및 민감 query 이름을 다시
-  검증한다. 일반 Scrapling 모니터는 수집 콘텐츠를 노출하지 않고 이벤트 종류만
-  `신규 항목`, `값 변경`, `키워드 일치` 같은 한국어로 표시한다.
+  검증한다. 일반 Scrapling 모니터는 선언된 매칭 필드의 현재값을 길이 제한과
+  민감값 제거 후 표시하고, 신규 항목은 선언된 제목·이름을 우선 표시한다. 이벤트
+  종류는 `신규 항목`, `값 변경`, `키워드 일치` 같은 한국어로 표시한다.
 - 과거에 이미 전달된 임대주택 import outbox payload는 레거시 형식으로 동결했다.
   새 렌더러가 바뀌어도 기존 DB를 다시 import할 때 충돌하지 않는다.
 - 최종 커밋·배포 직전 전체 테스트는 `5337 passed`, Ruff와
@@ -272,6 +274,40 @@ Telegram 연결을 다시 확인한다.
   `daily/2026-08-03T144931Z.tar.age` GCS 객체(348,440 bytes)를 확인했다.
   실패 이미지와 재생성 가능한 build cache만 제거해 약 3.46GB를 회수했으며 서버
   디스크 사용률은 79%다. 정상 운영 이미지와 rollback 자산은 보존했다.
+
+## 2026-08-04 모니터 의미 정확도 개선
+
+- LH 공공데이터의 `CLSG_DT`를 실제 접수 종료일로 매핑한다. 대상 문구는 공고명에
+  `청년`, `신혼`, `신생아`가 명시된 경우에만 `공고명 기준`으로 표시하고, 그 외에는
+  `공식 공고문 신청자격 확인`으로 표시해 신청 자격을 추측하지 않는다.
+- SH 제목은 공백을 제거한 뒤 동호선정, 서류심사·제출, 예비당첨자 발표 등 모집 뒤
+  후속 운영 게시물을 신규 공고에서 제외한다. 기존 행복주택·국민임대·신혼부부
+  매입임대 범위는 유지하며 청년안심주택 등 신규 공급유형은 이번 변경에 포함하지
+  않았다.
+- Scrapling 후보 승인 경계에서 시험 추출 0건과 `min_items=0`을 거부한다. GPT가
+  만든 키워드, 상태값, 숫자 기준·비교 방향, 변경·신규 규칙이 사용자의 조건 문장에
+  근거하지 않으면 최대 3회 재시도 후 pending action 없이 실패한다.
+- 등록 미리보기는 `지정 키워드` 대신 실제 키워드를 안전하게 보여준다. 일반
+  Telegram 알림은 선언된 매칭 필드의 현재값을 표시하며 URL query, credential 형태,
+  제어문자와 길이 초과 값은 기존 출력 경계에서 제거한다.
+- 전체 검증은 `5350 passed`, Ruff와 `git diff --check` 통과다. 기능 커밋
+  `6a36d15`을 PR #17 브랜치에 push했다.
+- 00:55 KST에 `6a36d15`을 격리 build, Scrapling import 3회, network 없는 migration,
+  원자적 디렉터리 교체 방식으로 VM에 배포했다. 이전 앱 디렉터리와
+  `personal-monitor:rollback-6a36d15` 이미지는 보존했다.
+- 배포 후 `personal-monitor.service=active`, Compose 서비스 3개, restart 0,
+  DB `quick_check=ok`, migration 8, heartbeat 34초, 활성 모니터 1개, 미전송 outbox
+  0개, 미소비 pending action 0개, 최근 실패 run 0개, 최근 journal 오류 0개와
+  Codex `Logged in using ChatGPT`를 확인했다.
+- Telegram 전송 없이 운영 이미지에서 실제 임대 수집을 다시 실행했다. 총 44건
+  (LH 39, GH 5), LH·SH·GH 상태 모두 `ok`, 경고 0건이었다. LH 39건 모두 공식
+  마감일이 들어갔고 대상은 공고명 근거 10건, 공고문 확인 필요 29건으로 나뉘었다.
+- 최신 결제 snapshot은 00:13 KST `source=bigquery`, 잔액 ₩413,734.38,
+  최근 일평균 ₩2,926.62, 예상 소진일 2026-12-24다. 12:10 자동 동기화는 아직
+  도래하지 않았으므로 아래 다음 행동에서 별도 확인한다.
+- 00:56 KST 암호화 백업이 `status=ok`로 완료됐고
+  `daily/2026-08-03T155611Z.tar.age` GCS 객체(348,440 bytes)를 확인했다. build
+  cache 2.94GB를 정리한 뒤 디스크 사용률은 84%, 여유는 약 7.7GB다.
 
 ## 중요한 운영 경계
 

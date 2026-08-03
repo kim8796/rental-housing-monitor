@@ -48,12 +48,13 @@ def test_static_monitor_runs_real_pipeline_and_deduplicates(integration_harness)
         "SELECT target_id, payload_json, status FROM outbox ORDER BY created_at, id"
     ).fetchall()
     assert [tuple(row) for row in rows] == [
-        (
-            "target-local",
-            '{"text":"모니터 조건에 맞는 변경이 감지되었습니다.\\n'
-            f'종류: 신규 항목\\n출처: {scenario.origin_url}/static"}}',
-            "pending",
-        )
+            (
+                "target-local",
+                '{"text":"모니터 조건에 맞는 변경이 감지되었습니다.\\n'
+                "종류: 신규 항목\\n항목: Local keyboard\\n"
+                f'출처: {scenario.origin_url}/static"}}',
+                "pending",
+            )
     ]
     assert scenario.pending_outbox_count == 1
     assert scenario.delivery_count == 0

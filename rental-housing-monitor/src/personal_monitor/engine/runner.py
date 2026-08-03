@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import unicodedata
 from collections.abc import Coroutine
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+from personal_monitor.control.messages import safe_plain, safe_url
 from personal_monitor.domain.observation import (
     ObservationBatch,
     ObservedItem,
@@ -17,7 +19,13 @@ from personal_monitor.domain.observation import (
     diff_items,
 )
 from personal_monitor.domain.rules import RuleMatch, evaluate_rules
-from personal_monitor.domain.spec import MonitorSpec, MonitorStatus, RuleKind, SourceAdapterKind
+from personal_monitor.domain.spec import (
+    FieldType,
+    MonitorSpec,
+    MonitorStatus,
+    RuleKind,
+    SourceAdapterKind,
+)
 from personal_monitor.domain.validator import BatchValidationError, validate_batch
 from personal_monitor.engine.errors import ErrorClass, MonitorError
 from personal_monitor.engine.scheduler import next_run_at
@@ -345,13 +353,60 @@ def render_payload(spec: MonitorSpec, item: ObservedItem, match: RuleMatch) -> d
     rental_payload = _rental_payload(spec, item, match)
     if rental_payload is not None:
         return rental_payload
-    return {
-        "text": (
-            "모니터 조건에 맞는 변경이 감지되었습니다.\n"
-            f"종류: {_RULE_KIND_LABELS[match.kind]}\n"
-            f"출처: {_public_url(spec.target_url)}"
+    lines = [
+        "모니터 조건에 맞는 변경이 감지되었습니다.",
+        f"종류: {_RULE_KIND_LABELS[match.kind]}",
+    ]
+    if spec.source_adapter is SourceAdapterKind.SCRAPLING:
+        lines.extend(_generic_match_lines(spec, item, match))
+    lines.append(f"출처: {_public_url(spec.target_url)}")
+    return {"text": "\n".join(lines)}
+
+
+def _generic_match_lines(
+    spec: MonitorSpec,
+    item: ObservedItem,
+    match: RuleMatch,
+) -> list[str]:
+    field_name = match.field
+    if field_name is None:
+        if match.kind is not RuleKind.NEW_ITEM:
+            return []
+        declared = tuple(spec.extract.fields)
+        field_name = next(
+            (
+                name
+                for name in ("title", "name", "status", "url", *declared)
+                if name in spec.extract.fields and name in item.fields
+            ),
+            None,
         )
-    }
+        if field_name is None:
+            return []
+        field_spec = spec.extract.fields[field_name]
+        return [f"항목: {_safe_observed_value(item.fields[field_name], field_spec.type)}"]
+    if field_name not in spec.extract.fields or field_name not in item.fields:
+        return []
+    field_spec = spec.extract.fields[field_name]
+    value = match.current
+    return [
+        f"일치 필드: {safe_plain(field_name, limit=64)}",
+        f"현재값: {_safe_observed_value(value, field_spec.type)}",
+    ]
+
+
+def _safe_observed_value(value: object, field_type: FieldType) -> str:
+    if value is None:
+        return "없음"
+    if field_type is FieldType.URL and type(value) is str:
+        return safe_url(value, limit=300)
+    if type(value) is bool:
+        return "예" if value else "아니요"
+    if type(value) in {int, float}:
+        if type(value) is float and not math.isfinite(value):
+            return "확인할 수 없음"
+        return safe_plain(str(value), limit=300)
+    return safe_plain(value, limit=300)
 
 
 def _rental_payload(

@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from rental_monitor.models import HousingType
 
-_FOLLOW_UP_TERMS = ("당첨", "계약결과", "계약 결과", "서류심사 대상자", "예비자 발표")
+_FOLLOW_UP_TERMS = (
+    "당첨",
+    "계약결과",
+    "계약안내",
+    "서류심사대상자",
+    "서류제출안내",
+    "예비자발표",
+    "예비당첨자발표",
+    "동호선정",
+)
 _NEWLYWED_TERMS = ("신혼", "신생아")
 
 
 def is_recruitment_title(title: str) -> bool:
-    compact = " ".join(title.split())
+    compact = "".join(title.split())
     if "모집" not in compact:
         return False
     return not (any(term in compact for term in _FOLLOW_UP_TERMS) and "정정공고" not in compact)

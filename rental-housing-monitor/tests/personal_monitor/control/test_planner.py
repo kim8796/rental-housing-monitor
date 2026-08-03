@@ -195,6 +195,20 @@ def spec(
     )
 
 
+def keyword_spec(keyword: str, *, min_items: int = 1) -> MonitorSpec:
+    payload = spec().model_dump(mode="json")
+    payload["name"] = "게시판 키워드 감시"
+    payload["extract"] = {
+        "item_scope": "main",
+        "fields": {"title": {"selector": "h1", "type": "text"}},
+    }
+    payload["validators"] = {"min_items": min_items, "max_items": 10}
+    payload["rules"] = [
+        {"kind": "keyword_match", "field": "title", "keywords": [keyword]}
+    ]
+    return MonitorSpec.model_validate(payload)
+
+
 def plan(
     value: MonitorSpec | None = None,
     explanation: str = "가격 조건을 검증했습니다",
@@ -730,6 +744,76 @@ def test_observation_validator_failure_retries_and_never_writes(
         for call in worker.calls[1:]
     )
     assert "private" not in str(caught.value)
+    assert pending_count(connection) == 0
+
+
+def test_zero_item_candidate_is_never_approvable(
+    connection: sqlite3.Connection,
+) -> None:
+    candidate = MonitorSpec.model_validate(
+        {
+            **spec(item_scope=".missing").model_dump(mode="json"),
+            "validators": {"min_items": 0, "max_items": 3},
+        }
+    )
+    result = plan(candidate)
+    value, _, _, worker = planner(connection, [result, result, result])
+
+    with pytest.raises(PlanningFailed):
+        run(value.propose(request(), intent()))
+
+    assert len(worker.calls) == 3
+    assert pending_count(connection) == 0
+
+
+def test_keyword_candidate_must_preserve_the_users_exact_keyword(
+    connection: sqlite3.Connection,
+) -> None:
+    source = document(body="<main><h1>정청래 관련 새 글</h1></main>".encode())
+    page_probe = FakeProbe(probe_result(source=source))
+    result = plan(keyword_spec("다른인물"))
+    value, _, _, worker = planner(
+        connection,
+        [result, result, result],
+        probe=page_probe,
+    )
+    create = IntentResult(
+        kind=IntentKind.CREATE,
+        target_monitor_ids=[],
+        target_url=TARGET_URL,
+        condition_text="새 글 제목에 정청래 글자가 들어가면 알려줘",
+        schedule_text="매일 13시",
+        clarification=None,
+        confidence=0.98,
+    )
+
+    with pytest.raises(PlanningFailed):
+        run(value.propose(request("정청래 글을 알려줘"), create))
+
+    assert len(worker.calls) == 3
+    assert pending_count(connection) == 0
+
+
+def test_numeric_candidate_must_preserve_comparison_direction(
+    connection: sqlite3.Connection,
+) -> None:
+    payload = spec().model_dump(mode="json")
+    payload["rules"] = [
+        {
+            "kind": "numeric_threshold",
+            "field": "price",
+            "operator": "gt",
+            "value": 100000,
+        }
+    ]
+    candidate = MonitorSpec.model_validate(payload)
+    result = plan(candidate)
+    value, _, _, worker = planner(connection, [result, result, result])
+
+    with pytest.raises(PlanningFailed):
+        run(value.propose(request(), intent()))
+
+    assert len(worker.calls) == 3
     assert pending_count(connection) == 0
 
 

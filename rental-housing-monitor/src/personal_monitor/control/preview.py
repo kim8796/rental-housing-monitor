@@ -188,7 +188,10 @@ def _rule_lines(spec: MonitorSpec) -> list[str]:
             field_type = spec.extract.fields[rule.field].type  # type: ignore[index]
             lines.append(f"조건: {field} {_format_value(rule.value, field_type)}")
         elif rule.kind is RuleKind.KEYWORD_MATCH:
-            lines.append(f"조건: {field} 지정 키워드 포함")
+            keywords = ", ".join(_plain(value, limit=120) for value in rule.keywords[:5])
+            if len(rule.keywords) > 5:
+                keywords = f"{keywords} 외 {len(rule.keywords) - 5}개"
+            lines.append(f"조건: {field} 키워드 포함: {keywords}")
     return lines
 
 
