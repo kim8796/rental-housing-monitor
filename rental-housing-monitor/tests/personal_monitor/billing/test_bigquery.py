@@ -14,6 +14,7 @@ from personal_monitor.billing.bigquery import (
 )
 
 NOW = datetime(2026, 7, 24, 3, 10, tzinfo=UTC)
+BASELINE = datetime(2026, 7, 23, 12, 10, tzinfo=UTC)
 
 
 def test_source_uses_fixed_metadata_and_bounded_parameterized_query() -> None:
@@ -37,9 +38,10 @@ def test_source_uses_fixed_metadata_and_bounded_parameterized_query() -> None:
                     "fields": [
                         {"name": "project_id", "type": "STRING"},
                         {"name": "project_name", "type": "STRING"},
-                        {"name": "month_cost", "type": "FLOAT"},
-                        {"name": "promotion_consumed", "type": "FLOAT"},
-                        {"name": "recent_7d_consumed", "type": "FLOAT"},
+                        {"name": "month_cost", "type": "NUMERIC"},
+                        {"name": "promotion_consumed", "type": "NUMERIC"},
+                        {"name": "baseline_promotion_consumed", "type": "NUMERIC"},
+                        {"name": "recent_7d_consumed", "type": "NUMERIC"},
                     ]
                 },
                 "rows": [
@@ -47,18 +49,20 @@ def test_source_uses_fixed_metadata_and_bounded_parameterized_query() -> None:
                         "f": [
                             {"v": "project-a"},
                             {"v": "주 프로젝트"},
-                            {"v": "4000.125"},
-                            {"v": "4954.74"},
-                            {"v": "1400"},
+                            {"v": "4000.125000"},
+                            {"v": "47382.382451"},
+                            {"v": "5971.404681"},
+                            {"v": "25664.106537"},
                         ]
                     },
                     {
                         "f": [
                             {"v": "project-b"},
                             {"v": "보조 프로젝트"},
-                            {"v": "500"},
-                            {"v": "4954.74"},
-                            {"v": "1400"},
+                            {"v": "500.000000"},
+                            {"v": "47382.382451"},
+                            {"v": "5971.404681"},
+                            {"v": "25664.106537"},
                         ]
                     },
                 ],
@@ -77,37 +81,37 @@ def test_source_uses_fixed_metadata_and_bounded_parameterized_query() -> None:
         transport=httpx.MockTransport(query_handler),
     )
 
-    result = asyncio.run(source.fetch(start_on=date(2026, 7, 8), now=NOW))
-    second = asyncio.run(source.fetch(start_on=date(2026, 7, 8), now=NOW))
+    result = asyncio.run(source.fetch(start_on=date(2026, 7, 8), baseline_as_of=BASELINE, now=NOW))
+    second = asyncio.run(source.fetch(start_on=date(2026, 7, 8), baseline_as_of=BASELINE, now=NOW))
 
     assert len(metadata_requests) == 1
     assert metadata_requests[0].url == (
-        "http://169.254.169.254/computeMetadata/v1/instance/"
-        "service-accounts/default/token"
+        "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
     )
     assert metadata_requests[0].headers["metadata-flavor"] == "Google"
     assert len(query_requests) == 2
     request = query_requests[0]
     assert request.url == (
-        "https://bigquery.googleapis.com/bigquery/v2/projects/"
-        "local-social-native-wlk-0720/queries"
+        "https://bigquery.googleapis.com/bigquery/v2/projects/local-social-native-wlk-0720/queries"
     )
     assert request.headers["authorization"] == "Bearer private-access-token"
     body = json.loads(request.content)
     assert body["useLegacySql"] is False
     assert body["maximumBytesBilled"] == "100000000"
-    assert "`local-social-native-wlk-0720.billing_monitor.gcp_billing_export_v1_*`" in body[
-        "query"
-    ]
+    assert "`local-social-native-wlk-0720.billing_monitor.gcp_billing_export_v1_*`" in body["query"]
     assert "private-access-token" not in body["query"]
     assert [item["name"] for item in body["queryParameters"]] == [
         "as_of",
+        "baseline_as_of",
         "credit_start",
         "invoice_month",
     ]
+    assert "CAST(ROUND(credit.amount, 6) AS NUMERIC)" in body["query"]
+    assert "CAST(ROUND(cost, 6) AS NUMERIC)" in body["query"]
     assert result == second
-    assert result.promotion_consumed_micros == 4_954_740_000
-    assert result.recent_7d_consumed_micros == 1_400_000_000
+    assert result.promotion_consumed_micros == 47_382_382_451
+    assert result.baseline_promotion_consumed_micros == 5_971_404_681
+    assert result.recent_7d_consumed_micros == 25_664_106_537
     assert [(item.project_id, item.cost_micros) for item in result.projects] == [
         ("project-a", 4_000_125_000),
         ("project-b", 500_000_000),
@@ -129,6 +133,7 @@ def test_source_uses_fixed_metadata_and_bounded_parameterized_query() -> None:
                     {"name": "project_name", "type": "STRING"},
                     {"name": "month_cost", "type": "NUMERIC"},
                     {"name": "promotion_consumed", "type": "NUMERIC"},
+                    {"name": "baseline_promotion_consumed", "type": "NUMERIC"},
                     {"name": "recent_7d_consumed", "type": "NUMERIC"},
                 ]
             },
@@ -139,6 +144,7 @@ def test_source_uses_fixed_metadata_and_bounded_parameterized_query() -> None:
                         {"v": "주 프로젝트"},
                         {"v": "not-money"},
                         {"v": "4954.74"},
+                        {"v": "1000"},
                         {"v": "1400"},
                     ]
                 }
@@ -161,7 +167,7 @@ def test_source_rejects_incomplete_or_malformed_results_without_leaks(
     )
 
     with pytest.raises(BigQueryBillingError) as caught:
-        asyncio.run(source.fetch(start_on=date(2026, 7, 8), now=NOW))
+        asyncio.run(source.fetch(start_on=date(2026, 7, 8), baseline_as_of=BASELINE, now=NOW))
 
     assert str(caught.value) == "billing export query failed"
     assert "private-access-token" not in repr(caught.value)

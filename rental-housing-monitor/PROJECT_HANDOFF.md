@@ -18,14 +18,14 @@
 
 ## 현재 요약
 
-- 마지막 갱신: 2026-07-27 KST
+- 마지막 갱신: 2026-08-03 KST
 - 저장소: `kim8796/rental-housing-monitor`
 - 기본 브랜치: `main`
-- 임대주택 상세 알림 수정 전 `main`: `8950470` (PR #14)
-- 운영 배포 코드 기준: `da94ec3` (`codex/fix-rental-alert-details`)
+- GCP 결제 동기화 복구 전 `main`: `dc61626` (PR #15)
+- 운영 배포 코드 기준: `6198eb8` (`codex/fix-billing-sync`)
 - 최종 통합: PR #13 `fix: enable production URL discovery`, PR #14
   `test: verify safe server upgrade runbook`, PR #15
-  `fix: send detailed rental alerts`
+  `fix: send detailed rental alerts`, PR #16 `fix: restore GCP billing sync`
 - 서비스 성격: 현재 개인용이며, 사용자·소유자 경계를 유지해 향후 다중 사용자
   서비스로 확장 가능하게 설계한다.
 - 사용자 개발 방식: 사용자가 직접 코딩하기보다 Codex에 자연어로 요청한다. 기능뿐
@@ -110,7 +110,7 @@ Telegram에서 새 모니터를 등록할 때는 JSON이나 slash command가 아
 - 환경 파일: `/srv/personal-monitor/.env`
 - DB: `/srv/personal-monitor/db/monitor.db`
 - systemd: `personal-monitor.service`
-- Compose wrapper: `/usr/local/bin/personal-monitor-compose`
+- Compose wrapper: `/usr/local/sbin/personal-monitor-compose`
 - BigQuery dataset: US 멀티 리전 `billing_monitor`
 - 백업 버킷 이름과 복구 절차:
   `docs/operations/backup-restore.md`
@@ -233,6 +233,46 @@ Telegram 연결을 다시 확인한다.
 - 배포 후에는 사용자 지시에 따라 별도 수집·메시지 전송 테스트를 실행하지 않았다.
   따라서 중복 Telegram 알림은 발생하지 않았다.
 
+## 2026-08-03 GCP 결제 동기화 복구
+
+- 결제 스케줄러는 매일 12:10 KST에 실행됐지만 2026-07-27부터 2026-08-03까지
+  8회 연속 `BigQueryBillingError`가 발생했다. 마지막 정상 DB snapshot은
+  2026-07-26 12:10 KST였고 Telegram 12:20 요약은 이 오래된 값을 반복했다.
+- BigQuery export 자체와 VM IAM은 정상이었다. 2026-08-03 진단 당시 테이블은
+  9,397행이고 최신 export는 22:18 KST였다.
+- 첫 원인은 Cloud Billing의 `FLOAT` 합계가
+  `47382.38245100002`처럼 부동소수 오차를 포함하는데 파서가 정확한 마이크로원
+  정수만 허용한 것이었다. 쿼리에서 각 금액을 소수점 6자리로 반올림한
+  BigQuery `NUMERIC`으로 변환한 뒤 합산하도록 바꿨다.
+- 두 번째 원인은 export가 비어 있던 첫 성공 시점에 기준 누적 사용액을 0으로
+  고정한 것이었다. 늦은 과거 데이터 백필이 들어오면 기준일 이전 사용액까지 다시
+  차감될 수 있었다. 이제 매 동기화에서 콘솔 기준시각 이전 누적 사용액도 함께
+  계산하고 최신 기준점으로 저장해 과거 백필을 자동 상쇄한다. DB migration이나
+  수동 기준값 수정은 필요하지 않다.
+- snapshot이 24시간 이상 오래되면 Telegram 상태·요약에
+  `사용량 동기화가 24시간 이상 지연되었습니다` 경고를 표시한다.
+- 첫 배포 이미지가 Scrapling import 단계에서 재시작했다. 코드 원인이 아니라
+  재빌드 중 `apify-fingerprint-datapoints 0.13.0→0.14.0`,
+  `cssselect 1.4.0→1.5.0`, `curl-cffi 0.15.0→0.16.0`이 자동 선택된 의존성
+  드리프트였다. 즉시 이전 이미지로 rollback한 뒤 Scrapling 0.4.12와 검증된
+  browser runtime 버전을 `pyproject.toml`에 고정했다.
+- 최종 커밋·재배포 직전 전체 테스트 `5339 passed`, Ruff와
+  `git diff --check`, 실제 BigQuery 현재 쿼리·파싱이 통과했다.
+- 코드 커밋 `6198eb8`을 격리 build, network 없는 migration, 원자적 디렉터리
+  교체 방식으로 배포했다. 운영 교체 전 새 이미지의 Scrapling import를 3회
+  확인하고 교체 후 30초 동안 monitor 재시작 횟수 0을 확인했다.
+- 23:48 KST 수동 동기화 결과는 잔액 `₩413,734.38 / ₩460,418.00 (89.86%)`,
+  사용 `₩46,683.62`, 최근 7일 일평균 약 `₩3,666.30`, 예상 소진일
+  2026-11-24, 만료일 2026-10-08이다. 8월 프로젝트 사용액은
+  `Local Social Native: ₩11,600.39`다.
+- 배포 후 `personal-monitor.service=active`, Compose 서비스 3개,
+  monitor restart 0, DB `quick_check=ok`, migration 8, heartbeat 약 35초,
+  미전송 outbox 0개, 신규 오류 0개, Codex `Logged in using ChatGPT`를 확인했다.
+- 23:49 KST 암호화 백업이 `status=ok`로 완료됐고
+  `daily/2026-08-03T144931Z.tar.age` GCS 객체(348,440 bytes)를 확인했다.
+  실패 이미지와 재생성 가능한 build cache만 제거해 약 3.46GB를 회수했으며 서버
+  디스크 사용률은 79%다. 정상 운영 이미지와 rollback 자산은 보존했다.
+
 ## 중요한 운영 경계
 
 - 2026-07-24 QStash 실행 성공과 GCP의 임대주택 모니터 `active` 상태가 모두
@@ -278,9 +318,10 @@ git diff --check
 
 ## 다음 세션의 첫 행동
 
-1. 2026-07-28 12:13 KST 신규 임대주택이 있으면 Telegram에 상세 제목과 실제
-   상세 URL이 표시되는지 확인한다.
-2. 다음 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하는지 확인한다.
-3. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
-4. 사용자가 Telegram에서 첫 URL 없는 모니터를 실제 등록하면 첫 예약 실행 결과와
+1. 2026-08-04 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하고
+   `billing_iteration_failed`가 다시 생기지 않는지 확인한다.
+2. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
+3. 사용자가 Telegram에서 첫 URL 없는 모니터를 실제 등록하면 첫 예약 실행 결과와
    중복 알림 방지를 확인한다.
+4. Scrapling runtime 버전을 올릴 때는 자동 범위 확장 대신 새 이미지 import와
+   실제 HTTP·브라우저 수집을 검증한 뒤 고정 버전을 의도적으로 갱신한다.

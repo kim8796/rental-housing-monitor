@@ -11,8 +11,7 @@ import httpx
 from .models import BillingAggregate, ProjectSpend
 
 _METADATA_TOKEN_URL: Final = (
-    "http://169.254.169.254/computeMetadata/v1/instance/"
-    "service-accounts/default/token"
+    "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 )
 _BIGQUERY_ROOT: Final = "https://bigquery.googleapis.com/bigquery/v2"
 _SEOUL: Final = ZoneInfo("Asia/Seoul")
@@ -23,9 +22,10 @@ _MAX_RESPONSE_BYTES: Final = 1024 * 1024
 _FIELDS: Final = (
     ("project_id", "STRING"),
     ("project_name", "STRING"),
-    ("month_cost", "FLOAT"),
-    ("promotion_consumed", "FLOAT"),
-    ("recent_7d_consumed", "FLOAT"),
+    ("month_cost", "NUMERIC"),
+    ("promotion_consumed", "NUMERIC"),
+    ("baseline_promotion_consumed", "NUMERIC"),
+    ("recent_7d_consumed", "NUMERIC"),
 )
 _QUERY: Final = """
 WITH usage AS (
@@ -33,9 +33,19 @@ WITH usage AS (
     project.id AS project_id,
     COALESCE(project.name, project.id) AS project_name,
     DATE(usage_start_time, "Asia/Seoul") AS usage_day,
-    cost,
+    usage_start_time,
+    CAST(ROUND(cost, 6) AS NUMERIC) AS cost,
     (
-      SELECT COALESCE(SUM(IF(credit.type = "PROMOTION", credit.amount, 0)), 0)
+      SELECT COALESCE(
+        SUM(
+          IF(
+            credit.type = "PROMOTION",
+            CAST(ROUND(credit.amount, 6) AS NUMERIC),
+            NUMERIC '0'
+          )
+        ),
+        NUMERIC '0'
+      )
       FROM UNNEST(credits) AS credit
     ) AS promotion_credit
   FROM `{table}`
@@ -44,16 +54,26 @@ WITH usage AS (
 ),
 credit_total AS (
   SELECT
-    COALESCE(-SUM(promotion_credit), 0) AS promotion_consumed,
+    COALESCE(-SUM(promotion_credit), NUMERIC '0') AS promotion_consumed,
+    COALESCE(
+      -SUM(
+        IF(
+          usage_start_time < @baseline_as_of,
+          promotion_credit,
+          NUMERIC '0'
+        )
+      ),
+      NUMERIC '0'
+    ) AS baseline_promotion_consumed,
     COALESCE(
       -SUM(
         IF(
           usage_day >= DATE_SUB(@as_of, INTERVAL 6 DAY),
           promotion_credit,
-          0
+          NUMERIC '0'
         )
       ),
-      0
+      NUMERIC '0'
     ) AS recent_7d_consumed
   FROM usage
 ),
@@ -61,7 +81,7 @@ project_month AS (
   SELECT
     project_id,
     project_name,
-    GREATEST(SUM(cost), 0) AS month_cost
+    GREATEST(COALESCE(SUM(cost), NUMERIC '0'), NUMERIC '0') AS month_cost
   FROM usage
   WHERE project_id IS NOT NULL
     AND FORMAT_DATE("%Y%m", usage_day) = @invoice_month
@@ -73,6 +93,7 @@ SELECT
   project_month.project_name,
   project_month.month_cost,
   credit_total.promotion_consumed,
+  credit_total.baseline_promotion_consumed,
   credit_total.recent_7d_consumed
 FROM credit_total
 LEFT JOIN project_month ON TRUE
@@ -195,15 +216,27 @@ class BigQueryBillingSource:
     def __repr__(self) -> str:
         return "<BigQueryBillingSource redacted>"
 
-    async def fetch(self, *, start_on: date, now: datetime) -> BillingAggregate:
+    async def fetch(
+        self,
+        *,
+        start_on: date,
+        baseline_as_of: datetime,
+        now: datetime,
+    ) -> BillingAggregate:
         if (
             type(start_on) is not date
+            or not isinstance(baseline_as_of, datetime)
+            or baseline_as_of.tzinfo is None
+            or baseline_as_of.utcoffset() is None
             or not isinstance(now, datetime)
             or now.tzinfo is None
             or now.utcoffset() is None
         ):
             raise ValueError("invalid billing export query window")
         observed_at = now.astimezone(UTC)
+        baseline_at = baseline_as_of.astimezone(UTC)
+        if baseline_at > observed_at:
+            raise ValueError("invalid billing export query window")
         local_day = observed_at.astimezone(_SEOUL).date()
         query = _QUERY.format(
             table=f"{self._project_id}.{self._dataset_id}.gcp_billing_export_v1_*"
@@ -216,6 +249,7 @@ class BigQueryBillingSource:
             "parameterMode": "NAMED",
             "queryParameters": [
                 _date_parameter("as_of", local_day),
+                _timestamp_parameter("baseline_as_of", baseline_at),
                 _date_parameter("credit_start", start_on),
                 _string_parameter("invoice_month", local_day.strftime("%Y%m")),
             ],
@@ -262,6 +296,14 @@ def _string_parameter(name: str, value: str) -> dict[str, object]:
     }
 
 
+def _timestamp_parameter(name: str, value: datetime) -> dict[str, object]:
+    return {
+        "name": name,
+        "parameterType": {"type": "TIMESTAMP"},
+        "parameterValue": {"value": value.astimezone(UTC).isoformat()},
+    }
+
+
 def _parse_result(payload: object, *, observed_at: datetime) -> BillingAggregate:
     if type(payload) is not dict or payload.get("jobComplete") is not True:
         raise BigQueryBillingError
@@ -281,17 +323,21 @@ def _parse_result(payload: object, *, observed_at: datetime) -> BillingAggregate
         raise BigQueryBillingError
     projects: list[ProjectSpend] = []
     promotion_consumed: int | None = None
+    baseline_consumed: int | None = None
     recent_consumed: int | None = None
     for row in rows:
         values = _row_values(row)
         row_promotion = _money_micros(values[3])
-        row_recent = _money_micros(values[4])
-        if (
-            promotion_consumed is not None
-            and (promotion_consumed != row_promotion or recent_consumed != row_recent)
+        row_baseline = _money_micros(values[4])
+        row_recent = _money_micros(values[5])
+        if promotion_consumed is not None and (
+            promotion_consumed != row_promotion
+            or baseline_consumed != row_baseline
+            or recent_consumed != row_recent
         ):
             raise BigQueryBillingError
         promotion_consumed = row_promotion
+        baseline_consumed = row_baseline
         recent_consumed = row_recent
         if values[0] is None and values[1] is None and values[2] is None:
             continue
@@ -304,11 +350,12 @@ def _parse_result(payload: object, *, observed_at: datetime) -> BillingAggregate
                 cost_micros=_money_micros(values[2]),
             )
         )
-    if promotion_consumed is None or recent_consumed is None:
+    if promotion_consumed is None or baseline_consumed is None or recent_consumed is None:
         raise BigQueryBillingError
     return BillingAggregate(
         observed_at=observed_at,
         promotion_consumed_micros=promotion_consumed,
+        baseline_promotion_consumed_micros=baseline_consumed,
         recent_7d_consumed_micros=recent_consumed,
         projects=tuple(projects),
     )

@@ -75,7 +75,11 @@ class BillingCoordinator:
     async def sync(self, *, now: datetime) -> None:
         observed_at = _aware_utc(now)
         for grant in self._repository.list_grants():
-            aggregate = await self._fetch(start_on=grant.starts_on, now=observed_at)
+            aggregate = await self._fetch(
+                start_on=grant.starts_on,
+                baseline_as_of=grant.baseline_as_of,
+                now=observed_at,
+            )
             snapshot = self._repository.record_aggregate(grant.id, aggregate)
             for key, text in self._alert_messages(snapshot, now=observed_at):
                 if self._repository.claim_alert(grant.id, key, now=observed_at):
@@ -147,10 +151,7 @@ class BillingCoordinator:
     def _migration_readiness(self) -> tuple[str, ...]:
         backup = read_backup_status(self._backup_status_path)
         if backup.healthy and backup.updated_at is not None:
-            backup_line = (
-                "✅ 최신 암호화 백업 검증: "
-                f"{_kst_time(backup.updated_at)}"
-            )
+            backup_line = f"✅ 최신 암호화 백업 검증: {_kst_time(backup.updated_at)}"
         else:
             backup_line = "❌ 최신 암호화 백업 검증 상태를 확인해야 합니다."
         return (
@@ -167,16 +168,20 @@ def render_billing_status(snapshot: BillingSnapshot, *, now: datetime) -> str:
     observed_at = _aware_utc(now)
     local_day = observed_at.astimezone(_SEOUL).date()
     expiry_days = (snapshot.ends_on - local_day).days
-    expiry_label = (
-        f"{expiry_days}일 남음" if expiry_days >= 0 else f"{abs(expiry_days)}일 지남"
-    )
+    expiry_label = f"{expiry_days}일 남음" if expiry_days >= 0 else f"{abs(expiry_days)}일 지남"
     source = "BigQuery" if snapshot.source == "bigquery" else "콘솔"
     lines = [
         "☁️ GCP 크레딧",
-        _balance_line(snapshot),
-        f"사용: {_won(snapshot.used_micros)}",
-        f"만료: {snapshot.ends_on.isoformat()} ({expiry_label})",
     ]
+    if observed_at - snapshot.observed_at > timedelta(hours=24):
+        lines.append("⚠️ 사용량 동기화가 24시간 이상 지연되었습니다.")
+    lines.extend(
+        (
+            _balance_line(snapshot),
+            f"사용: {_won(snapshot.used_micros)}",
+            f"만료: {snapshot.ends_on.isoformat()} ({expiry_label})",
+        )
+    )
     if snapshot.projected_exhaustion_on is None:
         lines.append("예상 소진: 최근 7일 사용 데이터 부족")
     else:
