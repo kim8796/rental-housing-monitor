@@ -308,6 +308,19 @@ Telegram 연결을 다시 확인한다.
 - 00:56 KST 암호화 백업이 `status=ok`로 완료됐고
   `daily/2026-08-03T155611Z.tar.age` GCS 객체(348,440 bytes)를 확인했다. build
   cache 2.94GB를 정리한 뒤 디스크 사용률은 84%, 여유는 약 7.7GB다.
+- 01:42 KST 병합 후 읽기 전용 종합 smoke test를 추가로 실행했다. 로컬 전체 테스트
+  `5350 passed`, Ruff와 `git diff --check`가 다시 통과했다. 운영 Codex worker는
+  `등록된 모니터 보여줘`를 `list`로 분류했고 confidence는 0.99였다.
+- 메모리 DB와 실제 `example.com` 문서를 사용한 전체 planner 경로가
+  `keyword_match`, 예시 1건, `키워드 포함: Example Domain` 미리보기를 만들었다.
+  실제 Scrapling 관측값으로 만든 알림도 `일치 필드: title`,
+  `현재값: Example Domain`을 표시했다. AI에 가상 HTML을 주고 다른 실제 URL을
+  긁게 한 첫 진단 시도는 의도대로 0건 승인 거부됐으며, 같은 실제 문서를 사용하는
+  제품 경로 검증과 구분했다.
+- 같은 테스트에서 임대 실수집은 44건(LH 39, GH 5), 세 기관 상태 `ok`, 경고
+  0건이었다. 종료 후에도 운영 active 모니터 1개, 미전송 outbox 0개, 미소비 pending
+  action 0개, 최근 실패 run 0개, 컨테이너 restart 0, DB `quick_check=ok`, 최근
+  journal 오류 0개였으므로 Telegram 전송과 운영 상태 변화는 없었다.
 
 ## 중요한 운영 경계
 
