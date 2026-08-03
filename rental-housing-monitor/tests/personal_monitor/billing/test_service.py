@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,10 +21,16 @@ SEOUL = ZoneInfo("Asia/Seoul")
 class Source:
     def __init__(self, aggregate: BillingAggregate) -> None:
         self.aggregate = aggregate
-        self.calls: list[tuple[date, datetime]] = []
+        self.calls: list[tuple[date, datetime, datetime]] = []
 
-    async def fetch(self, *, start_on: date, now: datetime) -> BillingAggregate:
-        self.calls.append((start_on, now))
+    async def fetch(
+        self,
+        *,
+        start_on: date,
+        baseline_as_of: datetime,
+        now: datetime,
+    ) -> BillingAggregate:
+        self.calls.append((start_on, baseline_as_of, now))
         return self.aggregate
 
 
@@ -54,6 +60,7 @@ def _aggregate(*, recent: int = 0) -> BillingAggregate:
     return BillingAggregate(
         observed_at=NOW,
         promotion_consumed_micros=4_954_740_000,
+        baseline_promotion_consumed_micros=4_954_740_000,
         recent_7d_consumed_micros=recent,
         projects=(ProjectSpend("project-a", "주 프로젝트", 4_500_125_000),),
     )
@@ -112,6 +119,29 @@ def test_status_and_daily_summary_show_credit_project_and_snapshot_time(tmp_path
     assert len(sender.messages) == 1
     assert "주 프로젝트: ₩4,500.13" in sender.messages[0]
     assert "BigQuery" in sender.messages[0]
+
+
+def test_daily_summary_warns_when_latest_usage_sync_is_over_24_hours_old(
+    tmp_path: Path,
+) -> None:
+    repository = BillingRepository(open_database(":memory:"))
+    repository.register_grant(_grant())
+    sender = Sender()
+    backup = tmp_path / "backup-status.json"
+    _backup(backup)
+    coordinator = BillingCoordinator(
+        repository,
+        Source(_aggregate()),
+        sender,
+        backup_status_path=backup,
+        clock=lambda: NOW,
+    )
+
+    asyncio.run(coordinator.send_summary(now=NOW + timedelta(days=1, minutes=1)))
+
+    assert len(sender.messages) == 1
+    assert "⚠️ 사용량 동기화가 24시간 이상 지연되었습니다." in sender.messages[0]
+    assert "기준: 2026-07-24 12:10 KST (콘솔)" in sender.messages[0]
 
 
 def test_ten_percent_alert_includes_migration_readiness_and_is_not_duplicated(

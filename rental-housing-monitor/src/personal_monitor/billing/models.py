@@ -11,9 +11,7 @@ _MAX_MICROS = 2**63 - 1
 
 def _aware(value: object) -> bool:
     return (
-        isinstance(value, datetime)
-        and value.tzinfo is not None
-        and value.utcoffset() is not None
+        isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
     )
 
 
@@ -84,6 +82,7 @@ class ProjectSpend:
 class BillingAggregate:
     observed_at: datetime
     promotion_consumed_micros: int
+    baseline_promotion_consumed_micros: int
     recent_7d_consumed_micros: int
     projects: tuple[ProjectSpend, ...]
 
@@ -91,6 +90,7 @@ class BillingAggregate:
         if (
             not _aware(self.observed_at)
             or not _micros(self.promotion_consumed_micros)
+            or not _micros(self.baseline_promotion_consumed_micros)
             or not _micros(self.recent_7d_consumed_micros)
             or type(self.projects) is not tuple
             or len(self.projects) > 1_000

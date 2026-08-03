@@ -94,20 +94,18 @@ class BillingRepository:
         observed_text = utc_timestamp(observed_at, parameter="observed_at")
         with transaction(self.connection, immediate=True):
             row = self.connection.execute(
-                "SELECT original_micros, baseline_remaining_micros, ends_on, "
-                "baseline_export_consumed_micros FROM billing_credit_grants WHERE id = ?",
+                "SELECT original_micros, baseline_remaining_micros, ends_on "
+                "FROM billing_credit_grants WHERE id = ?",
                 (grant_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("billing credit grant is unavailable")
-            baseline_export = row["baseline_export_consumed_micros"]
-            if baseline_export is None:
-                baseline_export = aggregate.promotion_consumed_micros
-                self.connection.execute(
-                    "UPDATE billing_credit_grants SET "
-                    "baseline_export_consumed_micros = ?, updated_at = ? WHERE id = ?",
-                    (baseline_export, observed_text, grant_id),
-                )
+            baseline_export = aggregate.baseline_promotion_consumed_micros
+            self.connection.execute(
+                "UPDATE billing_credit_grants SET "
+                "baseline_export_consumed_micros = ?, updated_at = ? WHERE id = ?",
+                (baseline_export, observed_text, grant_id),
+            )
             delta = aggregate.promotion_consumed_micros - baseline_export
             remaining = max(
                 0,

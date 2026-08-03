@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -9,6 +10,7 @@ DOCKERFILE = ROOT / "Dockerfile"
 ENTRYPOINT = ROOT / "deploy" / "entrypoint.sh"
 SQUID_DOCKERFILE = ROOT / "deploy" / "squid.Dockerfile"
 DOCKERIGNORE = ROOT / ".dockerignore"
+PYPROJECT = ROOT / "pyproject.toml"
 
 
 def _text(path: Path) -> str:
@@ -74,6 +76,17 @@ def test_runtime_pins_codex_and_installs_scrapling_browser_cache() -> None:
     assert "PLAYWRIGHT_BROWSERS_PATH=/opt/personal-monitor/browsers" in dockerfile
     assert "scrapling install --force" in dockerfile
     assert "chmod -R a+rX /opt/personal-monitor/browsers" in dockerfile
+
+
+def test_runtime_scraping_dependencies_match_the_verified_production_stack() -> None:
+    with PYPROJECT.open("rb") as file:
+        dependencies = tomllib.load(file)["project"]["dependencies"]
+
+    assert "scrapling[fetchers]==0.4.12" in dependencies
+    assert "browserforge==1.2.4" in dependencies
+    assert "apify-fingerprint-datapoints==0.13.0" in dependencies
+    assert "cssselect==1.4.0" in dependencies
+    assert "curl-cffi==0.15.0" in dependencies
 
 
 def test_runtime_user_and_private_paths_are_fixed() -> None:

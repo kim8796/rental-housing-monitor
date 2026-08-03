@@ -28,10 +28,11 @@ def grant() -> CreditGrant:
     )
 
 
-def aggregate(*, consumed: int, recent: int = 0) -> BillingAggregate:
+def aggregate(*, consumed: int, baseline: int, recent: int = 0) -> BillingAggregate:
     return BillingAggregate(
         observed_at=NOW,
         promotion_consumed_micros=consumed,
+        baseline_promotion_consumed_micros=baseline,
         recent_7d_consumed_micros=recent,
         projects=(
             ProjectSpend("project-a", "주 프로젝트", 4_000_000_000),
@@ -57,15 +58,30 @@ def test_register_grant_persists_console_baseline_as_initial_snapshot() -> None:
         snapshot.remaining_micros = 0  # type: ignore[misc]
 
 
-def test_first_export_sync_calibrates_then_later_sync_applies_only_increment() -> None:
+def test_each_export_sync_reconciles_late_backfill_before_console_baseline() -> None:
     connection = open_database(":memory:")
     repository = BillingRepository(connection)
     repository.register_grant(grant())
 
-    first = repository.record_aggregate("free-trial", aggregate(consumed=4_960_000_000))
+    first = repository.record_aggregate(
+        "free-trial",
+        aggregate(consumed=0, baseline=0),
+    )
     second = repository.record_aggregate(
         "free-trial",
-        aggregate(consumed=5_960_000_000, recent=1_400_000_000),
+        aggregate(
+            consumed=5_960_000_000,
+            baseline=4_960_000_000,
+            recent=1_400_000_000,
+        ),
+    )
+    third = repository.record_aggregate(
+        "free-trial",
+        aggregate(
+            consumed=6_160_000_000,
+            baseline=5_160_000_000,
+            recent=1_400_000_000,
+        ),
     )
 
     assert first.remaining_micros == 455_463_260_000
@@ -77,6 +93,14 @@ def test_first_export_sync_calibrates_then_later_sync_applies_only_increment() -
         ("project-a", 4_000_000_000),
         ("project-b", 500_000_000),
     ]
+    assert third.remaining_micros == second.remaining_micros
+    assert (
+        connection.execute(
+            "SELECT baseline_export_consumed_micros FROM billing_credit_grants "
+            "WHERE id = 'free-trial'"
+        ).fetchone()[0]
+        == 5_160_000_000
+    )
 
 
 def test_alert_claim_is_atomic_and_deduplicated_per_grant_and_key() -> None:
