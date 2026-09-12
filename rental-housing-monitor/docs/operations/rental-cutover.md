@@ -1,5 +1,9 @@
 # 임대주택 7일 shadow, 전환, 롤백
 
+> 2026-09-12 운영 전환이 끝나 이 문서는 역사적 절차와 장애 분석 참고용이다.
+> 현재 일일 실행은 GCP VM 내부 스케줄러가 담당하며 QStash를 운영 또는 롤백
+> 경로로 재개하지 않는다. 최신 상태는 `PROJECT_HANDOFF.md`를 우선한다.
+
 현재 QStash schedule `rental-housing-monitor-daily`과 GitHub Actions가 7일 shadow가
 끝날 때까지 production이다. `.github/workflows/rental-housing-monitor.yml`과 원격
 `data` 브랜치는 수정, force-push, 삭제하지 않는다.
