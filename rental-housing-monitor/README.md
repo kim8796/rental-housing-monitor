@@ -13,15 +13,16 @@
 
 ## 개인 모니터 플랫폼 운영 문서
 
-현재 QStash/GitHub Actions 임대주택 모니터를 유지하면서, 별도 GCP VM의 자연어
-Telegram 개인 모니터 플랫폼으로 단계적으로 이전하는 절차입니다.
+현재 운영 경로는 GCP VM의 자연어 Telegram 개인 모니터 플랫폼과 내부 스케줄러입니다.
+GitHub Actions 워크플로는 수동 복구·점검 용도로만 남아 있으며 QStash는 운영에
+사용하지 않습니다.
 
 - [GCP 배포와 호스트 운영](docs/operations/gcp-deploy.md)
 - [암호화 백업과 복구 검증](docs/operations/backup-restore.md)
-- [임대주택 7일 shadow, 전환, 롤백](docs/operations/rental-cutover.md)
+- [임대주택 7일 shadow, 전환, 롤백 기록](docs/operations/rental-cutover.md)
 
-VM 생성은 `infra/gcp/README.md`의 실행 체크포인트 뒤에만 수행합니다. 7일 shadow와
-중복 probe가 모두 통과하기 전에는 QStash schedule을 중지하지 않습니다.
+VM 생성·이전은 `infra/gcp/README.md`의 실행 체크포인트를 따릅니다. 과거 QStash
+전환 절차는 운영 이력과 복구 참고용이며 현재 실행 지침이 아닙니다.
 
 ## 공식 데이터 소스
 
@@ -103,16 +104,15 @@ SH/GH가 HTML 구조를 변경해 목록 표, 공고 ID, 필수 상세 필드를
 
 워크플로는 `.github/workflows/rental-housing-monitor.yml`에 있으며 다음을 수행합니다.
 
-- `workflow_dispatch`: QStash 외부 스케줄 또는 GitHub UI에서 수동 실행
+- `workflow_dispatch`: GitHub UI 또는 API에서 수동 복구·점검 실행
 - `concurrency`: DB를 동시에 갱신하는 실행 차단
 - `contents: write`: 전용 `data` 브랜치에 SQLite 저장
 - `if: always()`: 성공·실패와 무관하게 로그 artifact 업로드
 
-GitHub의 저장소 자체 `schedule` 이벤트가 발생하지 않는 현상이 확인되어, 현재는 QStash가 GitHub Actions의 `workflow_dispatch` API를 호출합니다. 중복 실행을 막기 위해 워크플로의 GitHub cron은 비활성화했습니다.
-
-- QStash schedule ID: `rental-housing-monitor-daily`
-- cron: `CRON_TZ=Asia/Seoul 13 12 * * *` (매일 한국시간 12:13)
-- GitHub fine-grained token 만료일: 2027-07-22 (만료 전에 QStash의 Authorization 헤더 토큰 교체 필요)
+일일 운영 실행은 GCP VM 내부 스케줄러가 담당합니다. 과거 QStash schedule
+`rental-housing-monitor-daily`는 매일 12:13 KST에 이 워크플로를 호출했지만,
+2026-07-24 이후 QStash 기원 `workflow_dispatch` 실행이 없었고 2026-09-12 기준
+운영 경로에서 제외됐습니다. 새 기능은 QStash에 의존하지 않습니다.
 
 첫 실행 때 `data` 브랜치가 없으면 자동 생성합니다. 이후 매 실행마다 `rental-housing-monitor/data/announcements.db`만 포함하는 새로운 단일 스냅샷 커밋으로 `data` 브랜치를 교체합니다. 과거 DB 커밋은 보존하지 않으므로 장기간 운영해도 접근 가능한 Git 이력이 누적되지 않습니다. `force-with-lease`가 예상하지 못한 동시 갱신을 감지하면 기존 상태를 덮어쓰지 않고 실행을 실패시킵니다.
 

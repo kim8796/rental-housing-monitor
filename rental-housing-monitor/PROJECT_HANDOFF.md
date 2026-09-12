@@ -18,10 +18,10 @@
 
 ## 현재 요약
 
-- 마지막 갱신: 2026-08-04 KST
+- 마지막 갱신: 2026-09-12 KST
 - 저장소: `kim8796/rental-housing-monitor`
 - 기본 브랜치: `main`
-- GCP 결제 동기화 복구 전 `main`: `dc61626` (PR #15)
+- 문서 정리 시작 기준 `main`: `f4615e2` (PR #18)
 - 운영 배포 코드 기준: `6a36d15` (`codex/fix-monitor-semantic-accuracy`)
 - 최종 통합: PR #13 `fix: enable production URL discovery`, PR #14
   `test: verify safe server upgrade runbook`, PR #15
@@ -34,17 +34,19 @@
 
 ## 시스템 구성
 
-### 1. 기존 임대주택 모니터
+### 1. 기존 GitHub Actions 임대주택 모니터
 
 - LH·SH·GH 공식 소스에서 서울·경기 임대주택 공고를 수집한다.
 - GitHub Actions workflow:
   `.github/workflows/rental-housing-monitor.yml`
-- QStash schedule `rental-housing-monitor-daily`가 매일 12:13 KST에
-  `workflow_dispatch`를 호출한다.
+- 일일 운영 실행은 GCP VM 내부 스케줄러가 담당한다. GitHub Actions는 수동
+  복구·점검 경로로만 유지하며 QStash를 운영 경로로 사용하지 않는다.
 - 실행 상태와 중복 방지 DB는 원격 `data` 브랜치에 단일 SQLite 스냅샷으로
   저장한다.
 - 2026-07-24 12:13 KST 실행은 성공했다. 당시 workflow 기준 SHA는
   `472154a3c17a7460b5ece0623122ece21234f963`이었다.
+- GitHub Actions 기록을 2026-09-12에 다시 확인했으며, 위 실행 이후 QStash 기원
+  `workflow_dispatch` 실행은 없었다.
 
 ### 2. 개인 모니터 플랫폼
 
@@ -322,15 +324,35 @@ Telegram 연결을 다시 확인한다.
   action 0개, 최근 실패 run 0개, 컨테이너 restart 0, DB `quick_check=ok`, 최근
   journal 오류 0개였으므로 Telegram 전송과 운영 상태 변화는 없었다.
 
+## 2026-09-12 QStash 운영 경로 제거
+
+- 별도 `kim8796/chatbot` Vercel 프로젝트에서 QStash 토큰과 현재·다음 서명키
+  환경변수 3개를 영구 삭제했다. Upstash Redis URL·토큰은 QStash와 별도 저장소
+  연결이므로 유지했다.
+- 환경변수 삭제 후 GitHub `main`의 `f887cf0`을 production에 재배포했고 Vercel
+  deployment `GsZtHqgQa`가 `Ready`로 완료됐다. QStash 설정이 없는 상태에서도
+  설정 로딩과 빌드는 성공한다.
+- 삭제 전 Vercel에 남아 있던 과거 QStash 토큰으로 EU schedule API를 조회하면
+  HTTP 404가 반환되어 원격 schedule 목록을 열거하거나 삭제할 수 없었다. 이
+  토큰은 더 이상 운영 자격증명으로 취급하지 않는다.
+- `kim8796/rental-housing-monitor` GitHub Actions 기록에는 2026-07-24 12:13 KST
+  이후 QStash 기원 `workflow_dispatch` 실행이 없다.
+- 같은 날 GCP VM을 읽기 전용으로 확인했다. `personal-monitor.service`는 `active`,
+  `서울·경기 임대주택` 모니터는 `active`, cron은 `13 12 * * *`, 시간대는
+  `Asia/Seoul`, 다음 실행은 2026-09-13 12:13 KST다.
+
 ## 중요한 운영 경계
 
-- 2026-07-24 QStash 실행 성공과 GCP의 임대주택 모니터 `active` 상태가 모두
-  확인됐다. QStash가 실제로 pause됐는지는 이번 확인에서 검증하지 못했다.
-- 다음 12:13 KST 전에 Upstash에서
-  `rental-housing-monitor-daily`의 `isPaused`를 반드시 확인한다.
-- 완전 전환을 유지하려면 QStash를 pause하고 삭제하지 않은 채 rollback 자산으로
-  보존한다. pause가 아니면 두 실행 경로가 동시에 동작할 위험이 있다.
-- GitHub workflow와 `data` 브랜치는 rollback 확인 전까지 삭제하거나 강제
+- 2026-09-12 기준 일일 운영 경로는 GCP VM 내부 스케줄러 하나다. 새 기능이나
+  리마인더에 QStash를 다시 도입하지 않는다.
+- 과거 임대주택 QStash schedule `rental-housing-monitor-daily`의 콘솔 레코드는
+  해당 Upstash 계정 접근을 복구하기 전까지 직접 삭제 여부를 확인할 수 없다.
+  다만 GitHub Actions에는 2026-07-24 이후 해당 스케줄 호출이 없다.
+- 별도 `kim8796/chatbot` Vercel 프로젝트에서는 `QSTASH_TOKEN`,
+  `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY`를 삭제하고 QStash 없이
+  production 재배포가 `Ready`로 끝났다. Upstash Redis 연결값은 QStash와 별개라
+  유지했다.
+- GitHub workflow와 `data` 브랜치는 수동 복구 자산이므로 삭제하거나 강제
   변경하지 않는다.
 - 결제 크레딧이 10% 이하라고 알리더라도 자동 서버 이전은 금지한다.
 - `local-social-api` Cloud Run 서비스는 이 프로젝트 배포의 변경 대상이 아니다.
@@ -367,9 +389,11 @@ git diff --check
 
 ## 다음 세션의 첫 행동
 
-1. 2026-08-04 12:10 KST 자동 결제 동기화와 12:20 Telegram 요약이 성공하고
-   `billing_iteration_failed`가 다시 생기지 않는지 확인한다.
-2. Upstash QStash schedule의 실제 pause 상태와 임대주택 중복 실행 여부를 확인한다.
+1. GCP 결제 동기화와 12:20 Telegram 요약의 최신 성공 시각을 확인하고
+   `billing_iteration_failed`가 다시 생기지 않았는지 점검한다.
+2. 과거 Upstash 계정 접근을 복구하는 경우에만 비활성
+   `rental-housing-monitor-daily` 레코드를 삭제한다. 운영 복구 수단으로 재개하지
+   않는다.
 3. 사용자가 Telegram에서 첫 URL 없는 모니터를 실제 등록하면 첫 예약 실행 결과와
    중복 알림 방지를 확인한다.
 4. Scrapling runtime 버전을 올릴 때는 자동 범위 확장 대신 새 이미지 import와
